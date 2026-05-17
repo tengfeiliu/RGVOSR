@@ -249,12 +249,26 @@ def update_ema(ema_model, model, decay=0.9999):
 
 def load_dinov2(args, device):
     if  args.enc_type == 'dinov2b':
-        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+        # encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+        encoder = torch.hub.load(
+            '/data/code/VOSR-main/preset/ckpts/torch_cache/facebookresearch_dinov2_main',
+            'dinov2_vitb14',
+            source='local'
+        )
     elif args.enc_type == 'dinov2l':
-        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        # encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        encoder = torch.hub.load(
+            '/data/code/VOSR-main/preset/ckpts/torch_cache/facebookresearch_dinov2_main',
+            'dinov2_vitl14',
+            source='local'
+        )
     elif args.enc_type == 'dinov2g':
-        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14')
-
+        # encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14')
+        encoder = torch.hub.load(
+            '/data/code/VOSR-main/preset/ckpts/torch_cache/facebookresearch_dinov2_main',
+            'dinov2_vitg14',
+            source='local'
+        )
     del encoder.head
 
     encoder.head = torch.nn.Identity()

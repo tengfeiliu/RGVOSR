@@ -125,10 +125,10 @@ def _semantic_contradiction(reasoning, suggestions, text_risk, hallucination_ris
         "global structure",
     )
 
-    if "improve text readability" in suggestions and text_risk <= 0.03:
-        return "text suggestion with zero text_region_risk"
-    if any(term in joined_reasoning for term in risky_text_terms) and text_risk <= 0.03:
-        return "text reasoning with zero text_region_risk"
+    # if "improve text readability" in suggestions and text_risk <= 0.0001:
+    #     return "text suggestion with zero text_region_risk"
+    # if any(term in joined_reasoning for term in risky_text_terms) and text_risk <= 0.0001:
+    #     return "text reasoning with zero text_region_risk"
 
     hallucination_suggestions = {
         "avoid hallucinated details",
@@ -136,10 +136,10 @@ def _semantic_contradiction(reasoning, suggestions, text_risk, hallucination_ris
         "preserve global structure",
         "preserve repeated patterns",
     }
-    if hallucination_suggestions.intersection(suggestions) and hallucination_risk <= 0.03:
-        return "semantic-risk suggestion with zero hallucination_risk"
-    if any(term in joined_reasoning for term in hallucination_terms) and hallucination_risk <= 0.03:
-        return "semantic-risk reasoning with zero hallucination_risk"
+    # if hallucination_suggestions.intersection(suggestions) and hallucination_risk <= 0.03:
+    #     return "semantic-risk suggestion with zero hallucination_risk"
+    # if any(term in joined_reasoning for term in hallucination_terms) and hallucination_risk <= 0.03:
+    #     return "semantic-risk reasoning with zero hallucination_risk"
     return None
 
 

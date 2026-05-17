@@ -3,8 +3,8 @@ train_dataset_config: configs/train_txt/train_dataset_txt.txt
 suffix: ''
 
 
-test_lq_dir: preset/datasets/RealSR/test_LR
-test_gt_dir: preset/datasets/RealSR/test_HR
+test_lq_dir: /data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_LR
+test_gt_dir: /data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_HR
 test_upscale: 4
 
 infer_steps: 25
@@ -96,5 +96,5 @@ report_to: none
 
 
 
-dataset_type: 'webdataset' # txt, webdataset
+dataset_type: 'txt' # txt, webdataset
 shuffle_buffer: 2000
