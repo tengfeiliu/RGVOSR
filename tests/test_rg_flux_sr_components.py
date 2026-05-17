@@ -1,0 +1,150 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from PIL import Image
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
+
+class RGFluxSRComponentTests(unittest.TestCase):
+    def _make_pair(self, root: Path):
+        hq_path = root / "hq.png"
+        lq_path = root / "lq.png"
+        Image.new("RGB", (64, 64), color=(128, 96, 64)).save(hq_path)
+        Image.new("RGB", (16, 16), color=(64, 96, 128)).save(lq_path)
+        return hq_path, lq_path
+
+    def test_prompt_builder_uses_reasoning_and_suggestions(self):
+        from models.prompt_builder import build_sr_prompt
+
+        result = {
+            "reasoning": {
+                "degradation_analysis": "blur and JPEG artifacts",
+                "texture_edge_analysis": "edges are weak",
+                "semantic_risk_analysis": "text may be fragile",
+                "sr_strategy": "restore conservatively",
+            },
+            "suggestions": ["recover fine textures", "avoid hallucinated details"],
+        }
+
+        prompt = build_sr_prompt(result, use_prompt=True, use_suggestions=True)
+
+        self.assertIn("blur and JPEG artifacts", prompt)
+        self.assertIn("- recover fine textures", prompt)
+        self.assertIn("Avoid hallucinated details", prompt)
+
+    def test_prompt_builder_can_disable_suggestions(self):
+        from models.prompt_builder import build_sr_prompt
+
+        prompt = build_sr_prompt(
+            {"suggestions": ["recover fine textures"]},
+            use_prompt=True,
+            use_suggestions=False,
+        )
+
+        self.assertNotIn("recover fine textures", prompt)
+        self.assertIn("Super-resolve this low-quality image", prompt)
+
+    def test_jsonl_dataset_reads_pair_and_ignores_raw_fields(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hq_path, lq_path = self._make_pair(root)
+            jsonl_path = root / "valid.jsonl"
+            record = {
+                "hq_path": str(hq_path),
+                "lq_path": str(lq_path),
+                "raw_degradation_params": {"blur": 999.0},
+                "raw_qwen_response": "must be ignored",
+                "result": {
+                    "reasoning": {"degradation_analysis": "offline result"},
+                    "suggestions": ["enhance edge sharpness"],
+                    "score": 47,
+                    "degradation_vector": {
+                        "blur": 0.1,
+                        "noise": 0.2,
+                        "jpeg": 0.3,
+                    },
+                },
+            }
+            jsonl_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            dataset = RGFluxSRJsonlDataset(
+                jsonl_path=str(jsonl_path),
+                crop_size=32,
+                scale=4,
+                mode="val",
+                use_prompt=True,
+                use_degradation_vector=True,
+            )
+            sample = dataset[0]
+
+        self.assertEqual(sample["hq"].shape, (3, 32, 32))
+        self.assertEqual(sample["lq_up"].shape, (3, 32, 32))
+        self.assertGreaterEqual(float(sample["hq"].min()), -1.0)
+        self.assertLessEqual(float(sample["hq"].max()), 1.0)
+        self.assertIn("offline result", sample["prompt"])
+        self.assertEqual(sample["degradation_vector"].shape, (8,))
+        self.assertAlmostEqual(float(sample["degradation_vector"][0]), 0.1)
+        self.assertAlmostEqual(float(sample["degradation_vector"][3]), 0.0)
+        self.assertEqual(float(sample["score"]), 47.0)
+        self.assertEqual(sample["suggestions"], ["enhance edge sharpness"])
+
+    def test_degradation_vector_encoder_outputs_context_tokens(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from models.degradation_vector_encoder import DegradationVectorEncoder
+
+        encoder = DegradationVectorEncoder(
+            in_dim=8,
+            hidden_dim=16,
+            context_dim=12,
+            num_tokens=4,
+            dropout=0.0,
+        )
+        tokens = encoder(torch.ones(2, 8))
+
+        self.assertEqual(tokens.shape, (2, 4, 12))
+
+    def test_lr_condition_encoder_latent_adapter_shape(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from models.lr_condition_encoder import LRConditionEncoder
+
+        encoder = LRConditionEncoder(
+            latent_channels=16,
+            context_dim=24,
+            num_tokens=8,
+            mode="latent_adapter",
+            dropout=0.0,
+        )
+        tokens = encoder(torch.randn(2, 16, 8, 8))
+
+        self.assertEqual(tokens.shape, (2, 8, 24))
+
+    def test_flow_matching_helper_builds_velocity_target(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from rg_flux_fm import build_flow_matching_inputs
+
+        z_hr = torch.ones(2, 4, 2, 2)
+        eps = torch.zeros_like(z_hr)
+        sigma = torch.tensor([0.25, 0.75])
+
+        z_t, v_target = build_flow_matching_inputs(z_hr, eps=eps, sigma=sigma)
+
+        self.assertTrue(torch.allclose(z_t[0], torch.full_like(z_t[0], 0.75)))
+        self.assertTrue(torch.allclose(z_t[1], torch.full_like(z_t[1], 0.25)))
+        self.assertTrue(torch.allclose(v_target, -torch.ones_like(z_hr)))
+
+
+if __name__ == "__main__":
+    unittest.main()
