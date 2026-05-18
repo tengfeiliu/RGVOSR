@@ -156,7 +156,7 @@ def main(args):
         lq_up = lq_up.to(device=device, dtype=dtype)
 
         with torch.no_grad():
-            z_lr = artist.encode_images(lq_up)
+            z_lr = artist.encode_images(lq_up).to(device=device, dtype=dtype)
             prompt_embeds, pooled_prompt_embeds, text_ids = artist.encode_prompts([prompt], device=device, dtype=dtype)
             degradation_vector = degradation_tensor(result, device, dtype, args.use_degradation_vector)
             dino_tokens = artist.extract_visual_tokens(lq_up)

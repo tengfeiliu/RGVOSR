@@ -77,8 +77,14 @@ class FluxSRArtist(nn.Module):
         self.use_degradation_vector = bool(_cfg(config, "condition.use_degradation_vector", True))
         self.use_visual_semantic_tokens = bool(_cfg(config, "condition.use_visual_semantic_tokens", False))
         self.use_lora = bool(_cfg(config, "model.use_lora", True))
+        self.text_encoder_device = str(_cfg(config, "model.text_encoder_device", "cpu"))
+        self.text_encoder_dtype = _dtype_from_config(_cfg(config, "model.text_encoder_dtype", "fp32"))
+        self.vae_device = str(_cfg(config, "model.vae_device", "cpu"))
+        default_vae_dtype = "fp32" if self.vae_device.lower() == "cpu" else _cfg(config, "model.dtype", "bf16")
+        self.vae_dtype = _dtype_from_config(_cfg(config, "model.vae_dtype", default_vae_dtype))
+        self.max_prompt_sequence_length = int(_cfg(config, "model.max_prompt_sequence_length", 128))
 
-        self.vae = None
+        object.__setattr__(self, "vae", None)
         self.transformer = None
         self.text_pipeline = None
         self.vae_scale_factor = 8
@@ -98,8 +104,12 @@ class FluxSRArtist(nn.Module):
             first = args[0]
             if isinstance(first, (torch.device, str, int)):
                 device = first
-        if device is not None and self.text_pipeline is not None and hasattr(self.text_pipeline, "to"):
-            self.text_pipeline.to(device)
+        if self.vae is not None and self.vae_device.lower() in {"cuda", "gpu", "same"} and device is not None:
+            self.vae.to(device=device, dtype=self.vae_dtype)
+        elif self.vae is not None and self.vae_device.lower() == "cpu":
+            self.vae.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return module
 
     def _load_flux_modules(self):
@@ -111,11 +121,16 @@ class FluxSRArtist(nn.Module):
                 "Install project dependencies before constructing FluxSRArtist."
             ) from exc
 
-        self.vae = AutoencoderKL.from_pretrained(
+        vae = AutoencoderKL.from_pretrained(
             self.flux_model_path,
             subfolder="vae",
-            torch_dtype=self.weight_dtype,
+            torch_dtype=self.vae_dtype,
         )
+        if self.vae_device.lower() == "cpu":
+            vae.to("cpu")
+        elif self.vae_device.lower() not in {"cuda", "gpu", "same"}:
+            vae.to(self.vae_device)
+        object.__setattr__(self, "vae", vae)
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.flux_model_path,
             subfolder="transformer",
@@ -125,8 +140,10 @@ class FluxSRArtist(nn.Module):
             self.flux_model_path,
             transformer=None,
             vae=None,
-            torch_dtype=self.weight_dtype,
+            torch_dtype=self.text_encoder_dtype,
         )
+        if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
+            self.text_pipeline.to(self.text_encoder_device)
         self.vae.requires_grad_(False)
         self.vae.eval()
         for module in (getattr(self.text_pipeline, "text_encoder", None), getattr(self.text_pipeline, "text_encoder_2", None)):
@@ -266,10 +283,17 @@ class FluxSRArtist(nn.Module):
     def encode_prompts(self, prompts, device=None, dtype=None):
         if isinstance(prompts, str):
             prompts = [prompts]
-        prompt_embeds, pooled_prompt_embeds, text_ids = self.text_pipeline.encode_prompt(
-            prompt=prompts,
-            prompt_2=None,
-        )
+        text_device = self.text_encoder_device if self.text_encoder_device else "cpu"
+        if text_device.lower() == "cpu" and hasattr(self.text_pipeline, "to"):
+            self.text_pipeline.to("cpu")
+        encode_kwargs = {"prompt": prompts, "prompt_2": None}
+        if self.max_prompt_sequence_length > 0:
+            encode_kwargs["max_sequence_length"] = self.max_prompt_sequence_length
+        try:
+            prompt_embeds, pooled_prompt_embeds, text_ids = self.text_pipeline.encode_prompt(**encode_kwargs)
+        except TypeError:
+            encode_kwargs.pop("max_sequence_length", None)
+            prompt_embeds, pooled_prompt_embeds, text_ids = self.text_pipeline.encode_prompt(**encode_kwargs)
         device = device or _module_device(self.transformer)
         dtype = dtype or self.weight_dtype
         return (

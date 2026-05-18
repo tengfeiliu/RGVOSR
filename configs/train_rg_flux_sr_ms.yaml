@@ -1,7 +1,12 @@
 model:
-  flux_model_path: black-forest-labs/FLUX.1-dev
+  flux_model_path: /data/models/FLUX.1-dev
   use_flux_vae: true
   dtype: bf16
+  text_encoder_device: cpu
+  text_encoder_dtype: fp32
+  vae_device: cpu
+  vae_dtype: fp32
+  max_prompt_sequence_length: 128
   use_lora: true
   lora_rank: 16
   lora_alpha: 16

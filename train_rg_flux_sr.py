@@ -148,6 +148,17 @@ def main(config_path, dry_run=False):
             json.dump(config, handle, indent=2)
         local_logger = create_logger(logging_dir)
         local_logger.info("Experiment directory created at %s", output_dir)
+        per_device_batch = int(cfg(config, "data.batch_size", 1))
+        grad_accum = int(cfg(config, "training.grad_accum_steps", 1))
+        effective_batch = per_device_batch * accelerator.num_processes * grad_accum
+        local_logger.info("===========> RG-FLUX-SR-MS Batch Size Debug Info:")
+        local_logger.info("  accelerator.num_processes = %s", accelerator.num_processes)
+        local_logger.info("  data.batch_size per device = %s", per_device_batch)
+        local_logger.info("  training.grad_accum_steps = %s", grad_accum)
+        local_logger.info("  effective global batch = %s", effective_batch)
+        local_logger.info("  text_encoder_device = %s", cfg(config, "model.text_encoder_device", "cpu"))
+        local_logger.info("  vae_device = %s", cfg(config, "model.vae_device", "cpu"))
+        local_logger.info("  max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
 
     seed = cfg(config, "training.seed", 42)
     if seed is not None:
@@ -255,8 +266,8 @@ def main(config_path, dry_run=False):
 
             unwrapped_artist = accelerator.unwrap_model(artist)
             with torch.no_grad():
-                z_hr = unwrapped_artist.encode_images(hq)
-                z_lr = unwrapped_artist.encode_images(lq_up)
+                z_hr = unwrapped_artist.encode_images(hq).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+                z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 prompt_embeds, pooled_prompt_embeds, text_ids = unwrapped_artist.encode_prompts(
                     prompts,
                     device=accelerator.device,

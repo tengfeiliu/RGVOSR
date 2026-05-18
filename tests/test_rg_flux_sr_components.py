@@ -1,8 +1,10 @@
 import json
+import ast
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
 from PIL import Image
 
 try:
@@ -37,6 +39,40 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("blur and JPEG artifacts", prompt)
         self.assertIn("- recover fine textures", prompt)
         self.assertIn("Avoid hallucinated details", prompt)
+
+    def test_flux_artist_to_does_not_move_text_pipeline(self):
+        source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        flux_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FluxSRArtist"
+        )
+        to_func = next(node for node in flux_class.body if isinstance(node, ast.FunctionDef) and node.name == "to")
+
+        calls_text_pipeline_to = False
+        for node in ast.walk(to_func):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "to":
+                continue
+            value = func.value
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr == "text_pipeline"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "self"
+            ):
+                calls_text_pipeline_to = True
+
+        self.assertFalse(calls_text_pipeline_to)
+
+    def test_default_config_uses_low_memory_frozen_encoder_devices(self):
+        config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
+
+        self.assertEqual(config["model"]["text_encoder_device"], "cpu")
+        self.assertEqual(config["model"]["vae_device"], "cpu")
+        self.assertEqual(config["model"]["vae_dtype"], "fp32")
+        self.assertLessEqual(config["model"]["max_prompt_sequence_length"], 128)
 
     def test_prompt_builder_can_disable_suggestions(self):
         from models.prompt_builder import build_sr_prompt
