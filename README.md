@@ -1,253 +1,313 @@
-<div align="center">
+# RG-FLUX-SR / VOSR Command Reference
 
-<p align="center">
-  <img src="assets/logo.png" alt="VOSR logo" width="72%">
-</p>
+这个 README 主要作为本地和服务器上的运行命令手册。当前重点是 `train_rg_flux_sr.py`、`inference_rg_flux_sr.py` 和 `eval_rg_flux_sr_metrics.py` 这条 RG-FLUX-SR 训练、推理、评测链路。
 
-# VOSR: A Vision-Only Generative Model for Image Super-Resolution
+## 项目简介
 
-<p align="center"><i>A framework for native generative image restoration.</i></p>
+RG-FLUX-SR 是在 FLUX.1-dev 上做超分适配的实验链路。训练时使用 FLUX VAE 编码 HQ/LQ-up 图像，在 latent space 中做 flow matching；FLUX transformer 作为主干，主要训练 LoRA 和退化/LR 条件 adapter。
 
-#### &#x1F6A9; Accepted by CVPR 2026
+目前推荐先用 2 卡 256 smoke 配置验证完整链路，再在更大显存或 8 卡环境下使用 512 正式配置训练。
 
-[![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b.svg)](https://arxiv.org/pdf/2604.03225)
-[![VOSR-ModelScope](https://img.shields.io/badge/VOSR-ModelScope-6246EA.svg)](https://modelscope.cn/models/LULALULALU/VOSR_CKPT)
-[![VOSR-HuggingFace](https://img.shields.io/badge/VOSR-HuggingFace-FCC624.svg)](https://huggingface.co/CSWRY/VOSR)
-[![ScreenSR-ModelScope](https://img.shields.io/badge/ScreenSR-ModelScope-0EA5E9.svg)](https://modelscope.cn/datasets/LULALULALU/ScreenSR)
-[![ScreenSR-HuggingFace](https://img.shields.io/badge/ScreenSR-HuggingFace-FFB000.svg)](https://huggingface.co/datasets/CSWRY/ScreenSR)
+## 环境与模型路径
 
-[Rongyuan Wu](https://scholar.google.com/citations?user=A-U8zE8AAAAJ&hl=zh-CN)<sup>1,2,&#42;</sup> |
-[Lingchen Sun](https://scholar.google.com/citations?user=ZCDjTn8AAAAJ&hl=zh-CN)<sup>1,2,&#42;</sup> |
-[Zhengqiang Zhang](https://scholar.google.com/citations?user=UX26wSMAAAAJ&hl=en)<sup>1,2</sup> |
-[Xiangtao Kong](https://scholar.google.com/citations?user=lueNzSgAAAAJ&hl=zh-CN)<sup>1,2</sup> <br>
-[Jixin Zhao](https://scholar.google.com/citations?user=0Z89rfUAAAAJ)<sup>1,2</sup> |
-[Shihao Wang](https://scholar.google.com/citations?user=7TWugs4AAAAJ&hl=zh-CN)<sup>1</sup> |
-[Lei Zhang](https://www4.comp.polyu.edu.hk/~cslzhang/)<sup>1,2,&dagger;</sup>
-
-<sup>1</sup> The Hong Kong Polytechnic University  
-<sup>2</sup> OPPO Research Institute
-
-<sup>&#42;</sup> Equal contribution. <sup>&dagger;</sup> Corresponding author.
-
-</div>
-
-<!-- Optional teaser image -->
-<!-- ![teaser](assets/teaser.png) -->
-
-<p align="center">
-  <img src="assets/overview.jpg" alt="VOSR overview" width="100%">
-</p>
-<p align="center"><em>Overview of the VOSR framework, including the overall pipeline and our condition / guidance design.</em></p>
-
-
-## &#x1F4CC; Quick Links
-
-- [&#x1F4F0; News](#news)
-- [&#x1F9F0; Preparation](#preparation)
-- [&#x1F3CB;&#xFE0F; Training](#training)
-- [&#x1F50D; Inference](#inference)
-- [&#x1F4EE; Contact](#contact)
-- [&#x1F4DA; Citation](#citation)
-
-<a id="news"></a>
-## &#x1F4F0; News
-
-- 2026.04.10 Public release: training and inference code, [pretrained checkpoints](https://modelscope.cn/models/LULALULALU/VOSR_CKPT), bundled VAE / decoder assets, and the [ScreenSR](https://modelscope.cn/datasets/LULALULALU/ScreenSR) benchmark. Setup and file layout: [Preparation](#preparation); commands: [Training](#training) and [Inference](#inference).
-
----
-
-<p align="center">
-  <img src="assets/vosr_comparison_figure.png" alt="VOSR performance, efficiency, and training cost comparison" width="100%">
-</p>
-<p align="center"><em>Comparison with prior methods in performance, inference efficiency, and training cost.</em></p>
-
-<p align="center">
-  <img src="assets/vis_comp.jpg" alt="Qualitative comparison on natural and text-rich images" width="100%">
-</p>
-<p align="center"><em>VOSR better preserves fine structures and text readability.</em></p>
-
-<a id="preparation"></a>
-## &#x1F9F0; Preparation
-
-### Dependencies and Installation
+安装依赖：
 
 ```bash
-## clone this repository
-git clone https://github.com/cswry/VOSR.git
-cd VOSR
-
-# create an environment with python >= 3.8
-conda create -n vosr python=3.8
-conda activate vosr
 pip install -r requirements.txt
 ```
 
-### &#x1F4E6; Model Weights
+FLUX 模型目录需要是完整 Diffusers 格式，并包含 `transformer/`、`vae/`、text encoder、tokenizer 等子目录。当前配置默认路径：
 
-Download all pretrained weights from [ModelScope](https://modelscope.cn/models/LULALULALU/VOSR_CKPT) or [Hugging Face](https://huggingface.co/CSWRY/VOSR), and place them under `preset/ckpts/`. The expected structure:
+```yaml
+model:
+  flux_model_path: /data/datasets/FLUX.1-dev
+```
+
+如果服务器路径不同，修改：
+
+- `configs/train_rg_flux_sr_ms.yaml`
+- `configs/train_rg_flux_sr_ms_smoke_256.yaml`
+
+数据 JSONL 默认：
+
+```yaml
+data:
+  jsonl_path: datasets/LSDIR_cache/valid.jsonl
+```
+
+每条 JSONL 需要包含 `hq_path`、`lq_path` 和 `result`。`result` 中的 reasoning、suggestions、degradation_vector 会用于 prompt 和退化条件。
+
+## 配置文件说明
+
+| 文件 | 用途 |
+| --- | --- |
+| `configs/train_rg_flux_sr_ms_smoke_256.yaml` | 2 卡低显存 smoke 配置，`crop_size=256`，用于验证训练链路。 |
+| `configs/train_rg_flux_sr_ms.yaml` | 512 正式训练配置，推荐 8 卡或更大显存。 |
+| `configs/accelerate/zero3_bf16_cpu_offload.yaml` | 2 卡 ZeRO-3 + CPU offload，用于 24GB 卡 smoke test。 |
+| `configs/accelerate/zero3_bf16.yaml` | 8 卡 ZeRO-3，无 CPU offload，用于正式训练。 |
+
+关键配置：
+
+- `data.batch_size`：每卡 batch，不是 global batch。
+- `training.grad_accum_steps`：梯度累积步数。
+- 有效 batch：`batch_size * num_processes * grad_accum_steps`。
+- `model.text_encoder_device: cpu`：text encoder 放 CPU，避免初始化 OOM。
+- `model.vae_device: cpu`：VAE 放 CPU，继续降低显存压力。
+- `evaluation.eval_every: 500`：训练中每 500 step 计算一次指标。
+
+## RG-FLUX-SR 训练命令
+
+### 2 卡 256 Smoke Dry-Run
+
+这个命令用于验证 2x24GB 环境下 ZeRO-3 初始化、模型加载、forward、backward、optimizer step 和 checkpoint 保存是否能完整跑通。`--dry_run` 只跑 1 个优化 step，适合改代码或换环境后快速检查。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 2 \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux_sr_ms_smoke_256.yaml \
+  --dry_run
+```
+
+### 2 卡 256 Smoke 正式训练
+
+这个命令去掉了 `--dry_run`，会按 smoke 配置持续训练。它适合 2x24GB 上做流程验证、小规模实验或调试，不代表最终 512 正式训练效果。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 2 \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux_sr_ms_smoke_256.yaml
+```
+
+### 8 卡 512 Dry-Run
+
+这个命令用正式 512 配置先跑 1 个 step，适合在正式训练前检查 8 卡 ZeRO-3、模型路径、数据路径和显存是否正常。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16.yaml \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux_sr_ms.yaml \
+  --dry_run
+```
+
+### 8 卡 512 正式训练
+
+这是推荐的正式训练入口。512 crop 的 image token 数比 256 高 4 倍，显存压力明显更大，建议用 8 卡或更大显存环境。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16.yaml \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux_sr_ms.yaml
+```
+
+### 普通 DDP Dry-Run
+
+这个命令主要用于调试 accelerate/DDP 行为，不推荐在 24GB 卡上做完整 512 训练。普通 DDP 会在每张卡上复制完整 FLUX transformer，显存压力比 ZeRO-3 更高。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --num_machines 1 \
+  --num_processes 2 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux_sr_ms_smoke_256.yaml \
+  --dry_run
+```
+
+## RG-FLUX-SR 推理命令
+
+### 单张图片或文件夹推理
+
+这个命令使用训练好的 LoRA/adapter checkpoint 对 LQ 图片或文件夹做超分。`--num_inference_steps` 控制 multi-step flow matching 的采样步数，默认建议 25。
+
+```bash
+python inference_rg_flux_sr.py \
+  --input path/to/lq_or_folder \
+  --output_dir outputs/rg_flux_sr \
+  --checkpoint exp_rg_flux_sr/rg_flux_sr_ms_stageA_latent_adapter_size256_smoke256/checkpoints/checkpoint-00000001/rg_flux_adapters \
+  --config configs/train_rg_flux_sr_ms_smoke_256.yaml \
+  --jsonl_path datasets/LSDIR_cache/valid.jsonl \
+  --num_inference_steps 25 \
+  --upscale 4
+```
+
+参数说明：
+
+- `--input`：输入 LQ 图片、文件夹，或 txt 列表。
+- `--output_dir`：SR 图片输出目录。
+- `--checkpoint`：训练保存的 adapter 目录，通常指向 `.../checkpoint-XXXXXXXX/rg_flux_adapters`。
+- `--config`：训练时使用的配置。推理会用其中的模型路径、条件模式等设置。
+- `--jsonl_path`：可选，用于读取 RG/VOSR 分析结果并构造 prompt 与 degradation vector。
+- `--num_inference_steps`：flow matching 采样步数，越大通常越慢。
+- `--upscale`：输入图先 bicubic 放大的倍率，默认超分倍率通常用 4。
+
+## 指标评测命令
+
+### 独立评测 SR 图片目录
+
+这个命令对已经生成好的 SR 图片目录计算 OMGSR 同款 PyIQA no-reference 指标，并输出 per-image CSV 和 summary JSON。
+
+```bash
+python eval_rg_flux_sr_metrics.py \
+  --dataset_dirs smoke=outputs/rg_flux_sr \
+  --output_dir eval/rg_flux_sr_smoke \
+  --device cuda \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa
+```
+
+输出文件：
 
 ```text
-preset/ckpts/
-|-- Qwen-Image-vae-2d/          # Qwen-Image VAE (2D, for 1.4B models)
-|-- stable-diffusion-2-1-base/  # SD2.1 VAE (for 0.5B models)
-|-- sd21_lwdecoder.pth          # Lightweight decoder for SD2.1 VAE
-|-- torch_cache/                # DINOv2 pretrained weights
-|-- VOSR_0.5B_ms/               # 0.5B multi-step model
-|-- VOSR_0.5B_os/               # 0.5B one-step (distilled) model
-|-- VOSR_1.4B_ms/               # 1.4B multi-step model
-`-- VOSR_1.4B_os/               # 1.4B one-step (distilled) model
+eval/rg_flux_sr_smoke/
+|-- per_image_scores.csv
+|-- summary_scores.csv
+`-- summary_scores.json
 ```
 
-#### VAE and decoder
+默认指标：
 
-For `VOSR-0.5B`, we provide `sd21_lwdecoder.pth`, a lightweight replacement for the original SD2.1 VAE decoder. It achieves comparable overall visual quality in our evaluation, while performing slightly better on text-rich and document-like images.
+- `clipiqa`
+- `clipiqa+`
+- `nima`
+- `niqe`
+- `liqe`
+- `musiq`
+- `maniqa`
 
-When scaling to `VOSR-1.4B`, we adopt the 16-channel Qwen-Image VAE to better preserve input fidelity. Although Qwen-Image is designed for T2I generation, it is released in a video-VAE form, which is unnecessarily slow for image SR inference. We therefore provide `Qwen-Image-vae-2d`, an image-only 2D variant extracted from the original model to remove the overhead of the full 3D design.
+其中 `niqe` 是 lower better，其余通常是 higher better。
 
-### &#x1F5C2;&#xFE0F; Training Data
+### 多个数据集一起评测
 
-We support two data loading modes, configured via `dataset_type` in the YAML config:
+如果有多个 SR 输出目录，可以一次传入多个 `name=path`。
 
-- `txt` - Each folder contains individual image files. A txt config lists folders with sampling weights.
-- `webdataset` - Each folder contains `.tar` shards. Same txt config format, loaded via WebDataset.
+```bash
+python eval_rg_flux_sr_metrics.py \
+  --dataset_dirs smoke=outputs/smoke real=outputs/real \
+  --output_dir eval/rg_flux_compare \
+  --device cuda
+```
 
-Create a dataset config file (e.g., `configs/train_txt/train_dataset_txt.txt`):
+### 训练期自动评测
+
+训练脚本会读取 YAML 中的 `evaluation` 配置。默认每 500 step 运行一次评测，采样前 8 条 JSONL 记录生成 SR 图片，然后计算 PyIQA 指标。
+
+```yaml
+evaluation:
+  enabled: true
+  eval_every: 500
+  num_samples: 8
+  num_inference_steps: 25
+  metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa]
+  jsonl_path: null
+  output_dir: eval
+  device: cpu
+```
+
+训练期指标输出路径：
 
 ```text
-/path/to/dataset_A, 2
-/path/to/dataset_B, 1
-/path/to/dataset_C, 1
+eval/<exp_name>/step-XXXXXXXX/
+|-- images/
+`-- metrics/
+    |-- per_image_scores.csv
+    |-- summary_scores.csv
+    `-- summary_scores.json
 ```
 
-Each line: `<folder_path>, <sampling_weight>`. Higher weight = more frequent sampling.
+默认 `evaluation.device: cpu` 是为了避免 PyIQA 额外占用训练 GPU 显存。如果显存充足，可以改成 `cuda` 加速指标计算。
 
-For `txt` mode, each folder should contain HQ images (`.png` / `.jpg`). For `webdataset` mode, each folder should contain `.tar` shards with images inside.
+## 常用参数说明
 
-### &#x1F9EA; New Real-World Paired Benchmark
+### `--dry_run`
 
-Download the [ScreenSR benchmark from ModelScope](https://modelscope.cn/datasets/LULALULALU/ScreenSR) or [Hugging Face](https://huggingface.co/datasets/CSWRY/ScreenSR), place it wherever you like, and then point `-i` to that folder when running inference.
+只跑 1 个优化 step，用于检查初始化、前向、反向、保存 checkpoint 是否正常。正式训练去掉即可。
 
-[ScreenSR](https://modelscope.cn/datasets/LULALULALU/ScreenSR) is a real-world paired benchmark for generative SR, built with a screen re-photography pipeline. It provides cleaner references, more diverse content, and broader variation in scenes and scales than existing real-world paired SR benchmarks.
+### `crop_size`
 
-<p align="center">
-  <img src="assets/montage_13x10_256px.jpg" alt="ScreenSR benchmark montage" width="100%">
-</p>
-<p align="center"><em>Thumbnail montage of the ScreenSR benchmark, covering diverse scenes, subjects, and multilingual text.</em></p>
+训练 patch 大小。`256` 对应更低显存 smoke；`512` 是正式配置。由于 FLUX 会 pack latent tokens，512 的 image token 数约为 256 的 4 倍，显存压力明显更高。
 
----
+### `lr_token_count`
 
-<a id="training"></a>
-## &#x1F3CB;&#xFE0F; Training
+LR latent adapter 产生的条件 token 数。token 越多，条件信息越丰富，但显存也更高。smoke 配置中是 16，正式配置中是 64。
 
-The provided training configs disable experiment tracking by default
-(`report_to: none`). To enable Weights & Biases logging, run `wandb login`
-with your own account and set `report_to: wandb` in the YAML config.
+### `num_inference_steps`
 
-### Multi-step Training
+推理时 multi-step flow matching 的采样步数。常用值：
 
-```bash
-# VOSR-0.5B
-torchrun --nproc_per_node=8 train_vosr.py --config configs/train_yml/multi_step/VOSR_0.5B.yml
+- `10`：更快，质量可能不稳定。
+- `25`：默认推荐值。
+- `50`：更慢，质量收益不一定线性。
 
-# VOSR-1.4B
-torchrun --nproc_per_node=8 train_vosr.py --config configs/train_yml/multi_step/VOSR_1.4B.yml
+### `resume_ckpt`
+
+配置中可以显式指定 checkpoint：
+
+```yaml
+training:
+  resume_ckpt: path/to/checkpoint-XXXXXXXX
 ```
 
-### One-step Distillation
+当前训练脚本也会扫描实验目录下的最新 checkpoint。如果想完全从头开始，建议换一个新的 `training.suffix`，或清理对应实验目录中的旧 `checkpoints/`。
 
-Requires a trained multi-step teacher checkpoint. Set `teacher_ckpt` and `pretrained_ckpt` in the YAML config.
+## 常见问题
 
-```bash
-# VOSR-0.5B one-step
-torchrun --nproc_per_node=8 train_vosr_distill.py --config configs/train_yml/one_step/VOSR_0.5B.yml
+### 1. 2 卡 24GB 能不能直接训练 512？
 
-# VOSR-1.4B one-step
-torchrun --nproc_per_node=8 train_vosr_distill.py --config configs/train_yml/one_step/VOSR_1.4B.yml
+不推荐。512 crop + FLUX.1-dev 的 forward 显存压力很大。2 卡 24GB 建议先跑 `train_rg_flux_sr_ms_smoke_256.yaml` 验证链路；512 正式训练建议 8 卡或更大显存。
+
+### 2. 为什么 text encoder 和 VAE 放 CPU？
+
+FLUX.1-dev 本身很大。把 text encoder 和 VAE 放 GPU 会在初始化或 forward 前额外占用大量显存。当前训练只需要冻结的 text/VAE 编码结果，所以默认放 CPU 更稳。
+
+### 3. ZeRO-3 下为什么禁用了 transformer gradient checkpointing？
+
+Diffusers FLUX transformer 的 gradient checkpointing 和 DeepSpeed ZeRO-3 参数分片在 backward recompute 阶段会出现 metadata mismatch。当前默认在 ZeRO-3 下关闭 transformer gradient checkpointing，优先保证链路稳定。
+
+### 4. `TOKENIZERS_PARALLELISM=false` 是必须的吗？
+
+不是数学上必须，但建议保留。它可以减少 tokenizer 多进程并行相关 warning 和潜在卡顿。
+
+### 5. 训练期指标很慢怎么办？
+
+可以调小：
+
+```yaml
+evaluation:
+  eval_every: 2000
+  num_samples: 4
+  device: cpu
 ```
 
----
+也可以临时关闭：
 
-<a id="inference"></a>
-## &#x1F50D; Inference
-
-Single-GPU inference. 
-
-### Multi-step models
-
-Multi-step sampling defaults to **25 steps** (`--infer_steps`, default 25). Override if you need fewer or more function evaluations.
-
-Two knobs mainly affect the trade-off between faithfulness to the LR input and generative detail (both can be set via CLI to override `args.json`):
-
-- `--cfg_scale` - Higher values tend to emphasize fidelity to the condition; lower values give more generative freedom. The sweet spot depends on input degradation strength. In our experiments, roughly `-0.5` to `2` is a usable range; `0.5` is a practical default.
-- `--weak_cond_strength_aelq` - During training this is sampled uniformly in `[0.05, 0.25]` so the checkpoint supports a wide range at inference via the same flag (smaller -> more generative, larger -> more faithful). Default `0.1`.
-
-Benchmark presets (multi-step): for apples-to-apples evaluation we use `--cfg_scale -0.5` on RealSR and `--cfg_scale 0.5` on [ScreenSR](https://modelscope.cn/datasets/LULALULALU/ScreenSR).
-
-```bash
-# Inputs under preset/datasets/inp_data follow RealSR-style evaluation; use --cfg_scale -0.5 (see benchmark presets above).
-
-# VOSR-0.5B multi-step (25 steps)
-python inference_vosr.py \
-    -c preset/ckpts/VOSR_0.5B_ms \
-    -i preset/datasets/inp_data \
-    -o preset/results \
-    -u 4
-
-# VOSR-1.4B multi-step (25 steps)
-python inference_vosr.py \
-    -c preset/ckpts/VOSR_1.4B_ms \
-    -i preset/datasets/inp_data \
-    -o preset/results \
-    -u 4
+```yaml
+evaluation:
+  enabled: false
 ```
 
-### One-step models
+## Legacy VOSR
 
-One-step models use `--infer_steps` with default `1` (typical for distilled checkpoints).
+原始 VOSR 多步/一步推理脚本仍在仓库中：
 
-```bash
-# VOSR-0.5B one-step
-python inference_vosr_onestep.py \
-    -c preset/ckpts/VOSR_0.5B_os \
-    -i preset/datasets/inp_data \
-    -o preset/results \
-    -u 4
+- `train_vosr.py`
+- `train_vosr_distill.py`
+- `inference_vosr.py`
+- `inference_vosr_onestep.py`
 
-# VOSR-1.4B one-step
-python inference_vosr_onestep.py \
-    -c preset/ckpts/VOSR_1.4B_os \
-    -i preset/datasets/inp_data \
-    -o preset/results \
-    -u 4
-```
-
-Key arguments: `-c` checkpoint path, `-i` input image or folder, `-o` output directory, `-u` upscale factor. Multi-step (`inference_vosr.py`): `--infer_steps` (default `25`), `--cfg_scale`, `--weak_cond_strength_aelq` (see above). One-step (`inference_vosr_onestep.py`): `--infer_steps` (default `1`). Use `--tile_size 512` for large images.
-
----
-
-<a id="contact"></a>
-## &#x1F4EE; Contact
-
-If you have any questions, please feel free to contact: `rong-yuan.wu@connect.polyu.hk`
-
-<a id="citation"></a>
-## &#x1F4DA; Citation
-
-If VOSR is useful for your research, please consider citing:
-
-```bibtex
-@inproceedings{wu2026vosr,
-  title   = {VOSR: A Vision-Only Generative Model for Image Super-Resolution},
-  author  = {Wu, Rongyuan and Sun, Lingchen and Zhang, Zhengqiang and Kong, Xiangtao and Zhao, Jixin and Wang, Shihao and Zhang, Lei},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year    = {2026}
-}
-```
-
-## Acknowledgements
-
-This project benefits from [stable-diffusion-2-1-base](https://huggingface.co/Manojb/stable-diffusion-2-1-base), [LightningDiT](https://github.com/hustvl/LightningDiT), [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image), [DINOv2](https://github.com/facebookresearch/dinov2), [BasicSR](https://github.com/XPixelGroup/BasicSR), [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), [RCGM](https://github.com/LINs-lab/RCGM), and [Shortcut-models](https://github.com/kvfrans/shortcut-models). We thank the authors for their open-source contributions.
-
-## &#x2696;&#xFE0F; License
-
-This project is released under the Apache License 2.0 unless otherwise noted. See [LICENSE](LICENSE) for details. Downloadable model weights, benchmark data, and external assets may have separate terms on their hosting pages.
+当前 README 不再展开旧 VOSR 命令，主要维护 RG-FLUX-SR 实验链路。

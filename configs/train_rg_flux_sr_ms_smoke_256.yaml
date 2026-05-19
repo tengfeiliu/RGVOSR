@@ -70,6 +70,16 @@ flow_matching:
   timestep_conversion: sigma
   num_inference_steps: 25
 
+evaluation:
+  enabled: true
+  eval_every: 500
+  num_samples: 8
+  num_inference_steps: 25
+  metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa]
+  jsonl_path: null
+  output_dir: eval
+  device: cpu
+
 loss:
   fm_weight: 1.0
   latent_weight: 0.0

@@ -11,6 +11,9 @@ import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from PIL import Image
+from torchvision import transforms
+from torchvision.transforms.functional import to_tensor
 try:
     from accelerate.utils import GradientAccumulationPlugin
 except ImportError:
@@ -21,9 +24,12 @@ except ImportError:
 from diffusers.optimization import get_scheduler
 from tqdm import tqdm
 
+from dataloaders.degradation_meta import DEGRADATION_KEYS
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
+from metrics.rg_sr_metrics import DEFAULT_OMGSR_METRICS, evaluate_dataset_dirs
 from models.flux_sr_artist import FluxSRArtist
-from rg_flux_fm import build_flow_matching_inputs, sample_sigma
+from models.prompt_builder import build_sr_prompt
+from rg_flux_fm import build_flow_matching_inputs, sample_multistep_fm, sample_sigma
 
 
 logger = get_logger(__name__)
@@ -192,12 +198,179 @@ def make_experiment_name(config):
     return f"rg_flux_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
 
 
+def load_evaluation_records(jsonl_path, num_samples):
+    jsonl_path = Path(jsonl_path)
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"Evaluation JSONL file not found: {jsonl_path}")
+    records = []
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            lq_path = record.get("lq_path")
+            result = record.get("result")
+            if not lq_path or not Path(lq_path).exists() or not isinstance(result, dict):
+                continue
+            records.append(record)
+            if len(records) >= num_samples:
+                break
+    if not records:
+        raise RuntimeError(f"No valid evaluation records found in {jsonl_path}")
+    return records
+
+
+def prepare_eval_lq_up(image_path, upscale, align):
+    image = Image.open(image_path).convert("RGB")
+    if upscale > 1:
+        image = image.resize((image.width * upscale, image.height * upscale), Image.Resampling.BICUBIC)
+    width = max(align, image.width - image.width % align)
+    height = max(align, image.height - image.height % align)
+    if (width, height) != image.size:
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return to_tensor(image).unsqueeze(0).mul(2.0).sub(1.0)
+
+
+def degradation_tensor_from_result(result, device, dtype, use_degradation_vector=True):
+    vector = result.get("degradation_vector") if isinstance(result, dict) else {}
+    vector = vector if isinstance(vector, dict) and use_degradation_vector else {}
+    values = [float(vector.get(key, 0.0) or 0.0) for key in DEGRADATION_KEYS]
+    return torch.tensor(values, device=device, dtype=dtype).unsqueeze(0)
+
+
+def fork_rng_for_device(device):
+    if getattr(device, "type", None) == "cuda":
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return torch.random.fork_rng(devices=[index])
+    return torch.random.fork_rng(devices=[])
+
+
+def evaluation_logs_from_summary(summary_json):
+    logs = {}
+    for row in summary_json.get("summary", []):
+        if row.get("dataset") != "eval":
+            continue
+        metric = row["metric"]
+        logs[f"eval/{metric}"] = float(row["mean"])  # Logs use eval/<metric> keys.
+    return logs
+
+
+def run_rg_flux_evaluation(accelerator, artist, config, exp_name, global_step, weight_dtype, local_logger=None):
+    if not bool(cfg(config, "evaluation.enabled", False)):
+        return None
+    eval_every = int(cfg(config, "evaluation.eval_every", 500))
+    if eval_every <= 0 or global_step <= 0 or global_step % eval_every != 0:
+        return None
+
+    eval_jsonl = cfg(config, "evaluation.jsonl_path", None) or cfg(config, "data.jsonl_path")
+    records = load_evaluation_records(eval_jsonl, int(cfg(config, "evaluation.num_samples", 8)))
+    eval_root = Path(cfg(config, "evaluation.output_dir", "eval")) / exp_name / f"step-{global_step:08d}"
+    image_dir = eval_root / "images"
+    metrics_dir = eval_root / "metrics"
+    if accelerator.is_main_process:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        if local_logger is not None:
+            local_logger.info("Running RG-FLUX-SR evaluation at step %s on %s samples", global_step, len(records))
+
+    unwrapped_artist = accelerator.unwrap_model(artist)
+    was_training = artist.training
+    artist.eval()
+    to_pil = transforms.ToPILImage()
+    lr_cond_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
+    use_degradation_vector = bool(cfg(config, "condition.use_degradation_vector", True))
+    num_inference_steps = int(cfg(config, "evaluation.num_inference_steps", cfg(config, "flow_matching.num_inference_steps", 25)))
+    eval_seed = int(cfg(config, "evaluation.seed", cfg(config, "training.seed", 42) or 42))
+
+    try:
+        with torch.no_grad():
+            for sample_index, record in enumerate(records):
+                result = record.get("result") if isinstance(record.get("result"), dict) else {}
+                prompt = build_sr_prompt(
+                    result,
+                    use_prompt=bool(cfg(config, "condition.use_prompt", True)),
+                    use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
+                )
+                lq_up = prepare_eval_lq_up(
+                    record["lq_path"],
+                    upscale=int(cfg(config, "data.scale", 4)),
+                    align=int(cfg(config, "data.vae_align", 16)),
+                ).to(accelerator.device, dtype=weight_dtype)
+                z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype)
+                prompt_embeds, pooled_prompt_embeds, text_ids = unwrapped_artist.encode_prompts(
+                    [prompt],
+                    device=accelerator.device,
+                    dtype=weight_dtype,
+                )
+                degradation_vector = degradation_tensor_from_result(
+                    result,
+                    accelerator.device,
+                    weight_dtype,
+                    use_degradation_vector=use_degradation_vector,
+                )
+                dino_tokens = unwrapped_artist.extract_visual_tokens(lq_up)
+                with fork_rng_for_device(accelerator.device):
+                    torch.manual_seed(eval_seed + sample_index)
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.manual_seed_all(eval_seed + sample_index)
+                    sr_latent = sample_multistep_fm(
+                        artist=artist,
+                        shape=tuple(z_lr.shape),
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        text_ids=text_ids,
+                        degradation_vector=degradation_vector,
+                        z_lr=z_lr,
+                        dino_tokens=dino_tokens,
+                        lr_cond_mode=lr_cond_mode,
+                        num_steps=num_inference_steps,
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+                if accelerator.is_main_process:
+                    sr = unwrapped_artist.decode_latents(sr_latent).clamp(-1, 1).add(1.0).mul(0.5).clamp(0, 1)
+                    to_pil(sr[0].float().cpu()).save(image_dir / f"{sample_index:04d}_{Path(record['lq_path']).stem}.png")
+                accelerator.wait_for_everyone()
+    finally:
+        if was_training:
+            artist.train()
+
+    summary_json = None
+    if accelerator.is_main_process:
+        metrics = cfg(config, "evaluation.metrics", DEFAULT_OMGSR_METRICS) or DEFAULT_OMGSR_METRICS
+        metric_device = cfg(config, "evaluation.device", "cpu")
+        summary_json = evaluate_dataset_dirs(
+            {"eval": image_dir},
+            output_dir=metrics_dir,
+            metrics=metrics,
+            device=metric_device,
+        )
+        if local_logger is not None:
+            for row in summary_json["summary"]:
+                metric = row["metric"]
+                direction = summary_json["metric_directions"].get(metric, "")
+                local_logger.info(
+                    "[Eval @ step %s] %s (%s): %.6f",
+                    global_step,
+                    metric,
+                    direction,
+                    float(row["mean"]),
+                )
+    accelerator.wait_for_everyone()
+    return summary_json
+
+
 def main(config_path, dry_run=False):
     config = load_config(config_path)
     config.setdefault("training", {})
     config.setdefault("model", {})
     config.setdefault("data", {})
     config.setdefault("condition", {})
+    config.setdefault("evaluation", {})
 
     report_to = normalize_report_to(cfg(config, "training.report_to", None))
     exp_name = cfg(config, "training.exp_name", None) or make_experiment_name(config)
@@ -216,6 +389,7 @@ def main(config_path, dry_run=False):
         project_config=accelerator_project_config,
     )
 
+    local_logger = logger
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -435,6 +609,19 @@ def main(config_path, dry_run=False):
                         checkpoint_dir / f"checkpoint-{global_step:08d}",
                         global_step,
                     )
+                eval_summary = run_rg_flux_evaluation(
+                    accelerator,
+                    artist,
+                    config,
+                    exp_name,
+                    global_step,
+                    weight_dtype,
+                    local_logger=local_logger if accelerator.is_main_process else None,
+                )
+                if accelerator.is_main_process and eval_summary is not None:
+                    eval_logs = evaluation_logs_from_summary(eval_summary)
+                    if eval_logs:
+                        accelerator.log(eval_logs, step=global_step)
 
     save_rg_checkpoint(
         accelerator,
