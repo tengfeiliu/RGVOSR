@@ -12,13 +12,6 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from tqdm import tqdm
-try:
-    from transformers.integrations import HfDeepSpeedConfig
-except ImportError:
-    try:
-        from transformers.integrations.deepspeed import HfDeepSpeedConfig
-    except ImportError:
-        HfDeepSpeedConfig = None
 
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
 from models.flux_sr_artist import FluxSRArtist
@@ -223,21 +216,18 @@ def main(config_path, dry_run=False):
     if seed is not None:
         set_seed(int(seed))
 
-    hf_ds_config = None
     ds_config = get_deepspeed_config(accelerator)
     if deepspeed_zero_stage(ds_config) == 3:
-        if HfDeepSpeedConfig is None:
-            raise ImportError("DeepSpeed ZeRO-3 training requires transformers with HfDeepSpeedConfig.")
         resolved_ds_config = resolve_hf_zero3_config(
             ds_config,
             per_device_batch=per_device_batch,
             grad_accum_steps=grad_accum,
             num_processes=accelerator.num_processes,
         )
-        hf_ds_config = HfDeepSpeedConfig(resolved_ds_config)
+        config.setdefault("_runtime", {})["hf_zero3_config"] = resolved_ds_config
         if accelerator.is_main_process:
             local_logger.info(
-                "Initialized HfDeepSpeedConfig before FluxSRArtist construction "
+                "Prepared HfDeepSpeedConfig for Flux transformer construction "
                 "(train_batch_size=%s, micro_batch=%s, grad_accum=%s).",
                 resolved_ds_config.get("train_batch_size"),
                 resolved_ds_config.get("train_micro_batch_size_per_gpu"),

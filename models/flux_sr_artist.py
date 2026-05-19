@@ -1,3 +1,4 @@
+import importlib
 import os
 from pathlib import Path
 
@@ -60,6 +61,41 @@ def _unpack_latents(tokens, height, width, latent_channels):
     tokens = tokens.view(bsz, height // 2, width // 2, latent_channels, 2, 2)
     tokens = tokens.permute(0, 3, 1, 4, 2, 5)
     return tokens.reshape(bsz, latent_channels, height, width)
+
+
+def _import_hf_deepspeed_config():
+    try:
+        from transformers.integrations import HfDeepSpeedConfig
+    except ImportError:
+        try:
+            from transformers.integrations.deepspeed import HfDeepSpeedConfig
+        except ImportError as exc:
+            raise ImportError("DeepSpeed ZeRO-3 loading requires transformers with HfDeepSpeedConfig.") from exc
+    return HfDeepSpeedConfig
+
+
+def _clear_hf_deepspeed_config():
+    for module_name in ("transformers.integrations.deepspeed", "transformers.deepspeed"):
+        try:
+            deepspeed_module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        unset_config = getattr(deepspeed_module, "unset_hf_deepspeed_config", None)
+        if callable(unset_config):
+            unset_config()
+        if hasattr(deepspeed_module, "_hf_deepspeed_config_weak_ref"):
+            setattr(deepspeed_module, "_hf_deepspeed_config_weak_ref", None)
+
+
+def _clip_position_embedding_length(text_pipeline):
+    text_encoder = getattr(text_pipeline, "text_encoder", None)
+    text_model = getattr(text_encoder, "text_model", None)
+    embeddings = getattr(text_model, "embeddings", None)
+    position_embedding = getattr(embeddings, "position_embedding", None)
+    weight = getattr(position_embedding, "weight", None)
+    if weight is None:
+        return None
+    return int(weight.shape[0])
 
 
 class FluxSRArtist(nn.Module):
@@ -131,17 +167,30 @@ class FluxSRArtist(nn.Module):
         elif self.vae_device.lower() not in {"cuda", "gpu", "same"}:
             vae.to(self.vae_device)
         object.__setattr__(self, "vae", vae)
-        self.transformer = FluxTransformer2DModel.from_pretrained(
-            self.flux_model_path,
-            subfolder="transformer",
-            torch_dtype=self.weight_dtype,
-        )
+
+        hf_ds_config = None
+        hf_zero3_config = _cfg(self.config, "_runtime.hf_zero3_config", None)
+        if hf_zero3_config:
+            HfDeepSpeedConfig = _import_hf_deepspeed_config()
+            hf_ds_config = HfDeepSpeedConfig(hf_zero3_config)
+        try:
+            self.transformer = FluxTransformer2DModel.from_pretrained(
+                self.flux_model_path,
+                subfolder="transformer",
+                torch_dtype=self.weight_dtype,
+            )
+        finally:
+            if hf_ds_config is not None:
+                _clear_hf_deepspeed_config()
+                hf_ds_config = None
+
         self.text_pipeline = FluxPipeline.from_pretrained(
             self.flux_model_path,
             transformer=None,
             vae=None,
             torch_dtype=self.text_encoder_dtype,
         )
+        self._validate_text_pipeline()
         if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
             self.text_pipeline.to(self.text_encoder_device)
         self.vae.requires_grad_(False)
@@ -153,6 +202,15 @@ class FluxSRArtist(nn.Module):
 
         if hasattr(self.vae.config, "block_out_channels"):
             self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+
+    def _validate_text_pipeline(self):
+        clip_position_count = _clip_position_embedding_length(self.text_pipeline)
+        if clip_position_count == 0:
+            raise RuntimeError(
+                "FLUX text_encoder position embeddings are empty. This usually means the text pipeline "
+                "was loaded while the global Hugging Face DeepSpeed ZeRO-3 config was active. "
+                "Keep HfDeepSpeedConfig scoped to FluxTransformer2DModel.from_pretrained only."
+            )
 
     def _infer_dimensions(self):
         vae_config = getattr(self.vae, "config", None)

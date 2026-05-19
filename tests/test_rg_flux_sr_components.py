@@ -67,25 +67,72 @@ class RGFluxSRComponentTests(unittest.TestCase):
 
         self.assertFalse(calls_text_pipeline_to)
 
-    def test_train_initializes_hf_zero3_before_flux_artist(self):
+    def test_train_passes_resolved_zero3_config_without_global_hf_init(self):
         source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
 
-        hf_ds_config_line = None
+        resolves_config_line = None
+        calls_hf_ds_config = False
         flux_artist_line = None
         for node in ast.walk(main_func):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             if isinstance(func, ast.Name) and func.id == "HfDeepSpeedConfig":
-                hf_ds_config_line = node.lineno
+                calls_hf_ds_config = True
+            if isinstance(func, ast.Name) and func.id == "resolve_hf_zero3_config":
+                resolves_config_line = node.lineno
             if isinstance(func, ast.Name) and func.id == "FluxSRArtist":
                 flux_artist_line = node.lineno
 
-        self.assertIsNotNone(hf_ds_config_line)
+        self.assertFalse(calls_hf_ds_config)
+        self.assertIsNotNone(resolves_config_line)
         self.assertIsNotNone(flux_artist_line)
-        self.assertLess(hf_ds_config_line, flux_artist_line)
+        self.assertLess(resolves_config_line, flux_artist_line)
+
+    def test_flux_artist_scopes_hf_zero3_to_transformer_load_only(self):
+        source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        flux_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FluxSRArtist"
+        )
+        load_func = next(node for node in flux_class.body if isinstance(node, ast.FunctionDef) and node.name == "_load_flux_modules")
+
+        hf_config_line = None
+        transformer_load_line = None
+        clear_line = None
+        pipeline_load_line = None
+        for node in ast.walk(load_func):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "HfDeepSpeedConfig":
+                hf_config_line = node.lineno
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "from_pretrained"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "FluxTransformer2DModel"
+            ):
+                transformer_load_line = node.lineno
+            if isinstance(func, ast.Name) and func.id == "_clear_hf_deepspeed_config":
+                clear_line = node.lineno
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "from_pretrained"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "FluxPipeline"
+            ):
+                pipeline_load_line = node.lineno
+
+        self.assertIsNotNone(hf_config_line)
+        self.assertIsNotNone(transformer_load_line)
+        self.assertIsNotNone(clear_line)
+        self.assertIsNotNone(pipeline_load_line)
+        self.assertLess(hf_config_line, transformer_load_line)
+        self.assertLess(transformer_load_line, clear_line)
+        self.assertLess(clear_line, pipeline_load_line)
 
     def test_zero3_cpu_offload_config_exists_for_two_gpu_smoke_test(self):
         config_path = Path("configs/accelerate/zero3_bf16_cpu_offload.yaml")
