@@ -315,6 +315,14 @@ class FluxSRArtist(nn.Module):
             module.train()
             module.requires_grad_(True)
 
+        disable_gradient_checkpointing = bool(
+            _cfg(self.config, "_runtime.disable_transformer_gradient_checkpointing", False)
+        )
+        if disable_gradient_checkpointing:
+            if hasattr(self.transformer, "disable_gradient_checkpointing"):
+                self.transformer.disable_gradient_checkpointing()
+            return
+
         if bool(_cfg(self.config, "model.gradient_checkpointing", True)):
             if hasattr(self.transformer, "enable_gradient_checkpointing"):
                 self.transformer.enable_gradient_checkpointing()

@@ -251,7 +251,10 @@ def main(config_path, dry_run=False):
             grad_accum_steps=grad_accum,
             num_processes=accelerator.num_processes,
         )
-        config.setdefault("_runtime", {})["hf_zero3_config"] = resolved_ds_config
+        runtime_config = config.setdefault("_runtime", {})
+        runtime_config["deepspeed_zero_stage"] = 3
+        runtime_config["disable_transformer_gradient_checkpointing"] = True
+        runtime_config["hf_zero3_config"] = resolved_ds_config
         if accelerator.is_main_process:
             local_logger.info(
                 "Prepared HfDeepSpeedConfig for Flux transformer construction "
@@ -260,6 +263,7 @@ def main(config_path, dry_run=False):
                 resolved_ds_config.get("train_micro_batch_size_per_gpu"),
                 resolved_ds_config.get("gradient_accumulation_steps"),
             )
+            local_logger.info("Disabled Flux transformer gradient checkpointing for DeepSpeed ZeRO-3 compatibility.")
 
     dataset = RGFluxSRJsonlDataset(
         jsonl_path=cfg(config, "data.jsonl_path"),

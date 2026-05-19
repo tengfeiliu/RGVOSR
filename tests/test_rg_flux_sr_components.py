@@ -234,6 +234,56 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertLess(plugin_create_line, accelerator_line)
         self.assertTrue(accelerator_has_plugin_kwarg)
 
+    def test_zero3_sets_runtime_disable_gradient_checkpointing(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+        sets_zero_stage = False
+        sets_disable_checkpointing = False
+        for node in ast.walk(main_func):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if not isinstance(target, ast.Subscript):
+                    continue
+                slice_node = target.slice
+                key = slice_node.value if isinstance(slice_node, ast.Constant) else None
+                if key == "deepspeed_zero_stage":
+                    sets_zero_stage = True
+                if key == "disable_transformer_gradient_checkpointing":
+                    sets_disable_checkpointing = True
+
+        self.assertTrue(sets_zero_stage)
+        self.assertTrue(sets_disable_checkpointing)
+
+    def test_flux_artist_disables_checkpointing_when_runtime_requests_it(self):
+        source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        flux_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FluxSRArtist"
+        )
+        train_strategy = next(
+            node for node in flux_class.body if isinstance(node, ast.FunctionDef) and node.name == "_apply_train_strategy"
+        )
+
+        has_disable_call = False
+        has_enable_call = False
+        for node in ast.walk(train_strategy):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "disable_gradient_checkpointing":
+                has_disable_call = True
+            if func.attr == "enable_gradient_checkpointing":
+                has_enable_call = True
+
+        self.assertTrue(has_disable_call)
+        self.assertTrue(has_enable_call)
+        self.assertIn("disable_transformer_gradient_checkpointing", source)
+
     def test_default_config_uses_low_memory_frozen_encoder_devices(self):
         config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
 
