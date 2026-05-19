@@ -66,6 +66,37 @@ class RGFluxSRComponentTests(unittest.TestCase):
 
         self.assertFalse(calls_text_pipeline_to)
 
+    def test_train_initializes_hf_zero3_before_flux_artist(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+        hf_ds_config_line = None
+        flux_artist_line = None
+        for node in ast.walk(main_func):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "HfDeepSpeedConfig":
+                hf_ds_config_line = node.lineno
+            if isinstance(func, ast.Name) and func.id == "FluxSRArtist":
+                flux_artist_line = node.lineno
+
+        self.assertIsNotNone(hf_ds_config_line)
+        self.assertIsNotNone(flux_artist_line)
+        self.assertLess(hf_ds_config_line, flux_artist_line)
+
+    def test_zero3_cpu_offload_config_exists_for_two_gpu_smoke_test(self):
+        config_path = Path("configs/accelerate/zero3_bf16_cpu_offload.yaml")
+        self.assertTrue(config_path.exists())
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["distributed_type"], "DEEPSPEED")
+        self.assertEqual(config["mixed_precision"], "bf16")
+        self.assertEqual(config["deepspeed_config"]["zero_stage"], 3)
+        self.assertEqual(config["deepspeed_config"]["offload_param_device"], "cpu")
+        self.assertEqual(config["deepspeed_config"]["offload_optimizer_device"], "cpu")
+
     def test_default_config_uses_low_memory_frozen_encoder_devices(self):
         config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
 

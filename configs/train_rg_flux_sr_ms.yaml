@@ -1,5 +1,5 @@
 model:
-  flux_model_path: /data/models/FLUX.1-dev
+  flux_model_path: /data/datasets/FLUX.1-dev
   use_flux_vae: true
   dtype: bf16
   text_encoder_device: cpu

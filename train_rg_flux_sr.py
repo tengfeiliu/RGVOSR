@@ -12,6 +12,13 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from tqdm import tqdm
+try:
+    from transformers.integrations import HfDeepSpeedConfig
+except ImportError:
+    try:
+        from transformers.integrations.deepspeed import HfDeepSpeedConfig
+    except ImportError:
+        HfDeepSpeedConfig = None
 
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
 from models.flux_sr_artist import FluxSRArtist
@@ -63,6 +70,32 @@ def weight_dtype_from_accelerator(accelerator):
     if accelerator.mixed_precision == "bf16":
         return torch.bfloat16
     return torch.float32
+
+
+def deepspeed_zero_stage(ds_config):
+    if not isinstance(ds_config, dict):
+        return 0
+    zero_optimization = ds_config.get("zero_optimization")
+    if isinstance(zero_optimization, dict):
+        value = zero_optimization.get("stage", 0)
+    else:
+        value = ds_config.get("zero_stage", zero_optimization or 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_deepspeed_config(accelerator):
+    plugin = getattr(getattr(accelerator, "state", None), "deepspeed_plugin", None)
+    if plugin is None:
+        return None
+    ds_config = getattr(plugin, "deepspeed_config", None)
+    if hasattr(ds_config, "config"):
+        ds_config = ds_config.config
+    if not isinstance(ds_config, dict):
+        return None
+    return ds_config
 
 
 def find_latest_checkpoint(output_dir, resume_ckpt=None):
@@ -163,6 +196,15 @@ def main(config_path, dry_run=False):
     seed = cfg(config, "training.seed", 42)
     if seed is not None:
         set_seed(int(seed))
+
+    hf_ds_config = None
+    ds_config = get_deepspeed_config(accelerator)
+    if deepspeed_zero_stage(ds_config) == 3:
+        if HfDeepSpeedConfig is None:
+            raise ImportError("DeepSpeed ZeRO-3 training requires transformers with HfDeepSpeedConfig.")
+        hf_ds_config = HfDeepSpeedConfig(copy.deepcopy(ds_config))
+        if accelerator.is_main_process:
+            local_logger.info("Initialized HfDeepSpeedConfig before FluxSRArtist construction.")
 
     dataset = RGFluxSRJsonlDataset(
         jsonl_path=cfg(config, "data.jsonl_path"),
