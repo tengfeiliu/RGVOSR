@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import json
 import logging
 import os
@@ -10,6 +11,13 @@ import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+try:
+    from accelerate.utils import GradientAccumulationPlugin
+except ImportError:
+    try:
+        from accelerate.utils.dataclasses import GradientAccumulationPlugin
+    except ImportError:
+        GradientAccumulationPlugin = None
 from diffusers.optimization import get_scheduler
 from tqdm import tqdm
 
@@ -63,6 +71,18 @@ def weight_dtype_from_accelerator(accelerator):
     if accelerator.mixed_precision == "bf16":
         return torch.bfloat16
     return torch.float32
+
+
+def create_gradient_accumulation_plugin(num_steps):
+    if GradientAccumulationPlugin is None:
+        return None, False
+    try:
+        parameters = inspect.signature(GradientAccumulationPlugin).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "sync_each_batch" in parameters:
+        return GradientAccumulationPlugin(num_steps=num_steps, sync_each_batch=True), True
+    return GradientAccumulationPlugin(num_steps=num_steps), False
 
 
 def deepspeed_zero_stage(ds_config):
@@ -186,10 +206,11 @@ def main(config_path, dry_run=False):
     logging_dir = output_dir / cfg(config, "training.logging_dir", "logs")
     per_device_batch = int(cfg(config, "data.batch_size", 1))
     grad_accum = int(cfg(config, "training.grad_accum_steps", 1))
+    gradient_accumulation_plugin, supports_sync_each_batch = create_gradient_accumulation_plugin(grad_accum)
 
     accelerator_project_config = ProjectConfiguration(project_dir=str(output_dir), logging_dir=str(logging_dir))
     accelerator = Accelerator(
-        gradient_accumulation_steps=grad_accum,
+        gradient_accumulation_plugin=gradient_accumulation_plugin,
         mixed_precision=str(cfg(config, "model.dtype", "bf16")),
         log_with=report_to,
         project_config=accelerator_project_config,
@@ -218,6 +239,12 @@ def main(config_path, dry_run=False):
 
     ds_config = get_deepspeed_config(accelerator)
     if deepspeed_zero_stage(ds_config) == 3:
+        if not supports_sync_each_batch:
+            raise RuntimeError(
+                "DeepSpeed ZeRO-3 is incompatible with Accelerate no_sync gradient accumulation. "
+                "Upgrade accelerate to a version with GradientAccumulationPlugin(sync_each_batch=True), "
+                "or set training.grad_accum_steps=1 for smoke testing."
+            )
         resolved_ds_config = resolve_hf_zero3_config(
             ds_config,
             per_device_batch=per_device_batch,

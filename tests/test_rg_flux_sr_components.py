@@ -1,6 +1,7 @@
 import json
 import ast
 import copy
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -177,6 +178,61 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(resolved["gradient_accumulation_steps"], 8)
         self.assertEqual(resolved["train_batch_size"], 16)
         self.assertEqual(ds_config["train_batch_size"], "auto")
+
+    def test_gradient_accumulation_plugin_uses_sync_each_batch(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "create_gradient_accumulation_plugin"
+            ),
+            None,
+        )
+        self.assertIsNotNone(helper)
+
+        class FakeGradientAccumulationPlugin:
+            def __init__(self, num_steps, sync_each_batch=False):
+                self.num_steps = num_steps
+                self.sync_each_batch = sync_each_batch
+
+        namespace = {
+            "GradientAccumulationPlugin": FakeGradientAccumulationPlugin,
+            "inspect": inspect,
+        }
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "train_rg_flux_sr.py", "exec"), namespace)
+
+        plugin, supports_sync_each_batch = namespace["create_gradient_accumulation_plugin"](8)
+
+        self.assertTrue(supports_sync_each_batch)
+        self.assertEqual(plugin.num_steps, 8)
+        self.assertTrue(plugin.sync_each_batch)
+
+    def test_accelerator_receives_gradient_accumulation_plugin(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+        plugin_create_line = None
+        accelerator_line = None
+        accelerator_has_plugin_kwarg = False
+        for node in ast.walk(main_func):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "create_gradient_accumulation_plugin":
+                plugin_create_line = node.lineno
+            if isinstance(func, ast.Name) and func.id == "Accelerator":
+                accelerator_line = node.lineno
+                accelerator_has_plugin_kwarg = any(
+                    keyword.arg == "gradient_accumulation_plugin" for keyword in node.keywords
+                )
+
+        self.assertIsNotNone(plugin_create_line)
+        self.assertIsNotNone(accelerator_line)
+        self.assertLess(plugin_create_line, accelerator_line)
+        self.assertTrue(accelerator_has_plugin_kwarg)
 
     def test_default_config_uses_low_memory_frozen_encoder_devices(self):
         config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
