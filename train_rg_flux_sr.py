@@ -98,6 +98,32 @@ def get_deepspeed_config(accelerator):
     return ds_config
 
 
+def _deepspeed_auto_or_missing(value):
+    return value is None or (isinstance(value, str) and value.strip().lower() in {"", "auto"})
+
+
+def _deepspeed_int(value, default):
+    if _deepspeed_auto_or_missing(value):
+        return int(default)
+    return int(value)
+
+
+def resolve_hf_zero3_config(ds_config, per_device_batch, grad_accum_steps, num_processes):
+    resolved = copy.deepcopy(ds_config)
+    micro_key = "train_micro_batch_size_per_gpu"
+    accum_key = "gradient_accumulation_steps"
+    train_key = "train_batch_size"
+
+    micro = _deepspeed_int(resolved.get(micro_key), per_device_batch)
+    accum = _deepspeed_int(resolved.get(accum_key), grad_accum_steps)
+    train_batch = _deepspeed_int(resolved.get(train_key), micro * accum * int(num_processes))
+
+    resolved[micro_key] = micro
+    resolved[accum_key] = accum
+    resolved[train_key] = train_batch
+    return resolved
+
+
 def find_latest_checkpoint(output_dir, resume_ckpt=None):
     if resume_ckpt:
         path = Path(resume_ckpt)
@@ -165,10 +191,12 @@ def main(config_path, dry_run=False):
     output_root = Path(cfg(config, "training.output_dir", "exp_rg_flux_sr"))
     output_dir = output_root / exp_name
     logging_dir = output_dir / cfg(config, "training.logging_dir", "logs")
+    per_device_batch = int(cfg(config, "data.batch_size", 1))
+    grad_accum = int(cfg(config, "training.grad_accum_steps", 1))
 
     accelerator_project_config = ProjectConfiguration(project_dir=str(output_dir), logging_dir=str(logging_dir))
     accelerator = Accelerator(
-        gradient_accumulation_steps=int(cfg(config, "training.grad_accum_steps", 1)),
+        gradient_accumulation_steps=grad_accum,
         mixed_precision=str(cfg(config, "model.dtype", "bf16")),
         log_with=report_to,
         project_config=accelerator_project_config,
@@ -181,8 +209,6 @@ def main(config_path, dry_run=False):
             json.dump(config, handle, indent=2)
         local_logger = create_logger(logging_dir)
         local_logger.info("Experiment directory created at %s", output_dir)
-        per_device_batch = int(cfg(config, "data.batch_size", 1))
-        grad_accum = int(cfg(config, "training.grad_accum_steps", 1))
         effective_batch = per_device_batch * accelerator.num_processes * grad_accum
         local_logger.info("===========> RG-FLUX-SR-MS Batch Size Debug Info:")
         local_logger.info("  accelerator.num_processes = %s", accelerator.num_processes)
@@ -202,9 +228,21 @@ def main(config_path, dry_run=False):
     if deepspeed_zero_stage(ds_config) == 3:
         if HfDeepSpeedConfig is None:
             raise ImportError("DeepSpeed ZeRO-3 training requires transformers with HfDeepSpeedConfig.")
-        hf_ds_config = HfDeepSpeedConfig(copy.deepcopy(ds_config))
+        resolved_ds_config = resolve_hf_zero3_config(
+            ds_config,
+            per_device_batch=per_device_batch,
+            grad_accum_steps=grad_accum,
+            num_processes=accelerator.num_processes,
+        )
+        hf_ds_config = HfDeepSpeedConfig(resolved_ds_config)
         if accelerator.is_main_process:
-            local_logger.info("Initialized HfDeepSpeedConfig before FluxSRArtist construction.")
+            local_logger.info(
+                "Initialized HfDeepSpeedConfig before FluxSRArtist construction "
+                "(train_batch_size=%s, micro_batch=%s, grad_accum=%s).",
+                resolved_ds_config.get("train_batch_size"),
+                resolved_ds_config.get("train_micro_batch_size_per_gpu"),
+                resolved_ds_config.get("gradient_accumulation_steps"),
+            )
 
     dataset = RGFluxSRJsonlDataset(
         jsonl_path=cfg(config, "data.jsonl_path"),
@@ -218,7 +256,7 @@ def main(config_path, dry_run=False):
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=int(cfg(config, "data.batch_size", 1)),
+        batch_size=per_device_batch,
         shuffle=True,
         num_workers=int(cfg(config, "data.num_workers", 4)),
         pin_memory=True,

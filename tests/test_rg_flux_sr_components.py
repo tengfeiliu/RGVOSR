@@ -1,5 +1,6 @@
 import json
 import ast
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,39 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(config["deepspeed_config"]["zero_stage"], 3)
         self.assertEqual(config["deepspeed_config"]["offload_param_device"], "cpu")
         self.assertEqual(config["deepspeed_config"]["offload_optimizer_device"], "cpu")
+
+    def test_hf_zero3_config_resolves_auto_batch_fields(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"_deepspeed_auto_or_missing", "_deepspeed_int", "resolve_hf_zero3_config"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        helper = next((node for node in helpers if node.name == "resolve_hf_zero3_config"), None)
+        self.assertIsNotNone(helper)
+
+        namespace = {"copy": copy}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "train_rg_flux_sr.py", "exec"), namespace)
+        ds_config = {
+            "train_batch_size": "auto",
+            "train_micro_batch_size_per_gpu": "auto",
+            "gradient_accumulation_steps": "auto",
+            "zero_optimization": {"stage": 3},
+        }
+
+        resolved = namespace["resolve_hf_zero3_config"](
+            ds_config,
+            per_device_batch=1,
+            grad_accum_steps=8,
+            num_processes=2,
+        )
+
+        self.assertEqual(resolved["train_micro_batch_size_per_gpu"], 1)
+        self.assertEqual(resolved["gradient_accumulation_steps"], 8)
+        self.assertEqual(resolved["train_batch_size"], 16)
+        self.assertEqual(ds_config["train_batch_size"], "auto")
 
     def test_default_config_uses_low_memory_frozen_encoder_devices(self):
         config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
