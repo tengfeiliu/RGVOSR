@@ -1,0 +1,76 @@
+model:
+  flux_model_path: /data/datasets/FLUX.1-dev
+  use_flux_vae: true
+  dtype: bf16
+  text_encoder_device: cpu
+  text_encoder_dtype: fp32
+  vae_device: cpu
+  vae_dtype: fp32
+  max_prompt_sequence_length: 64
+  use_lora: true
+  lora_rank: 16
+  lora_alpha: 16
+  gradient_checkpointing: true
+  guidance_scale: 1.0
+  latent_channels: 16
+  context_dim: 4096
+
+data:
+  jsonl_path: datasets/LSDIR_cache/valid.jsonl
+  crop_size: 256
+  scale: 4
+  batch_size: 1
+  num_workers: 4
+  vae_align: 16
+
+condition:
+  use_prompt: true
+  use_suggestions: true
+  use_degradation_vector: true
+  use_visual_semantic_tokens: false
+  deg_vector_dim: 8
+  deg_token_count: 0
+  deg_hidden_dim: 512
+  lr_cond_mode: latent_adapter
+  lr_token_count: 16
+  condition_dropout: 0.1
+  visual_feature_dim: 768
+  visual_token_count: 64
+
+training:
+  stage: A
+  freeze_flux_transformer: true
+  unfreeze_last_n_blocks: 0
+  max_steps: 100000
+  lr_adapter: 1.0e-4
+  lr_lora: 5.0e-5
+  weight_decay: 0.01
+  grad_accum_steps: 1
+  save_every: 1
+  log_every: 1
+  output_dir: exp_rg_flux_sr
+  logging_dir: logs
+  report_to: none
+  tracker_project_name: rg_flux_sr
+  seed: 42
+  use_8bit_adam: false
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 0
+  lr_num_cycles: 1
+  resume_ckpt: null
+  suffix: "_smoke256"
+
+flow_matching:
+  sigma_sampling: uniform
+  prediction_type: velocity
+  timestep_conversion: sigma
+  num_inference_steps: 25
+
+loss:
+  fm_weight: 1.0
+  latent_weight: 0.0
+  perceptual_weight: 0.0

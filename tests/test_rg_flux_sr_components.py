@@ -292,6 +292,30 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(config["model"]["vae_dtype"], "fp32")
         self.assertLessEqual(config["model"]["max_prompt_sequence_length"], 128)
 
+    def test_smoke_256_config_keeps_main_config_unchanged(self):
+        main_config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
+        smoke_path = Path("configs/train_rg_flux_sr_ms_smoke_256.yaml")
+        self.assertTrue(smoke_path.exists())
+        smoke_config = yaml.safe_load(smoke_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(main_config["data"]["crop_size"], 512)
+        self.assertEqual(smoke_config["data"]["crop_size"], 256)
+        self.assertLessEqual(smoke_config["condition"]["lr_token_count"], 16)
+        self.assertEqual(smoke_config["condition"]["deg_token_count"], 0)
+        self.assertLessEqual(smoke_config["model"]["max_prompt_sequence_length"], 64)
+        self.assertEqual(smoke_config["training"]["grad_accum_steps"], 1)
+        self.assertEqual(smoke_config["training"]["save_every"], 1)
+        self.assertEqual(smoke_config["training"]["suffix"], "_smoke256")
+        self.assertEqual(smoke_config["condition"]["lr_cond_mode"], "latent_adapter")
+
+    def test_train_logs_dry_run_token_shape_diagnostics(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("estimated latent size", source)
+        self.assertIn("packed image token count", source)
+        self.assertIn("condition.lr_token_count", source)
+        self.assertIn("condition.deg_token_count", source)
+
     def test_prompt_builder_can_disable_suggestions(self):
         from models.prompt_builder import build_sr_prompt
 

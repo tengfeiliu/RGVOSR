@@ -232,6 +232,17 @@ def main(config_path, dry_run=False):
         local_logger.info("  text_encoder_device = %s", cfg(config, "model.text_encoder_device", "cpu"))
         local_logger.info("  vae_device = %s", cfg(config, "model.vae_device", "cpu"))
         local_logger.info("  max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
+        crop_size = int(cfg(config, "data.crop_size", 512))
+        vae_scale_factor = 8
+        latent_size = crop_size // vae_scale_factor
+        packed_image_tokens = (latent_size // 2) * (latent_size // 2)
+        local_logger.info("===========> RG-FLUX-SR-MS Dry-run Token/Shape Debug Info:")
+        local_logger.info("  data.crop_size = %s", crop_size)
+        local_logger.info("  estimated latent size = %sx%s", latent_size, latent_size)
+        local_logger.info("  packed image token count = %s", packed_image_tokens)
+        local_logger.info("  model.max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
+        local_logger.info("  condition.lr_token_count = %s", cfg(config, "condition.lr_token_count", 64))
+        local_logger.info("  condition.deg_token_count = %s", cfg(config, "condition.deg_token_count", 4))
 
     seed = cfg(config, "training.seed", 42)
     if seed is not None:
