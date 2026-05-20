@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--opt-name", default="params_realsr.yml", help="RealESRGAN degradation YAML under dataloaders/.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--resume", action="store_true sk-a322b14b4b014d288bb02e98ed5ddc19")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resize-bak", action="store_true", default=True)
     parser.add_argument("--no-resize-bak", dest="resize_bak", action="store_false")
     parser.add_argument("--skip-qwen", action="store_true", help="Use physical-only fallback semantic fields.")
