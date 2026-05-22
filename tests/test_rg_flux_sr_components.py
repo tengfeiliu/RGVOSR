@@ -82,7 +82,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
             func = node.func
             if isinstance(func, ast.Name) and func.id == "HfDeepSpeedConfig":
                 calls_hf_ds_config = True
-            if isinstance(func, ast.Name) and func.id == "resolve_hf_zero3_config":
+            if isinstance(func, ast.Name) and func.id == "sync_deepspeed_config_for_training":
                 resolves_config_line = node.lineno
             if isinstance(func, ast.Name) and func.id == "build_rg_flux_artist":
                 artist_factory_line = node.lineno
@@ -191,6 +191,50 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(resolved["gradient_accumulation_steps"], 8)
         self.assertEqual(resolved["train_batch_size"], 16)
         self.assertEqual(ds_config["train_batch_size"], "auto")
+
+    def test_deepspeed_runtime_config_syncs_training_batch_and_disables_optimizer_offload(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {
+            "_deepspeed_auto_or_missing",
+            "_deepspeed_int",
+            "_normalize_offload_device",
+            "get_deepspeed_optimizer_offload_device",
+            "resolve_hf_zero3_config",
+            "set_deepspeed_optimizer_offload_device",
+            "sync_deepspeed_config_for_training",
+        }
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+
+        namespace = {"copy": copy}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "train_rg_flux_sr.py", "exec"), namespace)
+        ds_config = {
+            "gradient_accumulation_steps": 8,
+            "offload_optimizer_device": "cpu",
+            "zero_optimization": {
+                "stage": 3,
+                "offload_optimizer": {"device": "cpu"},
+            },
+        }
+
+        resolved = namespace["sync_deepspeed_config_for_training"](
+            ds_config,
+            per_device_batch=1,
+            grad_accum_steps=1,
+            num_processes=2,
+            optimizer_offload_device="none",
+        )
+
+        self.assertIs(resolved, ds_config)
+        self.assertEqual(ds_config["train_micro_batch_size_per_gpu"], 1)
+        self.assertEqual(ds_config["gradient_accumulation_steps"], 1)
+        self.assertEqual(ds_config["train_batch_size"], 2)
+        self.assertEqual(ds_config["offload_optimizer_device"], "none")
+        self.assertNotIn("offload_optimizer", ds_config["zero_optimization"])
 
     def test_gradient_accumulation_plugin_uses_sync_each_batch(self):
         source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
@@ -336,6 +380,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertLessEqual(config["condition"]["lr_token_count"], 8)
         self.assertEqual(config["condition"]["deg_token_count"], 0)
         self.assertEqual(config["training"]["grad_accum_steps"], 1)
+        self.assertEqual(config["training"]["deepspeed_optimizer_offload_device"], "none")
         self.assertEqual(config["training"]["suffix"], "_flux2_klein_smoke256")
 
     def test_flux2_artist_has_separate_diffusers_components_and_checkpoint_names(self):

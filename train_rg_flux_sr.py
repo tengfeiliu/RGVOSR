@@ -127,20 +127,111 @@ def _deepspeed_int(value, default):
     return int(value)
 
 
-def resolve_hf_zero3_config(ds_config, per_device_batch, grad_accum_steps, num_processes):
+def resolve_hf_zero3_config(
+    ds_config,
+    per_device_batch,
+    grad_accum_steps,
+    num_processes,
+    force_training_batch=False,
+):
     resolved = copy.deepcopy(ds_config)
     micro_key = "train_micro_batch_size_per_gpu"
     accum_key = "gradient_accumulation_steps"
     train_key = "train_batch_size"
 
-    micro = _deepspeed_int(resolved.get(micro_key), per_device_batch)
-    accum = _deepspeed_int(resolved.get(accum_key), grad_accum_steps)
-    train_batch = _deepspeed_int(resolved.get(train_key), micro * accum * int(num_processes))
+    if force_training_batch:
+        micro = int(per_device_batch)
+        accum = int(grad_accum_steps)
+        train_batch = micro * accum * int(num_processes)
+    else:
+        micro = _deepspeed_int(resolved.get(micro_key), per_device_batch)
+        accum = _deepspeed_int(resolved.get(accum_key), grad_accum_steps)
+        train_batch = _deepspeed_int(resolved.get(train_key), micro * accum * int(num_processes))
 
     resolved[micro_key] = micro
     resolved[accum_key] = accum
     resolved[train_key] = train_batch
     return resolved
+
+
+def _normalize_offload_device(device):
+    if device is None:
+        return None
+    return str(device).strip().lower()
+
+
+def get_deepspeed_optimizer_offload_device(ds_config):
+    if not isinstance(ds_config, dict):
+        return None
+    zero_optimization = ds_config.get("zero_optimization")
+    if isinstance(zero_optimization, dict):
+        offload_optimizer = zero_optimization.get("offload_optimizer")
+        if isinstance(offload_optimizer, dict) and "device" in offload_optimizer:
+            return _normalize_offload_device(offload_optimizer.get("device"))
+    return _normalize_offload_device(ds_config.get("offload_optimizer_device"))
+
+
+def set_deepspeed_optimizer_offload_device(ds_config, device):
+    if not isinstance(ds_config, dict):
+        return ds_config
+    normalized = _normalize_offload_device(device)
+    if normalized is None:
+        return ds_config
+    disabled = normalized in {"", "none", "false", "no", "off"}
+    ds_config["offload_optimizer_device"] = "none" if disabled else normalized
+    zero_optimization = ds_config.get("zero_optimization")
+    if isinstance(zero_optimization, dict):
+        if disabled:
+            zero_optimization.pop("offload_optimizer", None)
+        else:
+            offload_optimizer = zero_optimization.get("offload_optimizer")
+            if not isinstance(offload_optimizer, dict):
+                offload_optimizer = {}
+                zero_optimization["offload_optimizer"] = offload_optimizer
+            offload_optimizer["device"] = normalized
+    return ds_config
+
+
+def sync_deepspeed_config_for_training(
+    ds_config,
+    per_device_batch,
+    grad_accum_steps,
+    num_processes,
+    optimizer_offload_device=None,
+):
+    if not isinstance(ds_config, dict):
+        return None
+    resolved = resolve_hf_zero3_config(
+        ds_config,
+        per_device_batch=per_device_batch,
+        grad_accum_steps=grad_accum_steps,
+        num_processes=num_processes,
+        force_training_batch=True,
+    )
+    for key in ("train_micro_batch_size_per_gpu", "gradient_accumulation_steps", "train_batch_size"):
+        ds_config[key] = resolved[key]
+    if optimizer_offload_device is not None:
+        set_deepspeed_optimizer_offload_device(ds_config, optimizer_offload_device)
+    return ds_config
+
+
+def sync_deepspeed_plugin_for_training(plugin, grad_accum_steps, optimizer_offload_device=None):
+    if plugin is None:
+        return
+    for attr in ("gradient_accumulation_steps",):
+        if hasattr(plugin, attr):
+            try:
+                setattr(plugin, attr, int(grad_accum_steps))
+            except (AttributeError, TypeError, ValueError):
+                pass
+    if optimizer_offload_device is not None:
+        normalized = _normalize_offload_device(optimizer_offload_device)
+        for attr in ("offload_optimizer_device",):
+            if hasattr(plugin, attr):
+                try:
+                    setattr(plugin, attr, normalized)
+                except (AttributeError, TypeError):
+                    pass
 
 
 def find_latest_checkpoint(output_dir, resume_ckpt=None):
@@ -433,17 +524,41 @@ def main(config_path, dry_run=False):
                 "Upgrade accelerate to a version with GradientAccumulationPlugin(sync_each_batch=True), "
                 "or set training.grad_accum_steps=1 for smoke testing."
             )
-        resolved_ds_config = resolve_hf_zero3_config(
+        requested_optimizer_offload = cfg(config, "training.deepspeed_optimizer_offload_device", None)
+        if requested_optimizer_offload is None and cfg(config, "model.flux_backend", "flux1") == "flux2_klein":
+            requested_optimizer_offload = "none"
+        original_grad_accum = ds_config.get("gradient_accumulation_steps") if isinstance(ds_config, dict) else None
+        original_optimizer_offload = get_deepspeed_optimizer_offload_device(ds_config)
+        resolved_ds_config = sync_deepspeed_config_for_training(
             ds_config,
             per_device_batch=per_device_batch,
             grad_accum_steps=grad_accum,
             num_processes=accelerator.num_processes,
+            optimizer_offload_device=requested_optimizer_offload,
+        )
+        sync_deepspeed_plugin_for_training(
+            getattr(getattr(accelerator, "state", None), "deepspeed_plugin", None),
+            grad_accum_steps=grad_accum,
+            optimizer_offload_device=requested_optimizer_offload,
         )
         runtime_config = config.setdefault("_runtime", {})
         runtime_config["deepspeed_zero_stage"] = 3
         runtime_config["disable_transformer_gradient_checkpointing"] = True
         runtime_config["hf_zero3_config"] = resolved_ds_config
         if accelerator.is_main_process:
+            if original_grad_accum != resolved_ds_config.get("gradient_accumulation_steps"):
+                local_logger.info(
+                    "Synchronized DeepSpeed gradient_accumulation_steps from %s to %s.",
+                    original_grad_accum,
+                    resolved_ds_config.get("gradient_accumulation_steps"),
+                )
+            current_optimizer_offload = get_deepspeed_optimizer_offload_device(resolved_ds_config)
+            if original_optimizer_offload != current_optimizer_offload:
+                local_logger.info(
+                    "Synchronized DeepSpeed optimizer offload device from %s to %s.",
+                    original_optimizer_offload,
+                    current_optimizer_offload,
+                )
             local_logger.info(
                 "Prepared HfDeepSpeedConfig for Flux transformer construction "
                 "(train_batch_size=%s, micro_batch=%s, grad_accum=%s).",
