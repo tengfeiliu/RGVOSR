@@ -146,6 +146,19 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(config["deepspeed_config"]["offload_param_device"], "cpu")
         self.assertEqual(config["deepspeed_config"]["offload_optimizer_device"], "cpu")
 
+    def test_zero3_param_offload_config_avoids_cpu_adam_for_flux2_smoke(self):
+        config_path = Path("configs/accelerate/zero3_bf16_param_offload.yaml")
+        self.assertTrue(config_path.exists())
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["distributed_type"], "DEEPSPEED")
+        self.assertEqual(config["mixed_precision"], "bf16")
+        self.assertEqual(config["num_processes"], 2)
+        self.assertEqual(config["deepspeed_config"]["zero_stage"], 3)
+        self.assertEqual(config["deepspeed_config"]["offload_param_device"], "cpu")
+        self.assertEqual(config["deepspeed_config"]["offload_optimizer_device"], "none")
+        self.assertEqual(config["deepspeed_config"]["gradient_accumulation_steps"], 1)
+
     def test_hf_zero3_config_resolves_auto_batch_fields(self):
         source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
