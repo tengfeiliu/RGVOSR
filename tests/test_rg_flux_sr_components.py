@@ -394,6 +394,38 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("rg_flux_checkpoint_meta.json", source)
         self.assertNotIn("pooled_projections", source)
 
+    def test_flux2_encode_prompt_filters_kwargs_by_pipeline_signature(self):
+        source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_supported_call_kwargs"
+            ),
+            None,
+        )
+        self.assertIsNotNone(helper)
+
+        namespace = {"inspect": inspect}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "models/flux2_klein_sr_artist.py", "exec"), namespace)
+
+        def encode_prompt(prompt, max_sequence_length=None):
+            return prompt, max_sequence_length
+
+        kwargs = namespace["_supported_call_kwargs"](
+            encode_prompt,
+            {
+                "prompt": ["test"],
+                "prompt_2": None,
+                "max_sequence_length": 128,
+                "num_images_per_prompt": 1,
+            },
+        )
+
+        self.assertEqual(kwargs, {"prompt": ["test"], "max_sequence_length": 128})
+        self.assertIn("_supported_call_kwargs(self.text_pipeline.encode_prompt", source)
+
     def test_flux1_checkpoint_metadata_rejects_flux2_checkpoint(self):
         source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
 

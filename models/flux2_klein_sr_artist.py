@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -72,6 +73,16 @@ def _retrieve_latents(encoded, sample=True):
     if hasattr(latent_dist, "mean"):
         return latent_dist.mean
     return latent_dist
+
+
+def _supported_call_kwargs(callable_obj, kwargs):
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 class Flux2KleinSRArtist(nn.Module):
@@ -341,13 +352,22 @@ class Flux2KleinSRArtist(nn.Module):
             prompts = [prompts]
         if self.text_encoder_device.lower() == "cpu" and hasattr(self.text_pipeline, "to"):
             self.text_pipeline.to("cpu")
-        encode_kwargs = {"prompt": prompts, "prompt_2": None}
+        encode_kwargs = {
+            "prompt": prompts,
+            "prompt_2": None,
+            "device": self.text_encoder_device if self.text_encoder_device.lower() != "cpu" else "cpu",
+            "num_images_per_prompt": 1,
+        }
         if self.max_prompt_sequence_length > 0:
             encode_kwargs["max_sequence_length"] = self.max_prompt_sequence_length
+        encode_kwargs = _supported_call_kwargs(self.text_pipeline.encode_prompt, encode_kwargs)
         try:
             result = self.text_pipeline.encode_prompt(**encode_kwargs)
-        except TypeError:
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
             encode_kwargs.pop("max_sequence_length", None)
+            encode_kwargs.pop("prompt_2", None)
             result = self.text_pipeline.encode_prompt(**encode_kwargs)
         if isinstance(result, dict):
             prompt_embeds = result.get("prompt_embeds")
