@@ -27,7 +27,7 @@ from tqdm import tqdm
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
 from metrics.rg_sr_metrics import DEFAULT_OMGSR_METRICS, evaluate_dataset_dirs
-from models.flux_sr_artist import FluxSRArtist
+from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.prompt_builder import build_sr_prompt
 from rg_flux_fm import build_flow_matching_inputs, sample_multistep_fm, sample_sigma
 
@@ -195,6 +195,9 @@ def make_experiment_name(config):
     lr_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
     stage = cfg(config, "training.stage", "A")
     crop = cfg(config, "data.crop_size", 512)
+    backend = str(cfg(config, "model.flux_backend", "flux1") or "flux1").lower()
+    if backend in {"flux2_klein", "flux2-klein", "flux_2_klein"}:
+        return f"rg_flux2_klein_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
     return f"rg_flux_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
 
 
@@ -471,7 +474,7 @@ def main(config_path, dry_run=False):
         collate_fn=rg_flux_collate_fn,
     )
 
-    artist = FluxSRArtist(config)
+    artist = build_rg_flux_artist(config)
     trainable_named_params = [(name, param) for name, param in artist.named_parameters() if param.requires_grad]
     trainable_params = [param for _, param in trainable_named_params]
     if not trainable_named_params:

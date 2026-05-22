@@ -12,7 +12,7 @@ from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
 from dataloaders.degradation_meta import DEGRADATION_KEYS
-from models.flux_sr_artist import FluxSRArtist
+from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.prompt_builder import build_sr_prompt
 from rg_flux_fm import sample_multistep_fm
 
@@ -127,7 +127,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    artist = FluxSRArtist(config).to(device=device)
+    artist = build_rg_flux_artist(config).to(device=device)
     artist.load_trainable(args.checkpoint, is_trainable=False)
     artist.eval()
 

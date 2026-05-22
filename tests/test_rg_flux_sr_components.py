@@ -75,7 +75,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
 
         resolves_config_line = None
         calls_hf_ds_config = False
-        flux_artist_line = None
+        artist_factory_line = None
         for node in ast.walk(main_func):
             if not isinstance(node, ast.Call):
                 continue
@@ -84,13 +84,13 @@ class RGFluxSRComponentTests(unittest.TestCase):
                 calls_hf_ds_config = True
             if isinstance(func, ast.Name) and func.id == "resolve_hf_zero3_config":
                 resolves_config_line = node.lineno
-            if isinstance(func, ast.Name) and func.id == "FluxSRArtist":
-                flux_artist_line = node.lineno
+            if isinstance(func, ast.Name) and func.id == "build_rg_flux_artist":
+                artist_factory_line = node.lineno
 
         self.assertFalse(calls_hf_ds_config)
         self.assertIsNotNone(resolves_config_line)
-        self.assertIsNotNone(flux_artist_line)
-        self.assertLess(resolves_config_line, flux_artist_line)
+        self.assertIsNotNone(artist_factory_line)
+        self.assertLess(resolves_config_line, artist_factory_line)
 
     def test_flux_artist_scopes_hf_zero3_to_transformer_load_only(self):
         source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
@@ -287,10 +287,62 @@ class RGFluxSRComponentTests(unittest.TestCase):
     def test_default_config_uses_low_memory_frozen_encoder_devices(self):
         config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
 
+        self.assertEqual(config["model"].get("flux_backend", "flux1"), "flux1")
         self.assertEqual(config["model"]["text_encoder_device"], "cpu")
         self.assertEqual(config["model"]["vae_device"], "cpu")
         self.assertEqual(config["model"]["vae_dtype"], "fp32")
         self.assertLessEqual(config["model"]["max_prompt_sequence_length"], 128)
+
+    def test_rg_flux_artist_factory_defaults_to_flux1_and_supports_flux2_klein(self):
+        source = Path("models/rg_flux_artist_factory.py").read_text(encoding="utf-8")
+
+        self.assertIn('model_config.get("flux_backend", "flux1")', source)
+        self.assertIn("FluxSRArtist(config)", source)
+        self.assertIn("Flux2KleinSRArtist", source)
+        self.assertIn("flux2_klein", source)
+
+    def test_train_and_inference_use_backend_factory(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        inference_source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("from models.rg_flux_artist_factory import build_rg_flux_artist", train_source)
+        self.assertIn("artist = build_rg_flux_artist(config)", train_source)
+        self.assertIn("from models.rg_flux_artist_factory import build_rg_flux_artist", inference_source)
+        self.assertIn("artist = build_rg_flux_artist(config).to(device=device)", inference_source)
+
+    def test_flux2_klein_smoke_config_is_isolated(self):
+        main_config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
+        config_path = Path("configs/train_rg_flux2_klein_sr_smoke_256.yaml")
+        self.assertTrue(config_path.exists())
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(main_config["model"].get("flux_backend", "flux1"), "flux1")
+        self.assertEqual(config["model"]["flux_backend"], "flux2_klein")
+        self.assertIn("FLUX.2-klein", config["model"]["flux_model_path"])
+        self.assertEqual(config["data"]["crop_size"], 256)
+        self.assertLessEqual(config["condition"]["lr_token_count"], 8)
+        self.assertEqual(config["condition"]["deg_token_count"], 0)
+        self.assertEqual(config["training"]["grad_accum_steps"], 1)
+        self.assertEqual(config["training"]["suffix"], "_flux2_klein_smoke256")
+
+    def test_flux2_artist_has_separate_diffusers_components_and_checkpoint_names(self):
+        source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+
+        self.assertIn("class Flux2KleinSRArtist", source)
+        self.assertIn("AutoencoderKLFlux2", source)
+        self.assertIn("Flux2KleinPipeline", source)
+        self.assertIn("Flux2Transformer2DModel", source)
+        self.assertIn("flux2_klein_lora_state.pt", source)
+        self.assertIn("rg_flux_checkpoint_meta.json", source)
+        self.assertNotIn("pooled_projections", source)
+
+    def test_flux1_checkpoint_metadata_rejects_flux2_checkpoint(self):
+        source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+
+        self.assertIn('"flux_backend": "flux1"', source)
+        self.assertIn("rg_flux_checkpoint_meta.json", source)
+        self.assertIn("flux2_klein_lora_state.pt", source)
+        self.assertIn("model.flux_backend: flux2_klein", source)
 
     def test_smoke_256_config_keeps_main_config_unchanged(self):
         main_config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))

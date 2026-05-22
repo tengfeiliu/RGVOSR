@@ -1,105 +1,82 @@
-import importlib
 import json
-import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 from models.degradation_vector_encoder import DegradationVectorEncoder
+from models.flux_sr_artist import (
+    _cfg,
+    _clear_hf_deepspeed_config,
+    _dtype_from_config,
+    _import_hf_deepspeed_config,
+    _module_device,
+)
 from models.lr_condition_encoder import LRConditionEncoder
 from models.visual_condition_adapter import VisualConditionAdapter
 from rg_flux_fm import convert_sigma_to_flux_timestep
 
 
-def _cfg(config, path, default=None):
-    current = config
-    for part in path.split("."):
-        if isinstance(current, dict):
-            if part not in current:
-                return default
-            current = current[part]
-        else:
-            if not hasattr(current, part):
-                return default
-            current = getattr(current, part)
-    return current
+def _module_dtype(module, default=torch.float32):
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return default
 
 
-def _dtype_from_config(value):
-    if value in {torch.float32, torch.float16, torch.bfloat16}:
-        return value
-    value = str(value or "bf16").lower()
-    if value in {"fp16", "float16"}:
-        return torch.float16
-    if value in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float32
-
-
-def _prepare_latent_image_ids(height, width, device, dtype):
-    latent_image_ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
-    latent_image_ids[..., 1] = torch.arange(height, device=device, dtype=dtype)[:, None]
-    latent_image_ids[..., 2] = torch.arange(width, device=device, dtype=dtype)[None, :]
-    return latent_image_ids.reshape(height * width, 3)
-
-
-def _module_device(module):
-    return next(module.parameters()).device
-
-
-def _pack_latents(latents):
+def _patchify_latents(latents):
     bsz, channels, height, width = latents.shape
     if height % 2 != 0 or width % 2 != 0:
-        raise ValueError(f"FLUX packed latents require even H/W, got {height}x{width}")
+        raise ValueError(f"FLUX.2 patchified latents require even H/W, got {height}x{width}")
     latents = latents.view(bsz, channels, height // 2, 2, width // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    return latents.reshape(bsz, (height // 2) * (width // 2), channels * 4)
+    latents = latents.permute(0, 1, 3, 5, 2, 4)
+    return latents.reshape(bsz, channels * 4, height // 2, width // 2)
 
 
-def _unpack_latents(tokens, height, width, latent_channels):
-    bsz = tokens.shape[0]
-    tokens = tokens.view(bsz, height // 2, width // 2, latent_channels, 2, 2)
-    tokens = tokens.permute(0, 3, 1, 4, 2, 5)
-    return tokens.reshape(bsz, latent_channels, height, width)
+def _unpatchify_latents(latents, vae_latent_channels):
+    bsz, channels, height, width = latents.shape
+    expected_channels = int(vae_latent_channels) * 4
+    if channels != expected_channels:
+        raise ValueError(f"Expected {expected_channels} FLUX.2 latent channels, got {channels}")
+    latents = latents.view(bsz, vae_latent_channels, 2, 2, height, width)
+    latents = latents.permute(0, 1, 4, 2, 5, 3)
+    return latents.reshape(bsz, vae_latent_channels, height * 2, width * 2)
 
 
-def _import_hf_deepspeed_config():
-    try:
-        from transformers.integrations import HfDeepSpeedConfig
-    except ImportError:
-        try:
-            from transformers.integrations.deepspeed import HfDeepSpeedConfig
-        except ImportError as exc:
-            raise ImportError("DeepSpeed ZeRO-3 loading requires transformers with HfDeepSpeedConfig.") from exc
-    return HfDeepSpeedConfig
+def _flatten_image_tokens(latents):
+    return latents.flatten(2).transpose(1, 2)
 
 
-def _clear_hf_deepspeed_config():
-    for module_name in ("transformers.integrations.deepspeed", "transformers.deepspeed"):
-        try:
-            deepspeed_module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        unset_config = getattr(deepspeed_module, "unset_hf_deepspeed_config", None)
-        if callable(unset_config):
-            unset_config()
-        if hasattr(deepspeed_module, "_hf_deepspeed_config_weak_ref"):
-            setattr(deepspeed_module, "_hf_deepspeed_config_weak_ref", None)
+def _unflatten_image_tokens(tokens, height, width):
+    bsz, _, channels = tokens.shape
+    return tokens.transpose(1, 2).reshape(bsz, channels, height, width)
 
 
-def _clip_position_embedding_length(text_pipeline):
-    text_encoder = getattr(text_pipeline, "text_encoder", None)
-    text_model = getattr(text_encoder, "text_model", None)
-    embeddings = getattr(text_model, "embeddings", None)
-    position_embedding = getattr(embeddings, "position_embedding", None)
-    weight = getattr(position_embedding, "weight", None)
-    if weight is None:
-        return None
-    return int(weight.shape[0])
+def _latent_image_ids(batch_size, height, width, device, dtype):
+    ids = torch.zeros(height, width, 4, device=device, dtype=dtype)
+    ids[..., 1] = torch.arange(height, device=device, dtype=dtype)[:, None]
+    ids[..., 2] = torch.arange(width, device=device, dtype=dtype)[None, :]
+    ids = ids.reshape(1, height * width, 4)
+    return ids.expand(batch_size, -1, -1)
 
 
-class FluxSRArtist(nn.Module):
+def _retrieve_latents(encoded, sample=True):
+    if hasattr(encoded, "latent_dist"):
+        latent_dist = encoded.latent_dist
+    else:
+        latent_dist = encoded[0]
+    if sample and hasattr(latent_dist, "sample"):
+        return latent_dist.sample()
+    if hasattr(latent_dist, "mode"):
+        return latent_dist.mode()
+    if hasattr(latent_dist, "mean"):
+        return latent_dist.mean
+    return latent_dist
+
+
+class Flux2KleinSRArtist(nn.Module):
+    backend_name = "flux2_klein"
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -124,12 +101,15 @@ class FluxSRArtist(nn.Module):
         object.__setattr__(self, "vae", None)
         self.transformer = None
         self.text_pipeline = None
-        self.vae_scale_factor = 8
-        self.latent_channels = int(_cfg(config, "model.latent_channels", 16))
-        self.context_dim = int(_cfg(config, "model.context_dim", 4096))
-        self.image_token_dim = int(_cfg(config, "model.image_token_dim", self.latent_channels * 4))
+        self.vae_scale_factor = 16
+        self.vae_latent_channels = int(_cfg(config, "model.vae_latent_channels", 32))
+        self.latent_channels = int(_cfg(config, "model.latent_channels", 128))
+        self.context_dim = int(_cfg(config, "model.context_dim", 15360))
+        self.image_token_dim = int(_cfg(config, "model.image_token_dim", self.latent_channels))
+        self.latent_mean = None
+        self.latent_std = None
 
-        self._load_flux_modules()
+        self._load_flux2_modules()
         self._infer_dimensions()
         self._build_condition_modules()
         self._apply_train_strategy()
@@ -149,16 +129,16 @@ class FluxSRArtist(nn.Module):
                 torch.cuda.empty_cache()
         return module
 
-    def _load_flux_modules(self):
+    def _load_flux2_modules(self):
         try:
-            from diffusers import AutoencoderKL, FluxPipeline, FluxTransformer2DModel
-        except ModuleNotFoundError as exc:
+            from diffusers import AutoencoderKLFlux2, Flux2KleinPipeline, Flux2Transformer2DModel
+        except (ImportError, ModuleNotFoundError) as exc:
             raise ImportError(
-                "RG-FLUX-SR-MS requires diffusers with FLUX support. "
-                "Install project dependencies before constructing FluxSRArtist."
+                "FLUX.2-klein support requires a diffusers version with "
+                "AutoencoderKLFlux2, Flux2KleinPipeline, and Flux2Transformer2DModel."
             ) from exc
 
-        vae = AutoencoderKL.from_pretrained(
+        vae = AutoencoderKLFlux2.from_pretrained(
             self.flux_model_path,
             subfolder="vae",
             torch_dtype=self.vae_dtype,
@@ -175,7 +155,7 @@ class FluxSRArtist(nn.Module):
             HfDeepSpeedConfig = _import_hf_deepspeed_config()
             hf_ds_config = HfDeepSpeedConfig(hf_zero3_config)
         try:
-            self.transformer = FluxTransformer2DModel.from_pretrained(
+            self.transformer = Flux2Transformer2DModel.from_pretrained(
                 self.flux_model_path,
                 subfolder="transformer",
                 torch_dtype=self.weight_dtype,
@@ -185,49 +165,51 @@ class FluxSRArtist(nn.Module):
                 _clear_hf_deepspeed_config()
                 hf_ds_config = None
 
-        self.text_pipeline = FluxPipeline.from_pretrained(
+        self.text_pipeline = Flux2KleinPipeline.from_pretrained(
             self.flux_model_path,
             transformer=None,
             vae=None,
             torch_dtype=self.text_encoder_dtype,
         )
-        self._validate_text_pipeline()
         if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
             self.text_pipeline.to(self.text_encoder_device)
+
         self.vae.requires_grad_(False)
         self.vae.eval()
-        for module in (getattr(self.text_pipeline, "text_encoder", None), getattr(self.text_pipeline, "text_encoder_2", None)):
+        for module_name in ("text_encoder", "text_encoder_2"):
+            module = getattr(self.text_pipeline, module_name, None)
             if module is not None:
                 module.requires_grad_(False)
                 module.eval()
 
-        if hasattr(self.vae.config, "block_out_channels"):
-            self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-
-    def _validate_text_pipeline(self):
-        clip_position_count = _clip_position_embedding_length(self.text_pipeline)
-        if clip_position_count == 0:
-            raise RuntimeError(
-                "FLUX text_encoder position embeddings are empty. This usually means the text pipeline "
-                "was loaded while the global Hugging Face DeepSpeed ZeRO-3 config was active. "
-                "Keep HfDeepSpeedConfig scoped to FluxTransformer2DModel.from_pretrained only."
-            )
-
     def _infer_dimensions(self):
         vae_config = getattr(self.vae, "config", None)
         if hasattr(vae_config, "latent_channels"):
-            self.latent_channels = int(vae_config.latent_channels)
+            self.vae_latent_channels = int(vae_config.latent_channels)
         transformer_config = getattr(self.transformer, "config", None)
+        if hasattr(transformer_config, "in_channels"):
+            self.latent_channels = int(transformer_config.in_channels)
+            self.image_token_dim = self.latent_channels
         for attr in ("joint_attention_dim", "context_dim"):
             if hasattr(transformer_config, attr):
                 self.context_dim = int(getattr(transformer_config, attr))
                 break
-        if hasattr(transformer_config, "in_channels"):
-            self.image_token_dim = int(getattr(transformer_config, "in_channels"))
+
+        vae_bn = getattr(self.vae, "bn", None)
+        if vae_bn is not None and hasattr(vae_bn, "running_mean") and hasattr(vae_bn, "running_var"):
+            eps = float(getattr(vae_config, "batch_norm_eps", 1e-5))
+            self.latent_mean = vae_bn.running_mean.detach().float().view(1, -1, 1, 1)
+            self.latent_std = torch.sqrt(vae_bn.running_var.detach().float().view(1, -1, 1, 1) + eps)
+        else:
+            latent_mean = getattr(vae_config, "latents_mean", None)
+            latent_std = getattr(vae_config, "latents_std", None)
+            if latent_mean is not None and latent_std is not None:
+                self.latent_mean = torch.tensor(latent_mean, dtype=torch.float32).view(1, -1, 1, 1)
+                self.latent_std = torch.tensor(latent_std, dtype=torch.float32).view(1, -1, 1, 1)
 
     def _build_condition_modules(self):
         condition_dropout = float(_cfg(self.config, "condition.condition_dropout", 0.0))
-        deg_token_count = int(_cfg(self.config, "condition.deg_token_count", 4))
+        deg_token_count = int(_cfg(self.config, "condition.deg_token_count", 0))
         self.degradation_encoder = DegradationVectorEncoder(
             in_dim=int(_cfg(self.config, "condition.deg_vector_dim", 8)),
             hidden_dim=int(_cfg(self.config, "condition.deg_hidden_dim", min(self.context_dim, 1024))),
@@ -238,7 +220,7 @@ class FluxSRArtist(nn.Module):
         self.lr_condition_encoder = LRConditionEncoder(
             latent_channels=self.latent_channels,
             context_dim=self.context_dim,
-            num_tokens=int(_cfg(self.config, "condition.lr_token_count", 64)),
+            num_tokens=int(_cfg(self.config, "condition.lr_token_count", 8)),
             mode=self.lr_cond_mode,
             image_token_dim=self.image_token_dim,
             dropout=condition_dropout,
@@ -250,67 +232,60 @@ class FluxSRArtist(nn.Module):
             dropout=condition_dropout,
         )
 
+    def _resolve_lora_targets(self):
+        configured = _cfg(self.config, "model.lora_target_modules", None)
+        if configured:
+            return configured
+
+        suffixes = (
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "out_proj",
+        )
+        targets = []
+        for name, module in self.transformer.named_modules():
+            if isinstance(module, nn.Linear) and any(name.endswith(suffix) for suffix in suffixes):
+                targets.append(name)
+        if not targets:
+            raise RuntimeError(
+                "Could not infer FLUX.2-klein LoRA target modules. "
+                "Set model.lora_target_modules in the config after inspecting transformer.named_modules()."
+            )
+        return targets
+
     def _apply_lora(self):
         if not self.use_lora:
             return
         try:
             from peft import LoraConfig, PeftModel
         except ModuleNotFoundError as exc:
-            raise ImportError("LoRA training requires peft. Add peft to the environment.") from exc
+            raise ImportError("FLUX.2-klein LoRA training requires peft.") from exc
 
-        rank = int(_cfg(self.config, "model.lora_rank", 16))
+        rank = int(_cfg(self.config, "model.lora_rank", 8))
         alpha = int(_cfg(self.config, "model.lora_alpha", rank))
-        target_modules = _cfg(
-            self.config,
-            "model.lora_target_modules",
-            [
-                "x_embedder",
-                "attn.to_k",
-                "attn.to_q",
-                "attn.to_v",
-                "attn.to_out.0",
-                "attn.add_k_proj",
-                "attn.add_q_proj",
-                "attn.add_v_proj",
-                "attn.to_add_out",
-                "ff.net.0.proj",
-                "ff.net.2",
-                "ff_context.net.0.proj",
-                "ff_context.net.2",
-            ],
-        )
         lora_config = LoraConfig(
             r=rank,
             lora_alpha=alpha,
-            target_modules=target_modules,
+            target_modules=self._resolve_lora_targets(),
             init_lora_weights="gaussian",
         )
-        self.transformer = PeftModel(self.transformer, lora_config, adapter_name="flux_adapter")
-
-    def _unfreeze_last_blocks(self, n_blocks):
-        if n_blocks <= 0:
-            return
-        base = getattr(self.transformer, "base_model", self.transformer)
-        base = getattr(base, "model", base)
-        blocks = []
-        for name in ("transformer_blocks", "single_transformer_blocks"):
-            module_list = getattr(base, name, None)
-            if module_list is not None:
-                blocks.extend(list(module_list)[-n_blocks:])
-        for block in blocks:
-            for param in block.parameters():
-                param.requires_grad_(True)
+        self.transformer = PeftModel(self.transformer, lora_config, adapter_name="flux2_klein_adapter")
 
     def _apply_train_strategy(self):
         self.transformer.requires_grad_(False)
-        freeze_transformer = bool(_cfg(self.config, "training.freeze_flux_transformer", True))
-        if not freeze_transformer:
+        if not bool(_cfg(self.config, "training.freeze_flux_transformer", True)):
             self.transformer.requires_grad_(True)
         self._apply_lora()
-
-        stage = str(_cfg(self.config, "training.stage", "A")).upper()
-        if stage == "B":
-            self._unfreeze_last_blocks(int(_cfg(self.config, "training.unfreeze_last_n_blocks", 0)))
 
         for module in (self.degradation_encoder, self.lr_condition_encoder, self.visual_condition_adapter):
             module.train()
@@ -324,102 +299,164 @@ class FluxSRArtist(nn.Module):
                 self.transformer.disable_gradient_checkpointing()
             return
 
-        if bool(_cfg(self.config, "model.gradient_checkpointing", True)):
+        if bool(_cfg(self.config, "model.gradient_checkpointing", False)):
             if hasattr(self.transformer, "enable_gradient_checkpointing"):
                 self.transformer.enable_gradient_checkpointing()
 
-    def trainable_parameters(self):
-        return [param for param in self.parameters() if param.requires_grad]
+    def _normalize_latents(self, latents):
+        if self.latent_mean is None or self.latent_std is None:
+            return latents
+        mean = self.latent_mean.to(device=latents.device, dtype=latents.dtype)
+        std = self.latent_std.to(device=latents.device, dtype=latents.dtype)
+        return (latents - mean) / std
+
+    def _denormalize_latents(self, latents):
+        if self.latent_mean is None or self.latent_std is None:
+            return latents
+        mean = self.latent_mean.to(device=latents.device, dtype=latents.dtype)
+        std = self.latent_std.to(device=latents.device, dtype=latents.dtype)
+        return latents * std + mean
 
     @torch.no_grad()
     def encode_images(self, images, sample=True):
-        posterior = self.vae.encode(images.to(device=_module_device(self.vae), dtype=self.vae.dtype)).latent_dist
-        latents = posterior.sample() if sample else posterior.mode()
-        shift = getattr(self.vae.config, "shift_factor", 0.0)
-        scale = getattr(self.vae.config, "scaling_factor", 1.0)
-        return ((latents - shift) * scale).to(dtype=self.weight_dtype)
+        vae_device = _module_device(self.vae)
+        vae_dtype = _module_dtype(self.vae, self.vae_dtype)
+        encoded = self.vae.encode(images.to(device=vae_device, dtype=vae_dtype))
+        latents = _retrieve_latents(encoded, sample=sample)
+        latents = _patchify_latents(latents)
+        latents = self._normalize_latents(latents)
+        return latents.to(dtype=self.weight_dtype)
 
     @torch.no_grad()
     def decode_latents(self, latents):
-        shift = getattr(self.vae.config, "shift_factor", 0.0)
-        scale = getattr(self.vae.config, "scaling_factor", 1.0)
-        latents = latents / scale + shift
-        return self.vae.decode(latents.to(device=_module_device(self.vae), dtype=self.vae.dtype), return_dict=False)[0]
+        vae_device = _module_device(self.vae)
+        vae_dtype = _module_dtype(self.vae, self.vae_dtype)
+        latents = self._denormalize_latents(latents)
+        latents = _unpatchify_latents(latents, self.vae_latent_channels)
+        return self.vae.decode(latents.to(device=vae_device, dtype=vae_dtype), return_dict=False)[0]
 
     @torch.no_grad()
     def encode_prompts(self, prompts, device=None, dtype=None):
         if isinstance(prompts, str):
             prompts = [prompts]
-        text_device = self.text_encoder_device if self.text_encoder_device else "cpu"
-        if text_device.lower() == "cpu" and hasattr(self.text_pipeline, "to"):
+        if self.text_encoder_device.lower() == "cpu" and hasattr(self.text_pipeline, "to"):
             self.text_pipeline.to("cpu")
         encode_kwargs = {"prompt": prompts, "prompt_2": None}
         if self.max_prompt_sequence_length > 0:
             encode_kwargs["max_sequence_length"] = self.max_prompt_sequence_length
         try:
-            prompt_embeds, pooled_prompt_embeds, text_ids = self.text_pipeline.encode_prompt(**encode_kwargs)
+            result = self.text_pipeline.encode_prompt(**encode_kwargs)
         except TypeError:
             encode_kwargs.pop("max_sequence_length", None)
-            prompt_embeds, pooled_prompt_embeds, text_ids = self.text_pipeline.encode_prompt(**encode_kwargs)
+            result = self.text_pipeline.encode_prompt(**encode_kwargs)
+        if isinstance(result, dict):
+            prompt_embeds = result.get("prompt_embeds")
+            if prompt_embeds is None:
+                prompt_embeds = result.get("encoder_hidden_states")
+            text_ids = result.get("text_ids")
+            if text_ids is None:
+                text_ids = result.get("txt_ids")
+            pooled_prompt_embeds = result.get("pooled_prompt_embeds")
+        elif len(result) == 2:
+            prompt_embeds, text_ids = result
+            pooled_prompt_embeds = None
+        else:
+            prompt_embeds = result[0]
+            pooled_prompt_embeds = result[1]
+            text_ids = result[-1]
+        if prompt_embeds is None or text_ids is None:
+            raise RuntimeError("Flux2KleinPipeline.encode_prompt did not return prompt embeddings and text ids.")
+
         device = device or _module_device(self.transformer)
         dtype = dtype or self.weight_dtype
-        return (
-            prompt_embeds.to(device=device, dtype=dtype),
-            pooled_prompt_embeds.to(device=device, dtype=dtype),
-            text_ids.to(device=device, dtype=dtype),
-        )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        if text_ids.ndim == 2:
+            text_ids = text_ids.unsqueeze(0).expand(prompt_embeds.shape[0], -1, -1)
+        text_ids = text_ids.to(device=device, dtype=dtype)
+        if pooled_prompt_embeds is None:
+            pooled_prompt_embeds = prompt_embeds.new_zeros(prompt_embeds.shape[0], 0)
+        else:
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+        return prompt_embeds, pooled_prompt_embeds, text_ids
 
     def extract_visual_tokens(self, lq_up):
         return None
 
-    def _extra_text_ids(self, token_count, device, dtype, token_type=0):
+    def _extra_text_ids(self, batch_size, token_count, device, dtype, token_type=0):
         if token_count <= 0:
-            return torch.zeros(0, 3, device=device, dtype=dtype)
-        ids = torch.zeros(token_count, 3, device=device, dtype=dtype)
-        ids[:, 0] = token_type
+            return torch.zeros(batch_size, 0, 4, device=device, dtype=dtype)
+        ids = torch.zeros(batch_size, token_count, 4, device=device, dtype=dtype)
+        ids[..., 0] = token_type
+        ids[..., 3] = torch.arange(token_count, device=device, dtype=dtype)[None, :]
         return ids
 
     def build_context(
         self,
         prompt_embeds,
-        pooled_prompt_embeds,
         text_ids=None,
         degradation_vector=None,
         z_lr=None,
         dino_tokens=None,
         lr_cond_mode="latent_adapter",
     ):
+        batch_size = prompt_embeds.shape[0]
         context = [prompt_embeds]
-        ids = [text_ids] if text_ids is not None else [
-            self._extra_text_ids(prompt_embeds.shape[1], prompt_embeds.device, prompt_embeds.dtype)
+        ids = [
+            text_ids
+            if text_ids is not None
+            else self._extra_text_ids(batch_size, prompt_embeds.shape[1], prompt_embeds.device, prompt_embeds.dtype)
         ]
 
         if self.use_degradation_vector and degradation_vector is not None:
             deg_tokens = self.degradation_encoder(degradation_vector.to(prompt_embeds.device))
             if deg_tokens.shape[1] > 0:
                 context.append(deg_tokens.to(dtype=prompt_embeds.dtype))
-                ids.append(self._extra_text_ids(deg_tokens.shape[1], prompt_embeds.device, prompt_embeds.dtype, token_type=1))
+                ids.append(
+                    self._extra_text_ids(
+                        batch_size,
+                        deg_tokens.shape[1],
+                        prompt_embeds.device,
+                        prompt_embeds.dtype,
+                        token_type=1,
+                    )
+                )
 
         if self.use_visual_semantic_tokens and dino_tokens is not None:
             visual_tokens = self.visual_condition_adapter(dino_tokens)
             if visual_tokens is not None and visual_tokens.shape[1] > 0:
                 context.append(visual_tokens.to(dtype=prompt_embeds.dtype))
-                ids.append(self._extra_text_ids(visual_tokens.shape[1], prompt_embeds.device, prompt_embeds.dtype, token_type=2))
+                ids.append(
+                    self._extra_text_ids(
+                        batch_size,
+                        visual_tokens.shape[1],
+                        prompt_embeds.device,
+                        prompt_embeds.dtype,
+                        token_type=2,
+                    )
+                )
 
         if lr_cond_mode == "latent_adapter" and z_lr is not None:
             lr_tokens = self.lr_condition_encoder(z_lr.to(prompt_embeds.device), mode="latent_adapter")
             if lr_tokens.shape[1] > 0:
                 context.append(lr_tokens.to(dtype=prompt_embeds.dtype))
-                ids.append(self._extra_text_ids(lr_tokens.shape[1], prompt_embeds.device, prompt_embeds.dtype, token_type=3))
+                ids.append(
+                    self._extra_text_ids(
+                        batch_size,
+                        lr_tokens.shape[1],
+                        prompt_embeds.device,
+                        prompt_embeds.dtype,
+                        token_type=3,
+                    )
+                )
 
-        return torch.cat(context, dim=1), pooled_prompt_embeds, torch.cat(ids, dim=0)
+        return torch.cat(context, dim=1), torch.cat(ids, dim=1)
 
     def forward(
         self,
         z_t,
         timestep,
         prompt_embeds,
-        pooled_prompt_embeds,
+        pooled_prompt_embeds=None,
         text_ids=None,
         degradation_vector=None,
         z_lr=None,
@@ -428,10 +465,9 @@ class FluxSRArtist(nn.Module):
     ):
         lr_cond_mode = lr_cond_mode or self.lr_cond_mode
         bsz, channels, height, width = z_t.shape
-        hidden_states = _pack_latents(z_t)
-        context, pooled, txt_ids = self.build_context(
+        hidden_states = _flatten_image_tokens(z_t)
+        context, txt_ids = self.build_context(
             prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
             text_ids=text_ids,
             degradation_vector=degradation_vector,
             z_lr=z_lr,
@@ -439,7 +475,7 @@ class FluxSRArtist(nn.Module):
             lr_cond_mode=lr_cond_mode,
         )
 
-        img_ids = _prepare_latent_image_ids(height // 2, width // 2, z_t.device, hidden_states.dtype)
+        img_ids = _latent_image_ids(bsz, height, width, z_t.device, hidden_states.dtype)
         lr_token_count = 0
         if lr_cond_mode == "latent_concat":
             if z_lr is None:
@@ -447,16 +483,14 @@ class FluxSRArtist(nn.Module):
             lr_tokens = self.lr_condition_encoder(z_lr.to(z_t.device), mode="latent_concat").to(dtype=hidden_states.dtype)
             lr_token_count = lr_tokens.shape[1]
             hidden_states = torch.cat([lr_tokens, hidden_states], dim=1)
-            lr_img_ids = self._extra_text_ids(lr_token_count, z_t.device, hidden_states.dtype, token_type=4)
-            img_ids = torch.cat([lr_img_ids, img_ids], dim=0)
+            lr_img_ids = self._extra_text_ids(bsz, lr_token_count, z_t.device, hidden_states.dtype, token_type=4)
+            img_ids = torch.cat([lr_img_ids, img_ids], dim=1)
 
-        guidance = torch.full((bsz,), self.guidance_scale, device=z_t.device, dtype=hidden_states.dtype)
         flux_timestep = convert_sigma_to_flux_timestep(timestep.to(z_t.device), self.timestep_mode).to(dtype=hidden_states.dtype)
         model_out = self.transformer(
             hidden_states=hidden_states,
             timestep=flux_timestep,
-            guidance=guidance,
-            pooled_projections=pooled,
+            guidance=None,
             encoder_hidden_states=context,
             txt_ids=txt_ids,
             img_ids=img_ids,
@@ -465,21 +499,22 @@ class FluxSRArtist(nn.Module):
         packed_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out.sample
         if lr_token_count:
             packed_pred = packed_pred[:, lr_token_count:]
-        return _unpack_latents(packed_pred, height, width, channels).to(dtype=z_t.dtype)
+        return _unflatten_image_tokens(packed_pred, height, width).to(dtype=z_t.dtype)
 
     def save_trainable(self, output_dir):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        metadata = {"flux_backend": self.backend_name}
         with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
-            json.dump({"flux_backend": "flux1"}, handle, indent=2)
+            json.dump(metadata, handle, indent=2)
         if self.use_lora and hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(output_dir / "flux_adapter")
+            self.transformer.save_pretrained(output_dir / "flux2_klein_adapter")
             lora_state = {
                 name: param.detach().cpu()
                 for name, param in self.transformer.state_dict().items()
                 if "lora" in name.lower()
             }
-            torch.save(lora_state, output_dir / "flux_lora_state.pt")
+            torch.save(lora_state, output_dir / "flux2_klein_lora_state.pt")
         trainable_state = {
             name: param.detach().cpu()
             for name, param in self.state_dict().items()
@@ -495,12 +530,13 @@ class FluxSRArtist(nn.Module):
         if meta_path.exists():
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
             backend = str(metadata.get("flux_backend", "")).lower()
-            if backend and backend != "flux1":
-                raise RuntimeError(f"Checkpoint backend '{backend}' is incompatible with 'flux1'.")
-        if (checkpoint_dir / "flux2_klein_lora_state.pt").exists():
-            raise RuntimeError("This looks like a FLUX.2-klein checkpoint. Use model.flux_backend: flux2_klein.")
-        adapter_dir = checkpoint_dir / "flux_adapter"
-        lora_state_path = checkpoint_dir / "flux_lora_state.pt"
+            if backend and backend != self.backend_name:
+                raise RuntimeError(f"Checkpoint backend '{backend}' is incompatible with '{self.backend_name}'.")
+        if (checkpoint_dir / "flux_lora_state.pt").exists() and not (checkpoint_dir / "flux2_klein_lora_state.pt").exists():
+            raise RuntimeError("This looks like a FLUX.1 checkpoint. Use a FLUX.2-klein adapter checkpoint instead.")
+
+        adapter_dir = checkpoint_dir / "flux2_klein_adapter"
+        lora_state_path = checkpoint_dir / "flux2_klein_lora_state.pt"
         if lora_state_path.exists() and self.use_lora:
             state = torch.load(lora_state_path, map_location="cpu")
             self.transformer.load_state_dict(state, strict=False)
@@ -509,6 +545,7 @@ class FluxSRArtist(nn.Module):
 
             base = getattr(self.transformer, "base_model", self.transformer)
             self.transformer = PeftModel.from_pretrained(base, adapter_dir, is_trainable=is_trainable)
+
         adapter_state = checkpoint_dir / "condition_adapters.pt"
         if adapter_state.exists():
             state = torch.load(adapter_state, map_location="cpu")
