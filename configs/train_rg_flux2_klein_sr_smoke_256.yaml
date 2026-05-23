@@ -4,7 +4,7 @@ model:
   dtype: bf16
   text_encoder_device: cpu
   text_encoder_dtype: fp32
-  vae_device: cpu
+  vae_device: cuda
   vae_dtype: fp32
   max_prompt_sequence_length: 128
   use_lora: true
@@ -74,12 +74,12 @@ flow_matching:
 evaluation:
   enabled: true
   eval_every: 500
-  num_samples: 8
+  num_samples: 2
   num_inference_steps: 25
   metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa]
   jsonl_path: null
   output_dir: eval
-  device: cpu
+  device: cuda
 
 loss:
   fm_weight: 1.0
