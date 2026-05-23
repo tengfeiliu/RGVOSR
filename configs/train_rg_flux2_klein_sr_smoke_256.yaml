@@ -63,7 +63,8 @@ training:
   lr_warmup_steps: 0
   lr_num_cycles: 1
   resume_ckpt: null
-  suffix: "_flux2_klein_smoke256"
+  auto_resume: false
+  suffix: "_flux2_klein_smoke256_v2"
 
 flow_matching:
   sigma_sampling: uniform

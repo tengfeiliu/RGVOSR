@@ -49,6 +49,17 @@ def cfg(config, path, default=None):
     return current
 
 
+def cfg_bool(config, path, default=False):
+    value = cfg(config, path, default)
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off", "none", "null", ""}:
+            return False
+    return bool(value)
+
+
 def normalize_report_to(report_to):
     if report_to is None:
         return None
@@ -245,6 +256,14 @@ def find_latest_checkpoint(output_dir, resume_ckpt=None):
         return None
     candidates = sorted(checkpoint_dir.glob("checkpoint-*"))
     return candidates[-1] if candidates else None
+
+
+def resolve_resume_checkpoint(output_dir, resume_ckpt=None, auto_resume=True):
+    if resume_ckpt:
+        return find_latest_checkpoint(output_dir, resume_ckpt)
+    if not auto_resume:
+        return None
+    return find_latest_checkpoint(output_dir, None)
 
 
 def save_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir, global_step):
@@ -633,7 +652,11 @@ def main(config_path, dry_run=False):
     weight_dtype = weight_dtype_from_accelerator(accelerator)
 
     global_step = 0
-    resume_path = find_latest_checkpoint(output_dir, cfg(config, "training.resume_ckpt", None))
+    resume_path = resolve_resume_checkpoint(
+        output_dir,
+        resume_ckpt=cfg(config, "training.resume_ckpt", None),
+        auto_resume=cfg_bool(config, "training.auto_resume", True),
+    )
     if resume_path:
         if accelerator.is_main_process:
             logger.info("Loading RG-FLUX-SR-MS state from %s", resume_path)
