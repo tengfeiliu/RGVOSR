@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -202,6 +203,22 @@ def require_local_unipercept_model_path(model_path, backend):
     if not path.exists():
         raise FileNotFoundError(f"Local UniPercept model path does not exist: {path}")
     return str(path.resolve())
+
+
+def patch_unipercept_config_for_transformers_logging():
+    module_name = "unipercept_reward.internvl.model.internvl_chat.configuration_internvl_chat"
+    try:
+        config_module = importlib.import_module(module_name)
+    except ImportError:
+        return False
+    config_class = getattr(config_module, "InternVLChatConfig", None)
+    if config_class is None:
+        return False
+
+    # Transformers may instantiate this custom config with no args while formatting logs.
+    # UniPercept's empty default has an invalid blank architecture, so skip default diffing.
+    setattr(config_class, "has_no_defaults_at_init", True)
+    return True
 
 
 def append_jsonl(path, payload):
@@ -591,6 +608,7 @@ class UniPerceptRawAnalyzer:
                 "UniPercept raw scoring requires either `pip install unipercept-reward` "
                 "or --unipercept-command for a custom full-repo inference command."
             ) from exc
+        patch_unipercept_config_for_transformers_logging()
         kwargs = {"device": self.device}
         if self.model_path:
             kwargs["model_path"] = self.model_path

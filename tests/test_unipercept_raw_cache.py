@@ -122,6 +122,35 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertEqual(captured["hf_hub_offline"], "1")
         self.assertEqual(captured["transformers_offline"], "1")
 
+    def test_reward_backend_marks_unipercept_config_as_no_default_init(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeInternVLChatConfig:
+            has_no_defaults_at_init = False
+
+        class FakeRewardInferencer:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.config_is_patched = FakeInternVLChatConfig.has_no_defaults_at_init
+
+        fake_reward_module = types.SimpleNamespace(UniPerceptRewardInferencer=FakeRewardInferencer)
+        fake_config_module = types.SimpleNamespace(InternVLChatConfig=FakeInternVLChatConfig)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "UniPercept-model"
+            model_dir.mkdir()
+            with mock.patch.dict(
+                "sys.modules",
+                {
+                    "unipercept_reward": fake_reward_module,
+                    "unipercept_reward.internvl.model.internvl_chat.configuration_internvl_chat": fake_config_module,
+                },
+            ):
+                analyzer = module.UniPerceptRawAnalyzer(device="cpu", model_path=model_dir, backend="reward")
+
+        self.assertTrue(FakeInternVLChatConfig.has_no_defaults_at_init)
+        self.assertTrue(analyzer.inferencer.config_is_patched)
+
     def test_conversation_backend_calls_unipercept_repo_script_for_each_domain(self):
         from tools import generate_unipercept_raw_cache as module
 
