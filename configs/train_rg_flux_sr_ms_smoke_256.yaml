@@ -41,13 +41,13 @@ training:
   stage: A
   freeze_flux_transformer: true
   unfreeze_last_n_blocks: 0
-  max_steps: 100000
+  max_steps: 1000
   lr_adapter: 1.0e-4
   lr_lora: 5.0e-5
   weight_decay: 0.01
   grad_accum_steps: 1
-  save_every: 1
-  log_every: 1
+  save_every: 100
+  log_every: 10
   output_dir: exp_rg_flux_sr
   logging_dir: logs
   report_to: none

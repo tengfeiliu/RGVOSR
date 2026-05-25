@@ -73,7 +73,7 @@ flow_matching:
   num_inference_steps: 25
 
 evaluation:
-  enabled: true
+  enabled: false
   eval_every: 500
   num_samples: 2
   num_inference_steps: 25

@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 env/
+datasets/
 
 .omx/
 .idea/
@@ -23,3 +24,11 @@ preset/results/
 *.safetensors
 *.tar
 *.zip
+exp_rg_flux_sr/rg_flux_sr_ms_stageA_latent_adapter_size512/args.json
+exp_rg_flux_sr/
+.claude/settings.local.json
+*.json
+eval/
+*.png
+.claude/settings.local.json
+RG-FLUX-SR-MS

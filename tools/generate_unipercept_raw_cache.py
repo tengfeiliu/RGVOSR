@@ -327,6 +327,7 @@ def extract_conversation_answer(raw_text):
         re.compile(r"^\s*(?:assistant|ASSISTANT|Assistant)\s*:\s*(.*)$"),
         re.compile(r"^\s*#+\s*(?:assistant|ASSISTANT|Assistant)\s*:?\s*(.*)$"),
         re.compile(r"^\s*(?:response|RESPONSE|Response)\s*:\s*(.*)$"),
+        re.compile(r"^\s*\[(?:UniPercept|unipercept|UNIPERCEPT)\]\s*:\s*(.*)$"),
     )
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index]
@@ -592,7 +593,6 @@ class UniPerceptRawAnalyzer:
         if backend == "conversation":
             self._conversation_script()
         elif backend == "profile":
-            self._conversation_script()
             self.inferencer = self._load_reward_inferencer()
         elif backend == "reward":
             self.inferencer = self._load_reward_inferencer()
@@ -637,12 +637,15 @@ class UniPerceptRawAnalyzer:
     def _conversation_script(self):
         if self.unipercept_repo is None:
             raise ValueError("--unipercept-repo is required when --unipercept-backend=conversation/profile")
-        script = self.unipercept_repo / "src" / "eval" / "conversation.py"
-        if not script.exists():
-            raise FileNotFoundError(f"UniPercept conversation script not found: {script}")
+        upstream = self.unipercept_repo / "src" / "eval" / "conversation.py"
+        if not upstream.exists():
+            raise FileNotFoundError(f"UniPercept conversation script not found: {upstream}")
         if not self.model_path:
             raise ValueError("--unipercept-model-path is required when --unipercept-backend=conversation/profile")
-        return script
+        wrapper = Path(__file__).resolve().parent / "_unipercept_conversation_wrapper.py"
+        if not wrapper.exists():
+            raise FileNotFoundError(f"UniPercept conversation wrapper not found: {wrapper}")
+        return wrapper
 
     def _run_conversation_prompt(self, image_path, prompt):
         script = self._conversation_script()
@@ -650,19 +653,26 @@ class UniPerceptRawAnalyzer:
             sys.executable,
             str(script),
             "--model_path",
-            str(self.model_path),
+            str(Path(self.model_path).resolve()),
             "--image",
-            str(image_path),
+            str(Path(image_path).resolve()),
             "--prompt",
             prompt,
         ]
         completed = subprocess.run(
             command,
-            check=True,
             capture_output=True,
             text=True,
             env=force_hf_local_only_env(os.environ),
+            cwd=str(self.unipercept_repo),
         )
+        if completed.returncode != 0:
+            stderr_tail = (completed.stderr or "")[-2000:]
+            stdout_tail = (completed.stdout or "")[-500:]
+            raise RuntimeError(
+                f"conversation.py exited with code {completed.returncode}. "
+                f"stderr: {stderr_tail} stdout: {stdout_tail}"
+            )
         return extract_conversation_answer(completed.stdout)
 
     def _analyze_with_conversation(self, image_path):
@@ -682,6 +692,28 @@ class UniPerceptRawAnalyzer:
             "raw_reward": reward,
         }
 
+    def _chat_prompt(self, image_path, prompt, max_new_tokens=1024):
+        import torch
+
+        inferencer = self.inferencer
+        pixel_values = inferencer.preprocess_image(str(image_path))
+        gen_cfg = dict(inferencer.gen_cfg)
+        gen_cfg["max_new_tokens"] = max_new_tokens
+        pad_token_id = inferencer.tokenizer.pad_token_id or inferencer.tokenizer.eos_token_id
+        if pad_token_id is not None:
+            gen_cfg.setdefault("pad_token_id", pad_token_id)
+        with torch.no_grad():
+            response = inferencer.model.chat(
+                inferencer.device,
+                inferencer.tokenizer,
+                pixel_values,
+                prompt,
+                gen_cfg,
+                history=None,
+                return_history=False,
+            )
+        return str(response or "").strip()
+
     def _analyze_with_profile(self, image_path):
         result = self._reward_scores(image_path)
         profile = {
@@ -690,10 +722,10 @@ class UniPerceptRawAnalyzer:
             "ista": {},
         }
         for key, prompt in IAA_PROFILE_PROMPTS.items():
-            profile["iaa"][key] = self._run_conversation_prompt(image_path, prompt)
+            profile["iaa"][key] = self._chat_prompt(image_path, prompt)
         for key, prompt in IQA_PROFILE_PROMPTS.items():
-            profile["iqa"][key] = self._run_conversation_prompt(image_path, prompt)
-        ista_raw = self._run_conversation_prompt(image_path, ISTA_STRUCTURAL_ANNOTATION_PROMPT)
+            profile["iqa"][key] = self._chat_prompt(image_path, prompt)
+        ista_raw = self._chat_prompt(image_path, ISTA_STRUCTURAL_ANNOTATION_PROMPT, max_new_tokens=2048)
         profile["ista"] = normalize_ista_profile_response(ista_raw)
         result["profile"] = profile
         return result
@@ -714,7 +746,7 @@ def process_image(image_path, args, degradation, device, analyzer):
     hq = load_image_tensor(image_path, device)
     _, lq, meta = degradation.degrade_process(hq, resize_bak=args.resize_bak, return_meta=True)
 
-    lq_path = Path(args.lq_output_dir) / stable_lq_name(image_path)
+    lq_path = (Path(args.lq_output_dir) / stable_lq_name(image_path)).resolve()
     save_lq_tensor(lq, lq_path)
 
     unipercept_raw = analyzer.analyze(lq_path)
@@ -749,7 +781,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resize-bak", action="store_true", default=True)
     parser.add_argument("--no-resize-bak", dest="resize_bak", action="store_false")
-    parser.add_argument("--unipercept-repo", default=None, help="Optional local UniPercept repo path to add to PYTHONPATH.")
+    parser.add_argument("--unipercept-repo", default='/data/code/UniPercept/', help="Optional local UniPercept repo path to add to PYTHONPATH.")
     parser.add_argument(
         "--unipercept-model-path",
         default='/data/models/UniPercept/',
@@ -761,7 +793,7 @@ def parse_args():
     parser.add_argument(
         "--unipercept-backend",
         choices=["reward", "conversation", "command", "profile"],
-        default="reward",
+        default="profile",
         help=(
             "UniPercept inference backend. reward uses unipercept-reward; conversation calls the full repo script; "
             "profile combines reward scores with per-aspect conversation prompts; command runs a custom template."

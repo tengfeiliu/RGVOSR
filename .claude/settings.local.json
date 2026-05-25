@@ -5,7 +5,9 @@
       "WebSearch",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Read(//d/work/code/Z-Image-main/Z-Image-main/**)",
-      "Read(//d/work/code/Z-Image-main/Z-Image-main/src/**)"
+      "Read(//d/work/code/Z-Image-main/Z-Image-main/src/**)",
+      "Bash(ls -la /data/code/OMGSR-main/ | head -20)",
+      "Read(//data/code/OMGSR-main/**)"
     ]
   }
 }
