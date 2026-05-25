@@ -26,6 +26,10 @@ from dataloaders.degradation_meta import (  # noqa: E402
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 TAR_EXTENSIONS = {".tar"}
+HF_LOCAL_ONLY_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+}
 UNIPERCEPT_PROMPTS = {
     "iaa": "Analyze this image from the Image Aesthetic Assessment (IAA) perspective. Return your raw assessment.",
     "iqa": "Analyze this image from the Image Quality Assessment (IQA) perspective. Return your raw assessment.",
@@ -179,6 +183,25 @@ Style Type (!) -> Use style semantics terms where applicable.
 }
 
 Please use the above foundational knowledge and template to perform a texture and structural analysis of the image. Return valid JSON only."""
+
+
+def force_hf_local_only_env(env=None):
+    target = os.environ if env is None else dict(env)
+    for key, value in HF_LOCAL_ONLY_ENV.items():
+        target[key] = value
+    return target
+
+
+def require_local_unipercept_model_path(model_path, backend):
+    if not model_path:
+        raise ValueError(
+            f"--unipercept-model-path is required when --unipercept-backend={backend} "
+            "so UniPercept loads local weights instead of downloading from Hugging Face."
+        )
+    path = Path(model_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Local UniPercept model path does not exist: {path}")
+    return str(path.resolve())
 
 
 def append_jsonl(path, payload):
@@ -533,7 +556,12 @@ def build_result_from_unipercept_profile(meta, unipercept_raw):
 class UniPerceptRawAnalyzer:
     def __init__(self, device="cuda", model_path=None, unipercept_repo=None, command=None, backend="reward"):
         self.device = device
-        self.model_path = model_path
+        if backend in {"reward", "conversation", "profile"}:
+            self.model_path = require_local_unipercept_model_path(model_path, backend)
+        elif model_path:
+            self.model_path = str(Path(model_path).expanduser())
+        else:
+            self.model_path = None
         self.unipercept_repo = Path(unipercept_repo).expanduser() if unipercept_repo else None
         self.backend = backend
         self.command = command
@@ -555,6 +583,7 @@ class UniPerceptRawAnalyzer:
             raise ValueError(f"Unsupported UniPercept backend: {backend}")
 
     def _load_reward_inferencer(self):
+        force_hf_local_only_env()
         try:
             from unipercept_reward import UniPerceptRewardInferencer
         except ImportError as exc:
@@ -582,6 +611,7 @@ class UniPerceptRawAnalyzer:
                 check=True,
                 capture_output=True,
                 text=True,
+                env=force_hf_local_only_env(os.environ),
             )
             result[domain] = parse_subprocess_output(completed.stdout)
         return result
@@ -608,7 +638,13 @@ class UniPerceptRawAnalyzer:
             "--prompt",
             prompt,
         ]
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=force_hf_local_only_env(os.environ),
+        )
         return extract_conversation_answer(completed.stdout)
 
     def _analyze_with_conversation(self, image_path):
@@ -696,7 +732,14 @@ def parse_args():
     parser.add_argument("--resize-bak", action="store_true", default=True)
     parser.add_argument("--no-resize-bak", dest="resize_bak", action="store_false")
     parser.add_argument("--unipercept-repo", default=None, help="Optional local UniPercept repo path to add to PYTHONPATH.")
-    parser.add_argument("--unipercept-model-path", default=None, help="Optional local UniPercept model/checkpoint path.")
+    parser.add_argument(
+        "--unipercept-model-path",
+        default='/data/models/UniPercept/',
+        help=(
+            "Local UniPercept model/checkpoint path. Required for reward, conversation, and profile "
+            "backends; Hugging Face downloads are disabled."
+        ),
+    )
     parser.add_argument(
         "--unipercept-backend",
         choices=["reward", "conversation", "command", "profile"],

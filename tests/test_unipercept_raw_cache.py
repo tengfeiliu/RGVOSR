@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -89,6 +91,37 @@ class UniPerceptRawCacheTests(unittest.TestCase):
 
         self.assertEqual(seen, {"a.png", "b.png"})
 
+    def test_reward_backend_requires_local_model_path(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        with self.assertRaisesRegex(ValueError, "--unipercept-model-path is required"):
+            module.UniPerceptRawAnalyzer(device="cpu", backend="reward")
+
+    def test_reward_backend_forces_local_hf_loading(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        captured = {}
+
+        class FakeRewardInferencer:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                captured["hf_hub_offline"] = os.environ.get("HF_HUB_OFFLINE")
+                captured["transformers_offline"] = os.environ.get("TRANSFORMERS_OFFLINE")
+
+        fake_module = types.SimpleNamespace(UniPerceptRewardInferencer=FakeRewardInferencer)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "UniPercept-model"
+            model_dir.mkdir()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+                "sys.modules", {"unipercept_reward": fake_module}
+            ):
+                module.UniPerceptRawAnalyzer(device="cpu", model_path=model_dir, backend="reward")
+
+        self.assertEqual(Path(captured["kwargs"]["model_path"]).resolve(), model_dir.resolve())
+        self.assertEqual(captured["hf_hub_offline"], "1")
+        self.assertEqual(captured["transformers_offline"], "1")
+
     def test_conversation_backend_calls_unipercept_repo_script_for_each_domain(self):
         from tools import generate_unipercept_raw_cache as module
 
@@ -100,11 +133,13 @@ class UniPerceptRawCacheTests(unittest.TestCase):
             script = repo / "src" / "eval" / "conversation.py"
             script.parent.mkdir(parents=True)
             script.write_text("print('ok')\n", encoding="utf-8")
+            model_dir = Path(tmp) / "UniPercept-model"
+            model_dir.mkdir()
 
             with mock.patch.object(module.subprocess, "run", return_value=Completed()) as run:
                 analyzer = module.UniPerceptRawAnalyzer(
                     device="cuda",
-                    model_path="/models/UniPercept",
+                    model_path=model_dir,
                     unipercept_repo=repo,
                     backend="conversation",
                 )
@@ -117,6 +152,9 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertIn("--model_path", first_command)
         self.assertIn("--image", first_command)
         self.assertIn("--prompt", first_command)
+        first_env = run.call_args_list[0].kwargs["env"]
+        self.assertEqual(first_env["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(first_env["TRANSFORMERS_OFFLINE"], "1")
 
     def test_profile_prompt_keys_are_stable(self):
         from tools import generate_unipercept_raw_cache as module
@@ -188,6 +226,8 @@ class UniPerceptRawCacheTests(unittest.TestCase):
             script = repo / "src" / "eval" / "conversation.py"
             script.parent.mkdir(parents=True)
             script.write_text("print('ok')\n", encoding="utf-8")
+            model_dir = Path(tmp) / "UniPercept-model"
+            model_dir.mkdir()
 
             with mock.patch.object(
                 module.UniPerceptRawAnalyzer,
@@ -196,7 +236,7 @@ class UniPerceptRawCacheTests(unittest.TestCase):
             ), mock.patch.object(module.subprocess, "run", return_value=Completed()) as run:
                 analyzer = module.UniPerceptRawAnalyzer(
                     device="cuda",
-                    model_path="/models/UniPercept",
+                    model_path=model_dir,
                     unipercept_repo=repo,
                     backend="profile",
                 )
