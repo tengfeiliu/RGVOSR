@@ -118,6 +118,190 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertIn("--image", first_command)
         self.assertIn("--prompt", first_command)
 
+    def test_profile_prompt_keys_are_stable(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        self.assertEqual(
+            list(module.IAA_PROFILE_PROMPTS.keys()),
+            [
+                "composition_design",
+                "visual_elements_structure",
+                "technical_execution",
+                "originality_creativity",
+                "theme_communication",
+                "emotion_viewer_response",
+                "overall_gestalt",
+                "comprehensive",
+            ],
+        )
+        self.assertEqual(
+            list(module.IQA_PROFILE_PROMPTS.keys()),
+            [
+                "distortion_location",
+                "distortion_severity",
+                "distortion_type",
+                "overall_quality",
+            ],
+        )
+        self.assertIn("Prompt for ISTA Structural Annotation", module.ISTA_STRUCTURAL_ANNOTATION_PROMPT)
+        self.assertIn("Base Morphology", module.ISTA_STRUCTURAL_ANNOTATION_PROMPT)
+        self.assertIn("SceneType", module.ISTA_STRUCTURAL_ANNOTATION_PROMPT)
+
+    def test_extract_conversation_answer_strips_stdout_noise(self):
+        from tools.generate_unipercept_raw_cache import extract_conversation_answer
+
+        raw = "Loading model...\nUSER: ignored prompt\nASSISTANT: The image has visible blur.\n"
+
+        self.assertEqual(extract_conversation_answer(raw), "The image has visible blur.")
+
+    def test_ista_profile_response_parses_fenced_json_and_preserves_raw_fallback(self):
+        from tools.generate_unipercept_raw_cache import normalize_ista_profile_response
+
+        fenced = """```json
+        {
+          "SceneType": "Composite Scene",
+          "SceneName": "Urban street",
+          "Components": []
+        }
+        ```"""
+
+        parsed = normalize_ista_profile_response(fenced)
+        self.assertEqual(parsed["structural_annotation"]["SceneName"], "Urban street")
+        self.assertIn("Urban street", parsed["raw_structural_annotation"])
+
+        raw = normalize_ista_profile_response("not json")
+        self.assertEqual(raw["structural_annotation"], {})
+        self.assertEqual(raw["raw_structural_annotation"], "not json")
+
+    def test_profile_backend_calls_all_profile_prompts_and_preserves_scores(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class Completed:
+            stdout = "ASSISTANT: profile response"
+
+        class FakeRewardInferencer:
+            def reward(self, image_paths):
+                return [{"iaa": 100, "iqa": 20, "ista": 80, "extra": "kept"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "UniPercept"
+            script = repo / "src" / "eval" / "conversation.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("print('ok')\n", encoding="utf-8")
+
+            with mock.patch.object(
+                module.UniPerceptRawAnalyzer,
+                "_load_reward_inferencer",
+                return_value=FakeRewardInferencer(),
+            ), mock.patch.object(module.subprocess, "run", return_value=Completed()) as run:
+                analyzer = module.UniPerceptRawAnalyzer(
+                    device="cuda",
+                    model_path="/models/UniPercept",
+                    unipercept_repo=repo,
+                    backend="profile",
+                )
+                result = analyzer.analyze("lq.png")
+
+        self.assertEqual(run.call_count, 13)
+        self.assertEqual(result["iaa"], 100)
+        self.assertEqual(result["iqa"], 20)
+        self.assertEqual(result["ista"], 80)
+        self.assertEqual(list(result["profile"]["iaa"].keys()), list(module.IAA_PROFILE_PROMPTS.keys()))
+        self.assertEqual(list(result["profile"]["iqa"].keys()), list(module.IQA_PROFILE_PROMPTS.keys()))
+        self.assertIn("raw_structural_annotation", result["profile"]["ista"])
+
+    def test_process_image_writes_profile_reasoning_and_keeps_degradation_score(self):
+        from dataloaders.degradation_meta import compute_score
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeArgs:
+            lq_output_dir = "unused_lq"
+            resize_bak = True
+
+        class FakeDegradation:
+            def degrade_process(self, hq, resize_bak=True, return_meta=True):
+                return (
+                    None,
+                    "fake_lq_tensor",
+                    {
+                        "stage": "fake",
+                        "degradation_vector": {
+                            "blur": 0.4,
+                            "noise": 0.2,
+                            "jpeg": 0.3,
+                            "ringing": 0.1,
+                            "texture_loss": 0.5,
+                            "color_shift": 0.0,
+                        },
+                    },
+                )
+
+        class FakeAnalyzer:
+            def analyze(self, image_path):
+                return {
+                    "iaa": 100,
+                    "iqa": 0,
+                    "ista": 80,
+                    "raw_reward": {"iaa": 100, "iqa": 0, "ista": 80},
+                    "profile": {
+                        "iaa": {
+                            "comprehensive": "The image has limited aesthetic appeal because details are weak.",
+                        },
+                        "iqa": {
+                            "distortion_location": "Blur affects the whole image.",
+                            "distortion_severity": "The distortion is moderate.",
+                            "overall_quality": "Overall quality is limited by blur and texture loss.",
+                        },
+                        "ista": {
+                            "structural_annotation": {
+                                "SceneType": "Composite Scene",
+                                "SceneName": "Garden scene",
+                                "Components": [
+                                    {
+                                        "ComponentName": "Foliage",
+                                        "DescriptionContent": {
+                                            "PhysicalStructure": {
+                                                "BaseMorphology": ["matted"],
+                                                "Arrangement": ["layered"],
+                                            },
+                                            "MaterialRepresentation": {
+                                                "MaterialClass": ["Foliage"],
+                                                "SurfaceProperties": ["Matte"],
+                                            },
+                                            "GeometricComposition": {
+                                                "PlanarContour": ["N/A"],
+                                                "VolumetricForm": ["N/A"],
+                                            },
+                                            "SemanticPerception": {
+                                                "FunctionalInference": ["N/A"],
+                                                "StyleType": ["N/A"],
+                                            },
+                                        },
+                                    }
+                                ],
+                            },
+                            "raw_structural_annotation": "{}",
+                        },
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = self._make_image(root / "hq.png")
+
+            with mock.patch.object(module, "load_image_tensor", return_value="fake_hq_tensor"), mock.patch.object(
+                module, "save_lq_tensor"
+            ):
+                record = module.process_image(image, FakeArgs(), FakeDegradation(), "cpu", FakeAnalyzer())
+
+        reasoning = record["result"]["reasoning"]
+        self.assertIn("Overall quality is limited", reasoning["degradation_analysis"])
+        self.assertIn("Garden scene", reasoning["texture_edge_analysis"])
+        self.assertIn("limited aesthetic appeal", reasoning["semantic_risk_analysis"])
+        self.assertIn("recover fine textures", record["result"]["suggestions"])
+        self.assertEqual(record["result"]["score"], compute_score(record["result"]["degradation_vector"]))
+        self.assertNotEqual(record["result"]["score"], 60)
+
 
 if __name__ == "__main__":
     unittest.main()
