@@ -11,6 +11,7 @@ loguru==0.7.3
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
 openai>=1.0.0
+# profile_cleaner uses the OpenAI-compatible chat completions API above.
 peft==0.17.0
 pillow==12.1.1
 pyiqa==0.1.15

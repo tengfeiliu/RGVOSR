@@ -311,3 +311,109 @@ evaluation:
 - `inference_vosr_onestep.py`
 
 当前 README 不再展开旧 VOSR 命令，主要维护 RG-FLUX-SR 实验链路。
+
+## Profile Cleaner
+
+`profile_cleaner` is a post-processing utility for UniPercept image understanding profiles. It cleans
+`record.unipercept_raw.profile` in JSON or JSONL records while preserving every other record field.
+
+### Install
+
+```bash
+pip install -r requirements.txt
+```
+
+The tool uses the existing `openai>=1.0.0` dependency and works with OpenAI-compatible chat completion APIs.
+
+### Environment
+
+```bash
+export DASHSCOPE_API_KEY=...
+export OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1  # optional default
+export PROFILE_CLEANER_MODEL=qwen2.5-vl-72b-instruct                     # optional default
+export PROFILE_CLEANER_TEMPERATURE=0                                      # optional
+```
+
+### Commands
+
+Single JSON:
+
+```bash
+python -m profile_cleaner.cli --input input.json --output output.json --overwrite
+```
+
+JSONL batch:
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --jsonl \
+  --model qwen2.5-vl-72b-instruct \
+  --max-retries 2 \
+  --overwrite
+```
+
+Directory batch:
+
+```bash
+python -m profile_cleaner.cli --input ./raw_profiles --output ./cleaned_profiles --recursive
+```
+
+Dry run validates structure and local IAA/IQA contamination without calling the model or writing output:
+
+```bash
+python -m profile_cleaner.cli --input input.jsonl --output output.jsonl --jsonl --dry-run --verbose
+```
+
+### Input And Output
+
+The input record must contain a nested profile at:
+
+```json
+{
+  "unipercept_raw": {
+    "profile": {
+      "iaa": {},
+      "iqa": {},
+      "ista": {}
+    }
+  }
+}
+```
+
+Only `unipercept_raw.profile` is replaced. The cleaner does not change top-level fields, raw rewards, image paths,
+degradation metadata, or `result`.
+
+### IAA/IQA Boundary
+
+IAA is limited to composition, framing, layout, balance, color harmony, mood, theme communication, originality,
+artistic expression, viewer response, and overall gestalt.
+
+IQA is limited to blur, sharpness, focus, resolution, pixelation, noise, compression artifacts, exposure problems,
+detail loss, texture loss, fidelity, recognizability, and usability.
+
+If model output still mixes these concepts after retries, the local fallback deletes contaminated bullet/sentence
+items and fills empty fields with a short valid placeholder.
+
+### Error Log
+
+Single-record failures do not stop a batch. Errors are written as JSONL with:
+
+```json
+{
+  "input_file": "input.jsonl",
+  "item_index": 0,
+  "error": "...",
+  "profile_summary": {}
+}
+```
+
+Use `--error-log path/to/errors.jsonl` to choose the log path.
+
+### FAQ
+
+- Existing output files are not overwritten unless `--overwrite` is set.
+- Missing `unipercept_raw.profile`, `iaa`, or `iqa` is logged and the record is kept unchanged.
+- `profile.ista` is preserved from the original profile.
+- JSON output uses `ensure_ascii=False`, so Chinese and other Unicode text are preserved.
