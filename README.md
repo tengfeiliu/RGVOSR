@@ -351,8 +351,12 @@ python -m profile_cleaner.cli \
   --jsonl \
   --model qwen2.5-vl-72b-instruct \
   --max-retries 2 \
+  --limit 1 \
   --overwrite
 ```
+
+`--limit 1` is useful for testing a single paid API sample before launching a full batch. The CLI prints progress
+for each file, record, and LLM prompt stage so long-running requests show where they are waiting.
 
 Directory batch:
 

@@ -42,6 +42,36 @@ class ProfileCleanerLLMClientTests(unittest.TestCase):
         self.assertEqual(calls["kwargs"]["base_url"], "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.assertEqual(client.model, "qwen2.5-vl-72b-instruct")
 
+    def test_dashscope_key_takes_precedence_over_openai_key_for_default_dashscope_base_url(self):
+        calls = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                calls["kwargs"] = kwargs
+                self.chat = types.SimpleNamespace(
+                    completions=types.SimpleNamespace(
+                        create=lambda **create_kwargs: types.SimpleNamespace(
+                            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="ok"))]
+                        )
+                    )
+                )
+
+        fake_openai_module = types.SimpleNamespace(OpenAI=FakeOpenAI)
+
+        with mock.patch.dict("sys.modules", {"openai": fake_openai_module}), mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "openai-key",
+                "DASHSCOPE_API_KEY": "dashscope-key",
+            },
+            clear=True,
+        ):
+            from profile_cleaner.llm_client import LLMClient
+
+            LLMClient()
+
+        self.assertEqual(calls["kwargs"]["api_key"], "dashscope-key")
+
 
 if __name__ == "__main__":
     unittest.main()

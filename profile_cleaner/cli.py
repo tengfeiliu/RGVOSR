@@ -29,9 +29,10 @@ def build_parser():
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing outputs.")
     parser.add_argument("--model", default=os.getenv("PROFILE_CLEANER_MODEL", DEFAULT_MODEL))
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL") or DEFAULT_BASE_URL)
-    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY"))
+    parser.add_argument("--api-key", default=None)
     parser.add_argument("--temperature", type=float, default=float(os.getenv("PROFILE_CLEANER_TEMPERATURE", DEFAULT_TEMPERATURE)))
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--limit", type=int, default=0, help="Maximum records to process from each input file. 0 means no limit.")
     parser.add_argument("--dry-run", action="store_true", help="Validate records without calling the LLM or writing outputs.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--error-log", default=DEFAULT_ERROR_LOG)
@@ -45,7 +46,7 @@ def build_cleaner(args):
         model=args.model,
         temperature=args.temperature,
     )
-    return ProfileCleaner(client, max_retries=args.max_retries, verbose=args.verbose)
+    return ProfileCleaner(client, max_retries=args.max_retries, verbose=True)
 
 
 def get_nested_profile(record: dict):
@@ -87,36 +88,52 @@ def append_error(error_log: Path, input_file: Path, item_index: int, error: str,
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def clean_records(records, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False):
+def clean_record(record, index, total, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False, progress=True):
+    if progress:
+        print(f"[profile_cleaner] {input_file}: record {index + 1}/{total} start", flush=True)
+    output_record = copy.deepcopy(record)
+    profile = get_nested_profile(output_record)
+    if profile is None:
+        if verbose or progress:
+            print(f"{input_file}:{index} missing unipercept_raw.profile")
+        if not dry_run:
+            append_error(error_log, input_file, index, "missing unipercept_raw.profile", None)
+        return output_record
+
+    structure_errors = validate_profile_structure(profile)
+    if dry_run:
+        report = validate_strict_separation(profile)
+        if verbose:
+            print(f"{input_file}:{index} structure={structure_errors} valid={report['valid']}")
+        elif progress:
+            print(f"[profile_cleaner] {input_file}: record {index + 1}/{total} dry-run valid={report['valid']}", flush=True)
+        return output_record
+
+    try:
+        if structure_errors:
+            append_error(error_log, input_file, index, "; ".join(structure_errors), profile)
+        cleaned_profile = cleaner.clean_one(profile)
+        set_nested_profile(output_record, cleaned_profile)
+        if progress:
+            print(f"[profile_cleaner] {input_file}: record {index + 1}/{total} cleaned", flush=True)
+    except Exception as exc:
+        append_error(error_log, input_file, index, str(exc), profile)
+        if progress:
+            print(f"[profile_cleaner] {input_file}: record {index + 1}/{total} failed: {exc}", flush=True)
+    return output_record
+
+
+def clean_records(records, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False, progress=True):
     cleaned = []
+    total = len(records)
     for index, record in enumerate(records):
-        output_record = copy.deepcopy(record)
-        profile = get_nested_profile(output_record)
-        if profile is None:
-            if verbose:
-                print(f"{input_file}:{index} missing unipercept_raw.profile")
-            if not dry_run:
-                append_error(error_log, input_file, index, "missing unipercept_raw.profile", None)
-            cleaned.append(output_record)
-            continue
-
-        structure_errors = validate_profile_structure(profile)
-        if dry_run:
-            report = validate_strict_separation(profile)
-            if verbose:
-                print(f"{input_file}:{index} structure={structure_errors} valid={report['valid']}")
-            cleaned.append(output_record)
-            continue
-
-        try:
-            if structure_errors:
-                append_error(error_log, input_file, index, "; ".join(structure_errors), profile)
-            cleaned_profile = cleaner.clean_one(profile)
-            set_nested_profile(output_record, cleaned_profile)
-        except Exception as exc:
-            append_error(error_log, input_file, index, str(exc), profile)
-        cleaned.append(output_record)
+        cleaned.append(clean_record(record, index, total, cleaner, input_file, error_log, dry_run, verbose, progress))
     return cleaned
+
+
+def append_jsonl_record(handle, record: dict):
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
 
 
 def iter_input_output_files(input_path: Path, output_path: Path, recursive=False, jsonl=False):
@@ -133,6 +150,31 @@ def iter_input_output_files(input_path: Path, output_path: Path, recursive=False
 def process_file(input_file: Path, output_file: Path, cleaner, args):
     file_jsonl = args.jsonl or input_file.suffix.lower() == ".jsonl"
     records = load_json_or_jsonl(input_file, jsonl=file_jsonl)
+    if args.limit > 0:
+        records = records[: args.limit]
+    print(f"[profile_cleaner] Processing file {input_file} -> {output_file} records={len(records)}", flush=True)
+    if file_jsonl and not args.dry_run:
+        if output_file.exists() and not args.overwrite:
+            raise FileExistsError(f"Output already exists: {output_file}")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with output_file.open("w", encoding="utf-8") as handle:
+            total = len(records)
+            for index, record in enumerate(records):
+                cleaned_record = clean_record(
+                    record,
+                    index,
+                    total,
+                    cleaner,
+                    input_file=input_file,
+                    error_log=Path(args.error_log),
+                    dry_run=False,
+                    verbose=args.verbose,
+                    progress=True,
+                )
+                append_jsonl_record(handle, cleaned_record)
+        print(f"[profile_cleaner] Wrote {output_file}", flush=True)
+        return len(records)
+
     cleaned = clean_records(
         records,
         cleaner,
@@ -140,9 +182,11 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
         error_log=Path(args.error_log),
         dry_run=args.dry_run,
         verbose=args.verbose,
+        progress=True,
     )
     if not args.dry_run:
         save_json_or_jsonl(cleaned, output_file, jsonl=file_jsonl, overwrite=args.overwrite)
+        print(f"[profile_cleaner] Wrote {output_file}", flush=True)
     return len(records)
 
 
@@ -160,8 +204,7 @@ def main(argv=None):
     total = 0
     for input_file, output_file in iter_input_output_files(input_path, output_path, args.recursive, args.jsonl):
         total += process_file(input_file, output_file, cleaner, args)
-    if args.verbose or args.dry_run:
-        print(f"Processed {total} records")
+    print(f"[profile_cleaner] Processed {total} records", flush=True)
     return 0
 
 

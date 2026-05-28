@@ -127,7 +127,9 @@ class ProfileCleanerMockTests(unittest.TestCase):
             ]
             input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
 
-            with mock.patch.object(cli, "build_cleaner", return_value=DummyCleaner()):
+            with mock.patch.object(cli, "build_cleaner", return_value=DummyCleaner()), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
                 exit_code = cli.main(
                     [
                         "--input",
@@ -150,6 +152,166 @@ class ProfileCleanerMockTests(unittest.TestCase):
         self.assertEqual(written[1], records[1])
         self.assertEqual(errors[0]["item_index"], 1)
         self.assertIn("boom", errors[0]["error"])
+
+    def test_cli_jsonl_flushes_each_record_before_later_failure(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class FailingCleaner:
+            def __init__(self, output_path):
+                self.calls = 0
+                self.output_path = output_path
+
+            def clean_one(self, profile):
+                self.calls += 1
+                if self.calls == 2:
+                    written = [json.loads(line) for line in self.output_path.read_text(encoding="utf-8").splitlines()]
+                    self.seen_before_failure = written
+                    raise RuntimeError("stop after first write")
+                return clean
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            error_log = root / "errors.jsonl"
+            records = [
+                {"unipercept_raw": {"profile": sample_profile()}, "id": 1},
+                {"unipercept_raw": {"profile": sample_profile()}, "id": 2},
+            ]
+            input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+            cleaner = FailingCleaner(output_path)
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                        "--error-log",
+                        str(error_log),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(cleaner.seen_before_failure), 1)
+        self.assertEqual(cleaner.seen_before_failure[0]["id"], 1)
+
+    def test_cli_limit_processes_only_requested_record_count(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class CountingCleaner:
+            def __init__(self):
+                self.calls = 0
+
+            def clean_one(self, profile):
+                self.calls += 1
+                return clean
+
+        cleaner = CountingCleaner()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            records = [
+                {"unipercept_raw": {"profile": sample_profile()}, "id": 1},
+                {"unipercept_raw": {"profile": sample_profile()}, "id": 2},
+            ]
+            input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                        "--limit",
+                        "1",
+                    ]
+                )
+
+            written = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cleaner.calls, 1)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["id"], 1)
+
+    def test_cli_prints_progress_for_records(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class DummyCleaner:
+            def clean_one(self, profile):
+                return clean
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            input_path.write_text(
+                json.dumps({"unipercept_raw": {"profile": sample_profile()}, "id": 1}) + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+
+            with mock.patch.object(cli, "build_cleaner", return_value=DummyCleaner()), mock.patch(
+                "sys.stdout", new=stdout
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Processing file", stdout.getvalue())
+        self.assertIn("record 1/1", stdout.getvalue())
+
+    def test_cleaner_verbose_prints_llm_stage_progress(self):
+        from profile_cleaner.cleaner import ProfileCleaner
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+        llm = FakeLLMClient([json.dumps(clean), json.dumps(clean)])
+        stdout = io.StringIO()
+
+        with mock.patch("sys.stdout", new=stdout):
+            ProfileCleaner(llm, max_retries=0, verbose=True).clean_one(sample_profile())
+
+        self.assertIn("Prompt B start", stdout.getvalue())
+        self.assertIn("Prompt C start", stdout.getvalue())
 
     def test_cli_dry_run_does_not_write_output_or_error_log(self):
         from profile_cleaner import cli

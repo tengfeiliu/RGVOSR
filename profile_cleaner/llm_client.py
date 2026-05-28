@@ -9,8 +9,13 @@ class LLMClient:
     """Small wrapper around the OpenAI Python SDK chat completions API."""
 
     def __init__(self, api_key=None, base_url=None, model=DEFAULT_MODEL, temperature=DEFAULT_TEMPERATURE):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL") or DEFAULT_BASE_URL
+        if api_key:
+            self.api_key = api_key
+        elif self.base_url == DEFAULT_BASE_URL:
+            self.api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+        else:
+            self.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
         self.model = model or os.getenv("PROFILE_CLEANER_MODEL") or DEFAULT_MODEL
         env_temperature = os.getenv("PROFILE_CLEANER_TEMPERATURE")
         self.temperature = float(temperature if temperature is not None else env_temperature or DEFAULT_TEMPERATURE)

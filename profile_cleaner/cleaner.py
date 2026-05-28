@@ -1,6 +1,7 @@
 """LLM-backed profile cleaning orchestration."""
 
 import copy
+import time
 from typing import Any
 
 from .config import IAA_PLACEHOLDER, IQA_PLACEHOLDER
@@ -25,22 +26,36 @@ class ProfileCleaner:
         self.max_retries = int(max_retries)
         self.verbose = bool(verbose)
 
-    def _parse_or_repair_json(self, raw_output: str) -> dict:
+    def _log(self, message: str):
+        if self.verbose:
+            print(f"[profile_cleaner] {message}", flush=True)
+
+    def _complete(self, stage: str, prompt: str) -> str:
+        self._log(f"{stage} start prompt_chars={len(prompt)}")
+        started = time.time()
+        response = self.llm_client.complete(prompt)
+        self._log(f"{stage} done seconds={time.time() - started:.1f} response_chars={len(response or '')}")
+        return response
+
+    def _parse_or_repair_json(self, raw_output: str, stage: str) -> dict:
         try:
             return parse_json_strict_or_extract(raw_output)
         except ValueError as first_error:
             repair_prompt = render_json_repair_prompt(raw_output)
-            repaired = self.llm_client.complete(repair_prompt)
+            self._log(f"JSON repair start after {stage}: {first_error}")
+            repaired = self._complete("JSON repair", repair_prompt)
             try:
                 return parse_json_strict_or_extract(repaired)
             except ValueError as second_error:
                 raise ValueError(f"Unable to parse or repair JSON: {first_error}; repair failed: {second_error}") from second_error
 
     def _call_prompt_b(self, profile: dict) -> dict:
-        return self._parse_or_repair_json(self.llm_client.complete(render_prompt_b(profile)))
+        raw = self._complete("Prompt B", render_prompt_b(profile))
+        return self._parse_or_repair_json(raw, "Prompt B")
 
     def _call_prompt_c(self, profile: dict) -> dict:
-        return self._parse_or_repair_json(self.llm_client.complete(render_prompt_c(profile)))
+        raw = self._complete("Prompt C", render_prompt_c(profile))
+        return self._parse_or_repair_json(raw, "Prompt C")
 
     def clean_one(self, profile: dict) -> dict:
         """Clean one bare profile dictionary and return a cleaned copy."""
@@ -55,12 +70,25 @@ class ProfileCleaner:
         for _ in range(max(self.max_retries, 0)):
             report = validate_strict_separation(cleaned)
             if report["valid"]:
+                self._log("Strict separation valid")
                 return self._restore_ista_if_needed(original, cleaned)
+            self._log(
+                "Strict separation retry "
+                f"iaa_violations={len(report['iaa_violations'])} "
+                f"iqa_violations={len(report['iqa_violations'])}"
+            )
             cleaned = self._call_prompt_c(cleaned)
 
         report = validate_strict_separation(cleaned)
         if not report["valid"]:
+            self._log(
+                "Local fallback repair start "
+                f"iaa_violations={len(report['iaa_violations'])} "
+                f"iqa_violations={len(report['iqa_violations'])}"
+            )
             cleaned = self.local_fallback_repair(cleaned)
+            repaired_report = validate_strict_separation(cleaned)
+            self._log(f"Local fallback repair done valid={repaired_report['valid']}")
         return self._restore_ista_if_needed(original, cleaned)
 
     def clean_many(self, profiles: list[dict]) -> list[dict]:
