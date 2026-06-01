@@ -463,6 +463,28 @@ detail loss, texture loss, fidelity, recognizability, and usability.
 If model output still mixes these concepts after retries, the local fallback deletes contaminated bullet/sentence
 items and fills empty fields with a short valid placeholder.
 
+### Word Budgets And IQA Fallback
+
+Prompt B asks the model to follow token budgets. The local cleaner uses an English word-count approximation instead
+of character or byte counts:
+
+- `profile.iaa`: no more than 50 words, summarized into `iaa.comprehensive`.
+- `profile.iqa`: no more than 350 words, preserving the required IQA fields when possible.
+- `profile.suggestion`: no more than 80 words.
+
+By default, if `distortion_location`, `distortion_severity`, `distortion_type`, or `overall_quality` is empty after
+LLM cleanup, the cleaner fills it from the original profile. To inspect whether the LLM itself returned all required
+fields correctly, disable that fallback:
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --jsonl \
+  --no-required-iqa-fallback \
+  --overwrite
+```
+
 ### Error Log
 
 Single-record failures do not stop a batch. Errors are written as JSONL with:
@@ -634,9 +656,9 @@ python -m profile_cleaner.cli \
 
 当前 Prompt B 约束：
 
-- `profile.iaa`：总字符数不超过 50，摘要集中写入 `iaa.comprehensive`，其他 IAA 字符串字段置空。
-- `profile.iqa`：总字符数约 370，覆盖失真位置、类型、严重程度和整体质量影响。
-- `profile.suggestion`：总字符数不超过 80，只给 IQA 改善建议，并使用程度词，例如 `Moderately reduce blur; strongly suppress noise; carefully restore edges.`
+- `profile.iaa`：不超过 50 tokens；本地 cleaner 使用 50 words 近似控制。
+- `profile.iqa`：约 350 tokens；本地 cleaner 使用 350 words 近似控制，并尽量保留四个 IQA 必填字段。
+- `profile.suggestion`：不超过 80 tokens；本地 cleaner 使用 80 words 近似控制。
 - `profile.ista`：保留原始结构和内容。
 
 常用参数：
@@ -647,3 +669,4 @@ python -m profile_cleaner.cli \
 - `--error-log profile_cleaner_errors.jsonl`：单条失败记录写入 JSONL，不中断批处理。
 - `--max-retries`：当前单 Prompt B 流程下影响有限，主要保留兼容参数。
 - `--verbose`：输出文件、记录和 LLM 阶段进度。
+- `--no-required-iqa-fallback`：关闭四个 IQA 必填字段的原始 profile 兜底，便于检查 LLM 原始返回是否合规。

@@ -110,7 +110,7 @@ class ProfileCleanerMockTests(unittest.TestCase):
         self.assertTrue(validate_strict_separation(cleaned)["valid"])
 
     def test_iaa_is_compacted_into_comprehensive_summary(self):
-        from profile_cleaner.cleaner import ProfileCleaner
+        from profile_cleaner.cleaner import IAA_MAX_WORDS, ProfileCleaner, count_words
 
         long_iaa = {
             "composition_design": "- The framing is static and centered around the riverside buildings.",
@@ -137,14 +137,16 @@ class ProfileCleanerMockTests(unittest.TestCase):
         cleaned = ProfileCleaner(llm, max_retries=0).clean_one(sample_profile())
 
         iaa = cleaned["iaa"]
-        self.assertLessEqual(len(" ".join(value for value in iaa.values() if isinstance(value, str))), 100)
+        self.assertLessEqual(count_words(" ".join(value for value in iaa.values() if isinstance(value, str))), IAA_MAX_WORDS)
         self.assertTrue(iaa["comprehensive"])
         for key, value in iaa.items():
             if key != "comprehensive":
                 self.assertEqual(value, "")
 
-    def test_iqa_long_text_is_normalized_under_four_hundred_chars(self):
-        from profile_cleaner.cleaner import ProfileCleaner
+    def test_iqa_long_text_is_normalized_under_word_budget(self):
+        from profile_cleaner.cleaner import IQA_MAX_WORDS, ProfileCleaner, count_words
+
+        long_quality_tail = " ".join(f"artifact-token-{index}" for index in range(420))
 
         response = {
             "iaa": {
@@ -163,7 +165,7 @@ class ProfileCleanerMockTests(unittest.TestCase):
                 "distortion_type": "- Blur\n- Noise\n- Low resolution\n- Compression artifacts",
                 "overall_quality": (
                     "- Overall fidelity is limited by softened edges, pixelation, and reduced texture recovery.\n"
-                    "- The image remains usable for coarse scene understanding but less reliable for fine detail analysis."
+                    f"- The image remains usable for coarse scene understanding but less reliable for fine detail analysis. {long_quality_tail}"
                 ),
             },
             "ista": {"unchanged": True},
@@ -173,10 +175,126 @@ class ProfileCleanerMockTests(unittest.TestCase):
         cleaned = ProfileCleaner(llm, max_retries=0).clean_one(sample_profile())
         iqa_text = " ".join(value for value in cleaned["iqa"].values() if isinstance(value, str))
 
-        self.assertLessEqual(len(iqa_text), 400)
+        self.assertLessEqual(count_words(iqa_text), IQA_MAX_WORDS)
         self.assertIn("Blur", iqa_text)
         self.assertIn("Noise", iqa_text)
-        self.assertTrue(any(cleaned["iqa"][key] for key in ("distortion_location", "distortion_severity", "overall_quality")))
+        for key in ("distortion_location", "distortion_severity", "distortion_type", "overall_quality"):
+            self.assertTrue(cleaned["iqa"][key].strip(), key)
+
+    def test_suggestion_is_normalized_under_word_budget(self):
+        from profile_cleaner.cleaner import ProfileCleaner, SUGGESTION_MAX_WORDS, count_words
+
+        long_suggestion = " ".join(f"restore-token-{index}" for index in range(120))
+        response = {
+            "iaa": {"composition_design": "- The framing is stable.", "comprehensive": "- Stable framing."},
+            "iqa": {
+                "distortion_location": "- Blur appears across the image.",
+                "distortion_severity": "- Moderate blur reduces recognizability.",
+                "distortion_type": "- Blur\n- Noise",
+                "overall_quality": "- Blur and noise reduce fidelity.",
+            },
+            "suggestion": long_suggestion,
+        }
+        llm = FakeLLMClient([json.dumps(response)])
+
+        cleaned = ProfileCleaner(llm, max_retries=0).clean_one(sample_profile())
+
+        self.assertLessEqual(count_words(cleaned["suggestion"]), SUGGESTION_MAX_WORDS)
+
+    def test_clean_one_fills_required_iqa_fields_from_original_profile(self):
+        from profile_cleaner.cleaner import ProfileCleaner
+
+        response = {
+            "iaa": {
+                "composition_design": "",
+                "visual_elements_structure": "",
+                "technical_execution": "",
+                "originality_creativity": "",
+                "theme_communication": "",
+                "emotion_viewer_response": "",
+                "overall_gestalt": "",
+                "comprehensive": "- Static centered framing creates a subdued impression.",
+            },
+            "iqa": {
+                "distortion_location": "- Blur appears across the image.",
+                "distortion_severity": "",
+                "distortion_type": "",
+                "overall_quality": "",
+            },
+            "ista": {"unchanged": True},
+        }
+        llm = FakeLLMClient([json.dumps(response)])
+
+        cleaned = ProfileCleaner(llm, max_retries=0).clean_one(sample_profile())
+
+        for key in ("distortion_location", "distortion_severity", "distortion_type", "overall_quality"):
+            self.assertTrue(cleaned["iqa"][key].strip(), key)
+        self.assertIn("Moderate blur", cleaned["iqa"]["distortion_severity"])
+        self.assertIn("Noise", cleaned["iqa"]["distortion_type"])
+        self.assertIn("Blur reduces recognizability", cleaned["iqa"]["overall_quality"])
+
+    def test_required_iqa_fallback_can_be_disabled(self):
+        from profile_cleaner.cleaner import ProfileCleaner
+
+        response = {
+            "iaa": {"composition_design": "", "comprehensive": "- Static centered framing."},
+            "iqa": {
+                "distortion_location": "- Blur appears across the image.",
+                "distortion_severity": "",
+                "distortion_type": "",
+                "overall_quality": "",
+            },
+        }
+        llm = FakeLLMClient([json.dumps(response)])
+
+        cleaned = ProfileCleaner(llm, max_retries=0, enable_required_iqa_fallback=False).clean_one(sample_profile())
+
+        self.assertEqual(cleaned["iqa"]["distortion_severity"], "")
+        self.assertEqual(cleaned["iqa"]["distortion_type"], "")
+        self.assertEqual(cleaned["iqa"]["overall_quality"], "")
+
+    def test_prompt_b_excludes_ista_and_restores_original_ista(self):
+        from profile_cleaner.cleaner import ProfileCleaner
+
+        original = sample_profile()
+        original["ista"] = {
+            "raw_structural_annotation": "DO_NOT_SEND_ISTA_SENTINEL",
+            "nested": {"component": "Armadillo structure"},
+        }
+        response = {
+            "iaa": {
+                "composition_design": "",
+                "visual_elements_structure": "",
+                "technical_execution": "",
+                "originality_creativity": "",
+                "theme_communication": "",
+                "emotion_viewer_response": "",
+                "overall_gestalt": "",
+                "comprehensive": "- Static centered framing creates a subdued impression.",
+            },
+            "iqa": {
+                "distortion_location": "- Blur appears across the image.",
+                "distortion_severity": "- Moderate blur reduces recognizability.",
+                "distortion_type": "- Blur\n- Noise",
+                "overall_quality": "- Blur reduces recognizability.",
+            },
+        }
+        llm = FakeLLMClient([json.dumps(response)])
+
+        cleaned = ProfileCleaner(llm, max_retries=0).clean_one(original)
+
+        self.assertNotIn("DO_NOT_SEND_ISTA_SENTINEL", llm.prompts[0])
+        self.assertEqual(cleaned["ista"], original["ista"])
+
+    def test_cli_no_required_iqa_fallback_configures_cleaner(self):
+        from profile_cleaner import cli
+
+        args = cli.build_parser().parse_args(["--input", "input.jsonl", "--output", "output.jsonl", "--no-required-iqa-fallback"])
+
+        with mock.patch.object(cli, "LLMClient", return_value=FakeLLMClient([])):
+            cleaner = cli.build_cleaner(args)
+
+        self.assertFalse(cleaner.enable_required_iqa_fallback)
 
     def test_cli_jsonl_replaces_only_nested_profile_and_keeps_failures(self):
         from profile_cleaner import cli

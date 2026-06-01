@@ -36,6 +36,19 @@ def build_parser():
     parser.add_argument("--dry-run", action="store_true", help="Validate records without calling the LLM or writing outputs.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--error-log", default=DEFAULT_ERROR_LOG)
+    parser.add_argument(
+        "--required-iqa-fallback",
+        dest="required_iqa_fallback",
+        action="store_true",
+        default=False,
+        help="Fill empty required IQA fields from the original profile after LLM cleanup.",
+    )
+    parser.add_argument(
+        "--no-required-iqa-fallback",
+        dest="required_iqa_fallback",
+        action="store_false",
+        help="Keep empty required IQA fields from the LLM output for debugging.",
+    )
     return parser
 
 
@@ -46,7 +59,12 @@ def build_cleaner(args):
         model=args.model,
         temperature=args.temperature,
     )
-    return ProfileCleaner(client, max_retries=args.max_retries, verbose=True)
+    return ProfileCleaner(
+        client,
+        max_retries=args.max_retries,
+        verbose=True,
+        enable_required_iqa_fallback=args.required_iqa_fallback,
+    )
 
 
 def get_nested_profile(record: dict):

@@ -127,7 +127,7 @@ Rewriting rules
     - negligible aesthetic merit
     - completely unusable
     unless they are explicitly justified by the original profile.
-14. Keep profile.ista unchanged when it exists.
+14. Do not create, rewrite, or infer profile.ista; it is restored outside this prompt when present.
 15. Do not add any other new fields.
 
 ========================
@@ -146,7 +146,7 @@ IAA output must be very compact:
 - Summarize only the key aesthetic, composition, atmosphere, or expressive evidence.
 
 IQA output must be informative but bounded:
-- The entire profile.iqa section should be around 370 tokens.
+- The entire profile.iqa section should be around 350 tokens.
 - Keep it concise, but do not make it too short if the original profile contains enough quality evidence.
 - distortion_location, distortion_severity, distortion_type, and overall_quality must all be present and non-empty.
 - Optimize those four IQA fields based on the original profile evidence.
@@ -180,7 +180,6 @@ Return only the cleaned JSON profile.
 The returned profile must contain:
 - iaa
 - iqa
-- ista, if it existed in the original profile
 - suggestion
 
 Do not include explanations outside the JSON.
