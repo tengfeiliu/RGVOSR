@@ -421,3 +421,166 @@ Use `--error-log path/to/errors.jsonl` to choose the log path.
 - Missing `unipercept_raw.profile`, `iaa`, or `iqa` is logged and the record is kept unchanged.
 - `profile.ista` is preserved from the original profile.
 - JSON output uses `ensure_ascii=False`, so Chinese and other Unicode text are preserved.
+
+## UniPercept Profile 生成与清洗流程
+
+这一节记录从原始 HQ 图像生成 `unipercept_raw.profile`，再用 `profile_cleaner` 优化 IAA/IQA/profile suggestion 的推荐命令。生成阶段使用本地 UniPercept 权重，不会从 Hugging Face 下载模型。
+
+### 1. 生成 UniPercept Raw Profile Cache
+
+默认输入、输出和模型路径在 `tools/generate_unipercept_raw_cache.py` 中已经配置：
+
+```text
+--input configs/train_txt/train_dataset_txt.txt
+--lq-output-dir datasets/LSDIR_unipercept_lq
+--output datasets/LSDIR_unipercept_raw_cache/valid.jsonl
+--invalid-output datasets/LSDIR_unipercept_raw_cache/invalid.jsonl
+--unipercept-repo /data/code/UniPercept/
+--unipercept-model-path /data/models/UniPercept/
+--unipercept-backend profile
+```
+
+先只跑 1 条样本确认环境、模型路径和输出结构：
+
+```bash
+python tools/generate_unipercept_raw_cache.py \
+  --input configs/train_txt/train_dataset_txt.txt \
+  --lq-output-dir datasets/LSDIR_unipercept_lq \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --invalid-output datasets/LSDIR_unipercept_raw_cache/invalid.jsonl \
+  --unipercept-repo /data/code/UniPercept/ \
+  --unipercept-model-path /data/models/UniPercept/ \
+  --unipercept-backend profile \
+  --device auto \
+  --limit 1 \
+  --resume
+```
+
+确认无误后去掉 `--limit 1` 跑完整数据：
+
+```bash
+python tools/generate_unipercept_raw_cache.py \
+  --input configs/train_txt/train_dataset_txt.txt \
+  --lq-output-dir datasets/LSDIR_unipercept_lq \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --invalid-output datasets/LSDIR_unipercept_raw_cache/invalid.jsonl \
+  --unipercept-repo /data/code/UniPercept/ \
+  --unipercept-model-path /data/models/UniPercept/ \
+  --unipercept-backend profile \
+  --device auto \
+  --resume
+```
+
+常用参数：
+
+- `--unipercept-model-path`：本地 UniPercept 模型目录，必须存在；不会自动下载 HF 模型。
+- `--unipercept-repo`：本地 UniPercept 仓库路径，`profile` / `conversation` backend 需要。
+- `--unipercept-backend profile`：推荐默认值，组合 reward 分数和 per-aspect conversation profile。
+- `--unipercept-backend reward`：只使用 `unipercept-reward` inferencer。
+- `--unipercept-backend command`：使用自定义命令模板，需提供 `--unipercept-command`。
+- `--limit N`：只处理前 N 条，适合调试。
+- `--resume`：跳过已经写入 valid/invalid JSONL 的 HQ 路径。
+
+生成后的每条 JSONL 记录会包含 `hq_path`、`lq_path`、`raw_degradation_params`、`unipercept_raw` 和 `result`。其中待清洗的 profile 位于：
+
+```json
+{
+  "unipercept_raw": {
+    "profile": {
+      "iaa": {},
+      "iqa": {},
+      "ista": {}
+    }
+  }
+}
+```
+
+### 2. 配置千问/OpenAI-Compatible API
+
+`profile_cleaner` 使用 OpenAI-compatible Chat Completions 接口。当前默认指向阿里云 DashScope 兼容接口：
+
+```bash
+export DASHSCOPE_API_KEY=你的千问APIKey
+export OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export PROFILE_CLEANER_MODEL=qwen2.5-vl-72b-instruct
+export PROFILE_CLEANER_TEMPERATURE=0
+```
+
+也可以在命令行显式传入：
+
+```bash
+--api-key sk-xxx
+--base-url https://dashscope.aliyuncs.com/compatible-mode/v1
+--model qwen-plus
+--temperature 0
+```
+
+### 3. 优化 Profile Cleaner 输出
+
+`profile_cleaner` 只替换 `record.unipercept_raw.profile`，不会修改 `hq_path`、`lq_path`、`raw_degradation_params`、`unipercept_raw.raw_reward`、外层 `result` 等字段。JSONL 模式会完成一条写一条，长任务中断时更容易保留已完成输出。
+
+先用 `--limit 1` 测一条付费 API 样本：
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --jsonl \
+  --model qwen-plus \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --limit 1 \
+  --overwrite \
+  --verbose
+```
+
+确认输出后跑完整清洗：
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --jsonl \
+  --model qwen-plus \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --overwrite \
+  --verbose
+```
+
+目录批处理：
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache \
+  --output datasets/LSDIR_unipercept_cleaned_cache \
+  --recursive \
+  --jsonl \
+  --model qwen-plus \
+  --overwrite
+```
+
+不调用大模型、只做结构和本地禁词检查：
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/LSDIR_unipercept_raw_cache/valid.jsonl \
+  --output datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --jsonl \
+  --dry-run \
+  --verbose
+```
+
+当前 Prompt B 约束：
+
+- `profile.iaa`：总字符数不超过 50，摘要集中写入 `iaa.comprehensive`，其他 IAA 字符串字段置空。
+- `profile.iqa`：总字符数约 370，覆盖失真位置、类型、严重程度和整体质量影响。
+- `profile.suggestion`：总字符数不超过 80，只给 IQA 改善建议，并使用程度词，例如 `Moderately reduce blur; strongly suppress noise; carefully restore edges.`
+- `profile.ista`：保留原始结构和内容。
+
+常用参数：
+
+- `--jsonl`：按 JSONL 读取和写出。
+- `--limit 1`：只清洗 1 条，适合测试 API key、模型名和费用。
+- `--overwrite`：允许覆盖已有输出文件；默认禁止覆盖。
+- `--error-log profile_cleaner_errors.jsonl`：单条失败记录写入 JSONL，不中断批处理。
+- `--max-retries`：当前单 Prompt B 流程下影响有限，主要保留兼容参数。
+- `--verbose`：输出文件、记录和 LLM 阶段进度。

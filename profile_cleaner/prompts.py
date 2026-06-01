@@ -117,7 +117,7 @@ Rewriting rules
 6. If a field becomes empty, fill it with a concise valid sentence based only on information supported by the original profile.
 7. Preserve all original field names.
 8. Preserve the original JSON hierarchy.
-9. Do not add new top-level fields.
+9. Add exactly one new field at the returned profile root: suggestion.
 10. Do not include explanations outside the JSON.
 11. Keep the style concise and bullet-based if the original profile uses bullets.
 12. Do not overstate certainty.
@@ -127,6 +127,41 @@ Rewriting rules
     - negligible aesthetic merit
     - completely unusable
     unless they are explicitly justified by the original profile.
+14. Keep profile.ista unchanged when it exists.
+15. Do not add any other new fields.
+
+========================
+Length, placement, and suggestion constraints
+========================
+
+IAA output must be very compact:
+- The entire profile.iaa section must be no more than 50 characters total.
+- Put the IAA summary in profile.iaa.comprehensive when that field exists.
+- Set the other string fields under profile.iaa to "".
+- Summarize only the key aesthetic, composition, atmosphere, or expressive evidence.
+
+IQA output must be informative but bounded:
+- The entire profile.iqa section should be around 370 characters.
+- Keep it concise, but do not make it too short if the original profile contains enough quality evidence.
+- Preserve the original IQA field names, especially distortion_location, distortion_severity, distortion_type, and overall_quality when they exist.
+- Distribute IQA content across those fields within the total character budget.
+- Cover distortion location, distortion type, severity, and overall quality impact.
+- Do not invent unsupported quality evidence just to reach the target length.
+
+Suggestion output:
+- Add a profile-level field named suggestion.
+- suggestion must focus only on IQA-related improvement actions.
+- suggestion must be no more than 80 characters total.
+- Include multiple short suggestions when possible.
+- Use degree modifiers in each suggestion, such as mildly, moderately, strongly, selectively, or carefully.
+- Prefer concise action phrases.
+- Do not include aesthetic, composition, mood, theme, or viewer-response suggestions.
+- Do not include explanations.
+
+Good suggestion examples:
+- Moderately reduce blur; strongly suppress noise; carefully restore edges.
+- Mildly denoise flat areas; moderately sharpen edges; reduce artifacts.
+- Strongly reduce pixelation; moderately recover texture; improve fidelity.
 
 ========================
 Output
@@ -134,60 +169,16 @@ Output
 
 Return only the cleaned JSON profile.
 
+The returned profile must contain:
+- iaa
+- iqa
+- ista, if it existed in the original profile
+- suggestion
+
+Do not include explanations outside the JSON.
+
 Original profile:
 {{PROFILE_JSON}}"""
-
-
-PROMPT_C = """You are a strict validator and repair agent for cleaned image profiles.
-
-You will receive a cleaned JSON-like image profile.
-
-Your task is to verify whether profile.iaa and profile.iqa are strictly separated.
-
-If violations exist, repair them while preserving the original structure and field names.
-
-========================
-Hard constraints
-========================
-
-IAA must not contain any IQA terms or concepts.
-
-Forbidden in IAA:
-blur, blurry, blurriness, low resolution, resolution, pixelation, noise, grain, compression, artifact, sharpness, focus, detail loss, texture loss, fidelity, distortion, overexposure, underexposure, exposure defect, image quality, technical quality.
-
-IQA must not contain any IAA terms or concepts.
-
-Forbidden in IQA:
-composition, framing, layout, balance, symmetry, rhythm, leading lines, focal point, visual hierarchy, artistic, aesthetic, creativity, originality, theme, storytelling, narrative, mood, atmosphere, emotion, viewer, engagement, memorability, gestalt.
-
-========================
-Repair rules
-========================
-
-1. If an IAA sentence contains forbidden IQA content, rewrite it into a valid aesthetic sentence or delete it.
-2. If an IQA sentence contains forbidden IAA content, rewrite it into a valid image-quality sentence or delete it.
-3. If a sentence cannot be repaired without crossing section boundaries, delete it.
-4. If a field becomes empty, add one concise valid sentence that fits the field.
-5. Do not add new fields.
-6. Do not rename fields.
-7. Do not change the JSON hierarchy.
-8. Return only the repaired JSON.
-9. Do not include explanations.
-
-========================
-Final self-check before output
-========================
-
-Before returning the JSON, internally verify:
-- No IAA forbidden terms remain in profile.iaa.
-- No IQA forbidden terms remain in profile.iqa.
-- No repeated sentence appears across IAA and IQA.
-- Each IAA field contains only aesthetic/compositional/expressive content.
-- Each IQA field contains only quality/distortion/fidelity content.
-
-Now validate and repair this profile:
-
-{{CLEANED_PROFILE_JSON}}"""
 
 
 JSON_REPAIR_PROMPT = """You are a JSON structure repair agent.
@@ -214,11 +205,6 @@ def _format_json(value):
 def render_prompt_b(profile):
     """Render the structure-preserving rewrite prompt."""
     return PROMPT_B.replace("{{PROFILE_JSON}}", _format_json(profile))
-
-
-def render_prompt_c(cleaned_profile):
-    """Render the strict validation and repair prompt."""
-    return PROMPT_C.replace("{{CLEANED_PROFILE_JSON}}", _format_json(cleaned_profile))
 
 
 def render_json_repair_prompt(raw_output):
