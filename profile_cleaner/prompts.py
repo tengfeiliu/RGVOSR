@@ -137,6 +137,7 @@ Token budgets, placement, and suggestion constraints
 Length limits below are token budgets, not character budgets.
 Estimate tokens as the downstream FLUX.2/Qwen tokenizer would tokenize the returned English text.
 Do not count Unicode characters or bytes.
+Do not interpret tokens as English characters; tokens are tokenizer units, not letters.
 
 IAA output must be very compact:
 - The entire profile.iaa section must be no more than 50 tokens total.
@@ -147,6 +148,9 @@ IAA output must be very compact:
 IQA output must be informative but bounded:
 - The entire profile.iqa section should be around 370 tokens.
 - Keep it concise, but do not make it too short if the original profile contains enough quality evidence.
+- distortion_location, distortion_severity, distortion_type, and overall_quality must all be present and non-empty.
+- Optimize those four IQA fields based on the original profile evidence.
+- If the original profile has limited evidence for one required IQA field, write a concise evidence-bounded statement instead of leaving it empty.
 - Preserve the original IQA field names, especially distortion_location, distortion_severity, distortion_type, and overall_quality when they exist.
 - Distribute IQA content across those fields within the total token budget.
 - Cover distortion location, distortion type, severity, and overall quality impact.
