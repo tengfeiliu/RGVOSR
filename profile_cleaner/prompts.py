@@ -131,27 +131,31 @@ Rewriting rules
 15. Do not add any other new fields.
 
 ========================
-Length, placement, and suggestion constraints
+Token budgets, placement, and suggestion constraints
 ========================
 
+Length limits below are token budgets, not character budgets.
+Estimate tokens as the downstream FLUX.2/Qwen tokenizer would tokenize the returned English text.
+Do not count Unicode characters or bytes.
+
 IAA output must be very compact:
-- The entire profile.iaa section must be no more than 50 characters total.
+- The entire profile.iaa section must be no more than 50 tokens total.
 - Put the IAA summary in profile.iaa.comprehensive when that field exists.
 - Set the other string fields under profile.iaa to "".
 - Summarize only the key aesthetic, composition, atmosphere, or expressive evidence.
 
 IQA output must be informative but bounded:
-- The entire profile.iqa section should be around 370 characters.
+- The entire profile.iqa section should be around 370 tokens.
 - Keep it concise, but do not make it too short if the original profile contains enough quality evidence.
 - Preserve the original IQA field names, especially distortion_location, distortion_severity, distortion_type, and overall_quality when they exist.
-- Distribute IQA content across those fields within the total character budget.
+- Distribute IQA content across those fields within the total token budget.
 - Cover distortion location, distortion type, severity, and overall quality impact.
 - Do not invent unsupported quality evidence just to reach the target length.
 
 Suggestion output:
 - Add a profile-level field named suggestion.
 - suggestion must focus only on IQA-related improvement actions.
-- suggestion must be no more than 80 characters total.
+- suggestion must be no more than 80 tokens total.
 - Include multiple short suggestions when possible.
 - Use degree modifiers in each suggestion, such as mildly, moderately, strongly, selectively, or carefully.
 - Prefer concise action phrases.

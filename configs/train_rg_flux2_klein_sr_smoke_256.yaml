@@ -6,7 +6,7 @@ model:
   text_encoder_dtype: fp32
   vae_device: cuda
   vae_dtype: fp32
-  max_prompt_sequence_length: 128
+  max_prompt_sequence_length: 512
   use_lora: true
   lora_rank: 8
   lora_alpha: 8

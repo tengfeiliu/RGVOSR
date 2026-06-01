@@ -27,6 +27,17 @@ model:
 
 - `configs/train_rg_flux_sr_ms.yaml`
 - `configs/train_rg_flux_sr_ms_smoke_256.yaml`
+- `configs/train_rg_flux2_klein_sr_smoke_256.yaml`
+
+FLUX.2-klein 后端需要单独的 Diffusers 格式基础模型目录。当前 FLUX2 smoke 配置默认使用：
+
+```yaml
+model:
+  flux_backend: flux2_klein
+  flux_model_path: /data/models/FLUX.2-klein-base-4B
+```
+
+该目录需要包含 FLUX.2-klein base 的 `transformer/`、`vae/`、Qwen tokenizer/text encoder 等完整组件。FLUX.2-klein 不是简单替换 FLUX.1 路径，必须显式设置 `model.flux_backend: flux2_klein`。
 
 数据 JSONL 默认：
 
@@ -43,7 +54,9 @@ data:
 | --- | --- |
 | `configs/train_rg_flux_sr_ms_smoke_256.yaml` | 2 卡低显存 smoke 配置，`crop_size=256`，用于验证训练链路。 |
 | `configs/train_rg_flux_sr_ms.yaml` | 512 正式训练配置，推荐 8 卡或更大显存。 |
+| `configs/train_rg_flux2_klein_sr_smoke_256.yaml` | FLUX.2-klein 2 卡 256 smoke 配置，默认 `model.flux_backend=flux2_klein`。 |
 | `configs/accelerate/zero3_bf16_cpu_offload.yaml` | 2 卡 ZeRO-3 + CPU offload，用于 24GB 卡 smoke test。 |
+| `configs/accelerate/zero3_bf16_param_offload.yaml` | 2 卡 ZeRO-3 配置，optimizer 不 offload；可按显存情况设置 `offload_param_device` 为 `cpu` 或 `none`。 |
 | `configs/accelerate/zero3_bf16.yaml` | 8 卡 ZeRO-3，无 CPU offload，用于正式训练。 |
 
 关键配置：
@@ -85,6 +98,41 @@ accelerate launch \
   train_rg_flux_sr.py \
   --config configs/train_rg_flux_sr_ms_smoke_256.yaml
 ```
+
+### 2 卡 FLUX.2-klein 256 Smoke 训练
+
+这个命令用于启动 FLUX.2-klein base 后端的 256 smoke 训练。配置文件会走 `Flux2KleinSRArtist`，基础模型路径默认是 `/data/models/FLUX.2-klein-base-4B`。当前建议先用 2 卡 256 验证链路，后续再逐步放大 crop、token 数或迁移到更多显存。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16_param_offload.yaml \
+  --num_processes 2 \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml
+```
+
+FLUX2 smoke 配置里的几个关键项：
+
+```yaml
+model:
+  flux_backend: flux2_klein
+  flux_model_path: /data/models/FLUX.2-klein-base-4B
+  text_encoder_device: cpu
+  vae_device: cuda
+
+training:
+  grad_accum_steps: 1
+  resume_ckpt: null
+  auto_resume: false
+  suffix: "_flux2_klein_smoke256_v2"
+
+evaluation:
+  enabled: false
+```
+
+如果显存不足，优先把 `vae_device` 改回 `cpu`，并把 `configs/accelerate/zero3_bf16_param_offload.yaml` 中的 `offload_param_device` 改成 `cpu`。如果想恢复自动续训，把 `training.auto_resume` 改成 `true`，但 ZeRO-3 下旧 LoRA checkpoint 可能需要单独的安全加载逻辑。
 
 ### 8 卡 512 Dry-Run
 
@@ -142,6 +190,21 @@ python inference_rg_flux_sr.py \
   --output_dir outputs/rg_flux_sr \
   --checkpoint exp_rg_flux_sr/rg_flux_sr_ms_stageA_latent_adapter_size256_smoke256/checkpoints/checkpoint-00000001/rg_flux_adapters \
   --config configs/train_rg_flux_sr_ms_smoke_256.yaml \
+  --jsonl_path datasets/LSDIR_cache/valid.jsonl \
+  --num_inference_steps 25 \
+  --upscale 4
+```
+
+### FLUX.2-klein Checkpoint 推理
+
+FLUX.2-klein 推理仍使用 `inference_rg_flux_sr.py`，关键是 `--config` 指向 FLUX2 配置，`--checkpoint` 指向 FLUX2 实验保存的 `rg_flux_adapters` 目录。
+
+```bash
+python inference_rg_flux_sr.py \
+  --input path/to/lq_or_folder \
+  --output_dir outputs/rg_flux2_klein_sr \
+  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_latent_adapter_size256_flux2_klein_smoke256_v2/checkpoints/checkpoint-00000001/rg_flux_adapters \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
   --jsonl_path datasets/LSDIR_cache/valid.jsonl \
   --num_inference_steps 25 \
   --upscale 4
