@@ -154,6 +154,21 @@ def append_jsonl_record(handle, record: dict):
     handle.flush()
 
 
+def get_hq_path(record: dict):
+    hq_path = record.get("hq_path") if isinstance(record, dict) else None
+    return hq_path if hq_path else None
+
+
+def load_completed_hq_paths(output_file: Path) -> set:
+    records = load_json_or_jsonl(output_file, jsonl=True)
+    completed = set()
+    for record in records:
+        hq_path = get_hq_path(record)
+        if hq_path:
+            completed.add(hq_path)
+    return completed
+
+
 def iter_input_output_files(input_path: Path, output_path: Path, recursive=False, jsonl=False):
     if input_path.is_dir():
         pattern = "**/*" if recursive else "*"
@@ -172,12 +187,29 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
         records = records[: args.limit]
     print(f"[profile_cleaner] Processing file {input_file} -> {output_file} records={len(records)}", flush=True)
     if file_jsonl and not args.dry_run:
-        if output_file.exists() and not args.overwrite:
-            raise FileExistsError(f"Output already exists: {output_file}")
+        completed_hq_paths = set()
+        resume = output_file.exists() and not args.overwrite
+        if resume:
+            completed_hq_paths = load_completed_hq_paths(output_file)
+            print(
+                f"[profile_cleaner] Resuming {output_file}: completed_hq_paths={len(completed_hq_paths)}",
+                flush=True,
+            )
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        with output_file.open("w", encoding="utf-8") as handle:
+        mode = "a" if resume else "w"
+        skipped = 0
+        appended = 0
+        with output_file.open(mode, encoding="utf-8") as handle:
             total = len(records)
             for index, record in enumerate(records):
+                hq_path = get_hq_path(record)
+                if not args.overwrite and hq_path and hq_path in completed_hq_paths:
+                    skipped += 1
+                    print(
+                        f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped hq_path={hq_path}",
+                        flush=True,
+                    )
+                    continue
                 cleaned_record = clean_record(
                     record,
                     index,
@@ -190,7 +222,13 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
                     progress=True,
                 )
                 append_jsonl_record(handle, cleaned_record)
-        print(f"[profile_cleaner] Wrote {output_file}", flush=True)
+                appended += 1
+                if hq_path and not args.overwrite:
+                    completed_hq_paths.add(hq_path)
+        if resume:
+            print(f"[profile_cleaner] Wrote {output_file} appended={appended} skipped={skipped}", flush=True)
+        else:
+            print(f"[profile_cleaner] Wrote {output_file}", flush=True)
         return len(records)
 
     cleaned = clean_records(

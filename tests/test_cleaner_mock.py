@@ -356,6 +356,204 @@ class ProfileCleanerMockTests(unittest.TestCase):
         self.assertEqual(errors[0]["item_index"], 1)
         self.assertIn("boom", errors[0]["error"])
 
+    def test_cli_jsonl_existing_output_skips_matching_hq_paths_and_appends_missing(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class CountingCleaner:
+            def __init__(self):
+                self.calls = 0
+
+            def clean_one(self, profile):
+                self.calls += 1
+                return clean
+
+        cleaner = CountingCleaner()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            existing = {
+                "hq_path": "a.png",
+                "unipercept_raw": {"profile": {"already_cleaned": True}},
+                "result": {"kept": "existing"},
+            }
+            records = [
+                {"hq_path": "a.png", "unipercept_raw": {"profile": sample_profile()}, "id": 1},
+                {"hq_path": "b.png", "unipercept_raw": {"profile": sample_profile()}, "id": 2},
+            ]
+            input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+            output_path.write_text(json.dumps(existing) + "\n", encoding="utf-8")
+            stdout = io.StringIO()
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch("sys.stdout", new=stdout):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                    ]
+                )
+
+            written = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cleaner.calls, 1)
+        self.assertEqual(written[0], existing)
+        self.assertEqual(written[1]["hq_path"], "b.png")
+        self.assertEqual(written[1]["unipercept_raw"]["profile"], clean)
+        self.assertIn("skipped", stdout.getvalue())
+
+    def test_cli_jsonl_overwrite_recleans_existing_output(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class CountingCleaner:
+            def __init__(self):
+                self.calls = 0
+
+            def clean_one(self, profile):
+                self.calls += 1
+                return clean
+
+        cleaner = CountingCleaner()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            records = [
+                {"hq_path": "a.png", "unipercept_raw": {"profile": sample_profile()}, "id": 1},
+                {"hq_path": "b.png", "unipercept_raw": {"profile": sample_profile()}, "id": 2},
+            ]
+            input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+            output_path.write_text(json.dumps({"hq_path": "a.png", "old": True}) + "\n", encoding="utf-8")
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                        "--overwrite",
+                    ]
+                )
+
+            written = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cleaner.calls, 2)
+        self.assertEqual([item["hq_path"] for item in written], ["a.png", "b.png"])
+        self.assertNotIn("old", written[0])
+
+    def test_cli_jsonl_resume_cleans_records_without_hq_path(self):
+        from profile_cleaner import cli
+
+        clean = {
+            "iaa": {"composition_design": "- The framing is stable."},
+            "iqa": {"overall_quality": "- Blur is visible."},
+            "ista": {"unchanged": True},
+        }
+
+        class CountingCleaner:
+            def __init__(self):
+                self.calls = 0
+
+            def clean_one(self, profile):
+                self.calls += 1
+                return clean
+
+        cleaner = CountingCleaner()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            input_path.write_text(
+                json.dumps({"unipercept_raw": {"profile": sample_profile()}, "id": 1}) + "\n",
+                encoding="utf-8",
+            )
+            output_path.write_text(json.dumps({"hq_path": "a.png", "old": True}) + "\n", encoding="utf-8")
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                    ]
+                )
+
+            written = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cleaner.calls, 1)
+        self.assertEqual(written[1]["id"], 1)
+        self.assertEqual(written[1]["unipercept_raw"]["profile"], clean)
+
+    def test_cli_jsonl_limit_applies_before_resume_skips(self):
+        from profile_cleaner import cli
+
+        class CountingCleaner:
+            def __init__(self):
+                self.calls = 0
+
+            def clean_one(self, profile):
+                self.calls += 1
+                return profile
+
+        cleaner = CountingCleaner()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.jsonl"
+            output_path = root / "output.jsonl"
+            existing = {"hq_path": "a.png", "old": True}
+            records = [
+                {"hq_path": "a.png", "unipercept_raw": {"profile": sample_profile()}, "id": 1},
+                {"hq_path": "b.png", "unipercept_raw": {"profile": sample_profile()}, "id": 2},
+            ]
+            input_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+            output_path.write_text(json.dumps(existing) + "\n", encoding="utf-8")
+
+            with mock.patch.object(cli, "build_cleaner", return_value=cleaner), mock.patch(
+                "sys.stdout", new=io.StringIO()
+            ):
+                exit_code = cli.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--jsonl",
+                        "--limit",
+                        "1",
+                    ]
+                )
+
+            written = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cleaner.calls, 0)
+        self.assertEqual(written, [existing])
+
     def test_cli_jsonl_flushes_each_record_before_later_failure(self):
         from profile_cleaner import cli
 

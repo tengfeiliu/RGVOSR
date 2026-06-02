@@ -414,12 +414,13 @@ python -m profile_cleaner.cli \
   --jsonl \
   --model qwen2.5-vl-72b-instruct \
   --max-retries 2 \
-  --limit 1 \
-  --overwrite
+  --limit 1
 ```
 
 `--limit 1` is useful for testing a single paid API sample before launching a full batch. The CLI prints progress
 for each file, record, and LLM prompt stage so long-running requests show where they are waiting.
+If the JSONL output already exists, the CLI resumes by `hq_path`: records already present in the output are skipped,
+and only missing records are cleaned and appended. Use `--overwrite` to force a full reclean and rewrite the output.
 
 Directory batch:
 
@@ -502,7 +503,8 @@ Use `--error-log path/to/errors.jsonl` to choose the log path.
 
 ### FAQ
 
-- Existing output files are not overwritten unless `--overwrite` is set.
+- JSONL output resumes by `hq_path` when the output file already exists; use `--overwrite` to force a full reclean.
+- Existing non-JSONL output files are not overwritten unless `--overwrite` is set.
 - Missing `unipercept_raw.profile`, `iaa`, or `iqa` is logged and the record is kept unchanged.
 - `profile.ista` is preserved from the original profile.
 - JSON output uses `ensure_ascii=False`, so Chinese and other Unicode text are preserved.
@@ -614,7 +616,6 @@ python -m profile_cleaner.cli \
   --model qwen-plus \
   --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
   --limit 1 \
-  --overwrite \
   --verbose
 ```
 
@@ -627,9 +628,10 @@ python -m profile_cleaner.cli \
   --jsonl \
   --model qwen-plus \
   --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  --overwrite \
   --verbose
 ```
+
+如果 `valid.cleaned.jsonl` 已经存在，JSONL 模式会根据 `hq_path` 自动续跑：输出中已有的记录会跳过，只清洗并追加缺失记录。需要强制重新清洗并重写输出时再加 `--overwrite`。
 
 目录批处理：
 
@@ -639,8 +641,7 @@ python -m profile_cleaner.cli \
   --output datasets/LSDIR_unipercept_cleaned_cache \
   --recursive \
   --jsonl \
-  --model qwen-plus \
-  --overwrite
+  --model qwen-plus
 ```
 
 不调用大模型、只做结构和本地禁词检查：
@@ -665,7 +666,7 @@ python -m profile_cleaner.cli \
 
 - `--jsonl`：按 JSONL 读取和写出。
 - `--limit 1`：只清洗 1 条，适合测试 API key、模型名和费用。
-- `--overwrite`：允许覆盖已有输出文件；默认禁止覆盖。
+- `--overwrite`：强制覆盖输出并重新清洗；JSONL 默认会按已有输出中的 `hq_path` 自动续跑。
 - `--error-log profile_cleaner_errors.jsonl`：单条失败记录写入 JSONL，不中断批处理。
 - `--max-retries`：当前单 Prompt B 流程下影响有限，主要保留兼容参数。
 - `--verbose`：输出文件、记录和 LLM 阶段进度。
