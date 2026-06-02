@@ -1,3 +1,6 @@
+import json
+
+
 DEFAULT_SR_PROMPT = (
     "Super-resolve this low-quality image into a high-quality realistic image.\n\n"
     "Requirements:\n"
@@ -10,47 +13,41 @@ def _safe_text(value, default=""):
     if value is None:
         return default
     try:
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False).strip()
         return str(value).strip()
     except Exception:
         return default
 
 
-def build_sr_prompt(result: dict, use_prompt: bool = True, use_suggestions: bool = True) -> str:
+def build_sr_prompt(profile: dict, use_prompt: bool = True, use_suggestions: bool = True) -> str:
     if not use_prompt:
         return DEFAULT_SR_PROMPT
 
-    result = result if isinstance(result, dict) else {}
-    reasoning = result.get("reasoning")
-    reasoning = reasoning if isinstance(reasoning, dict) else {}
-
-    degradation_analysis = _safe_text(reasoning.get("degradation_analysis"))
-    texture_edge_analysis = _safe_text(reasoning.get("texture_edge_analysis"))
-    semantic_risk_analysis = _safe_text(reasoning.get("semantic_risk_analysis"))
-    sr_strategy = _safe_text(reasoning.get("sr_strategy"))
+    profile = profile if isinstance(profile, dict) else {}
+    iqa = profile.get("iqa")
+    iqa = iqa if isinstance(iqa, dict) else {}
+    iaa = profile.get("iaa")
+    iaa = iaa if isinstance(iaa, dict) else {}
 
     parts = [
         "Super-resolve this low-quality image into a high-quality realistic image.",
         "",
-        "Image degradation analysis:",
-        degradation_analysis,
-        "",
-        "Texture and edge analysis:",
-        texture_edge_analysis,
-        "",
-        "Semantic restoration risk:",
-        semantic_risk_analysis,
-        "",
-        "Super-resolution strategy:",
-        sr_strategy,
+        "IQA profile:",
     ]
 
-    suggestions = result.get("suggestions")
-    if use_suggestions and isinstance(suggestions, (list, tuple)):
-        clean_suggestions = [_safe_text(item) for item in suggestions]
-        clean_suggestions = [item for item in clean_suggestions if item]
-        if clean_suggestions:
-            parts.extend(["", "Restoration suggestions:"])
-            parts.extend([f"- {item}" for item in clean_suggestions])
+    for key, value in iqa.items():
+        text = _safe_text(value)
+        if text:
+            parts.extend([f"{key}:", text])
+
+    suggestion = _safe_text(profile.get("suggestion"))
+    if use_suggestions and suggestion:
+        parts.extend(["", "Restoration suggestion:", suggestion])
+
+    comprehensive = _safe_text(iaa.get("comprehensive"))
+    if comprehensive:
+        parts.extend(["", "IAA comprehensive:", comprehensive])
 
     parts.extend(
         [

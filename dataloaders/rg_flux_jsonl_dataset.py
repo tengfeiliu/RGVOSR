@@ -69,7 +69,10 @@ class RGFluxSRJsonlDataset(Dataset):
                 hq_path = payload.get("hq_path")
                 lq_path = payload.get("lq_path")
                 result = payload.get("result")
-                if not hq_path or not lq_path or not isinstance(result, dict):
+                unipercept_raw = payload.get("unipercept_raw")
+                unipercept_raw = unipercept_raw if isinstance(unipercept_raw, dict) else {}
+                profile = unipercept_raw.get("profile")
+                if not hq_path or not lq_path or not isinstance(result, dict) or not isinstance(profile, dict):
                     skipped += 1
                     continue
                 if not Path(hq_path).exists() or not Path(lq_path).exists():
@@ -81,6 +84,7 @@ class RGFluxSRJsonlDataset(Dataset):
                     {
                         "hq_path": str(hq_path),
                         "lq_path": str(lq_path),
+                        "profile": profile,
                         "result": result,
                     }
                 )
@@ -151,13 +155,14 @@ class RGFluxSRJsonlDataset(Dataset):
                 hq = self._load_rgb(record["hq_path"])
                 lq = self._load_rgb(record["lq_path"])
                 hq_crop, lq_crop, lq_up = self._crop_pair(hq, lq)
+                profile = record["profile"]
                 result = record["result"]
                 return {
                     "hq": self._normalize_m11(hq_crop),
                     "lq": self._normalize_m11(lq_crop),
                     "lq_up": self._normalize_m11(lq_up),
                     "prompt": build_sr_prompt(
-                        result,
+                        profile,
                         use_prompt=self.use_prompt,
                         use_suggestions=self.use_suggestions,
                     ),

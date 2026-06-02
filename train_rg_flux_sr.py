@@ -327,7 +327,10 @@ def load_evaluation_records(jsonl_path, num_samples):
                 continue
             lq_path = record.get("lq_path")
             result = record.get("result")
-            if not lq_path or not Path(lq_path).exists() or not isinstance(result, dict):
+            unipercept_raw = record.get("unipercept_raw")
+            unipercept_raw = unipercept_raw if isinstance(unipercept_raw, dict) else {}
+            profile = unipercept_raw.get("profile")
+            if not lq_path or not Path(lq_path).exists() or not isinstance(result, dict) or not isinstance(profile, dict):
                 continue
             records.append(record)
             if len(records) >= num_samples:
@@ -403,8 +406,11 @@ def run_rg_flux_evaluation(accelerator, artist, config, exp_name, global_step, w
         with torch.no_grad():
             for sample_index, record in enumerate(records):
                 result = record.get("result") if isinstance(record.get("result"), dict) else {}
+                unipercept_raw = record.get("unipercept_raw")
+                unipercept_raw = unipercept_raw if isinstance(unipercept_raw, dict) else {}
+                profile = unipercept_raw.get("profile") if isinstance(unipercept_raw.get("profile"), dict) else {}
                 prompt = build_sr_prompt(
-                    result,
+                    profile,
                     use_prompt=bool(cfg(config, "condition.use_prompt", True)),
                     use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
                 )

@@ -23,24 +23,40 @@ class RGFluxSRComponentTests(unittest.TestCase):
         Image.new("RGB", (16, 16), color=(64, 96, 128)).save(lq_path)
         return hq_path, lq_path
 
-    def test_prompt_builder_uses_reasoning_and_suggestions(self):
+    def test_prompt_builder_uses_cleaned_profile_fields_in_order(self):
         from models.prompt_builder import build_sr_prompt
 
-        result = {
-            "reasoning": {
-                "degradation_analysis": "blur and JPEG artifacts",
-                "texture_edge_analysis": "edges are weak",
-                "semantic_risk_analysis": "text may be fragile",
-                "sr_strategy": "restore conservatively",
+        profile = {
+            "iqa": {
+                "distortion_location": "IQA location: blur across the frame.",
+                "distortion_severity": "IQA severity: moderate detail loss.",
+                "distortion_type": "IQA type: blur and JPEG artifacts.",
+                "overall_quality": "IQA overall: fidelity is limited.",
             },
-            "suggestions": ["recover fine textures", "avoid hallucinated details"],
+            "suggestion": "Suggestion: recover fine textures.",
+            "iaa": {"comprehensive": "IAA comprehensive: simple balanced composition."},
+            "reasoning": {"degradation_analysis": "old result reasoning must not be used"},
         }
 
-        prompt = build_sr_prompt(result, use_prompt=True, use_suggestions=True)
+        prompt = build_sr_prompt(profile, use_prompt=True, use_suggestions=True)
 
-        self.assertIn("blur and JPEG artifacts", prompt)
-        self.assertIn("- recover fine textures", prompt)
+        self.assertIn("distortion_location:", prompt)
+        self.assertIn("IQA location: blur across the frame.", prompt)
+        self.assertIn("IQA severity: moderate detail loss.", prompt)
+        self.assertIn("IQA type: blur and JPEG artifacts.", prompt)
+        self.assertIn("IQA overall: fidelity is limited.", prompt)
+        self.assertIn("Suggestion: recover fine textures.", prompt)
+        self.assertIn("IAA comprehensive: simple balanced composition.", prompt)
+        self.assertNotIn("old result reasoning must not be used", prompt)
         self.assertIn("Avoid hallucinated details", prompt)
+
+        iqa_index = prompt.index("IQA location")
+        suggestion_index = prompt.index("Suggestion: recover fine textures")
+        iaa_index = prompt.index("IAA comprehensive")
+        requirements_index = prompt.index("Requirements:")
+        self.assertLess(iqa_index, suggestion_index)
+        self.assertLess(suggestion_index, iaa_index)
+        self.assertLess(iaa_index, requirements_index)
 
     def test_flux_artist_to_does_not_move_text_pipeline(self):
         source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
@@ -413,6 +429,124 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("from models.rg_flux_artist_factory import build_rg_flux_artist", inference_source)
         self.assertIn("artist = build_rg_flux_artist(config).to(device=device)", inference_source)
 
+    def test_inference_jsonl_conditions_load_cleaned_profile_and_result(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"load_jsonl_conditions", "condition_for_image"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"json": json, "Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lq_path = root / "images" / "lq.png"
+            hq_path = root / "images" / "hq.png"
+            lq_path.parent.mkdir()
+            jsonl_path = root / "valid.cleaned.jsonl"
+            record = {
+                "lq_path": str(lq_path),
+                "hq_path": str(hq_path),
+                "unipercept_raw": {
+                    "profile": {
+                        "iqa": {"overall_quality": "cleaned iqa quality"},
+                        "suggestion": "cleaned suggestion",
+                        "iaa": {"comprehensive": "cleaned iaa"},
+                    }
+                },
+                "result": {"degradation_vector": {"blur": 0.7}, "score": 38},
+            }
+            jsonl_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            index = namespace["load_jsonl_conditions"](jsonl_path)
+            by_full_path = namespace["condition_for_image"](index, lq_path)
+            by_basename = namespace["condition_for_image"](index, Path("other-root") / lq_path.name)
+
+        self.assertEqual(by_full_path["profile"]["iqa"]["overall_quality"], "cleaned iqa quality")
+        self.assertEqual(by_full_path["result"]["degradation_vector"]["blur"], 0.7)
+        self.assertEqual(by_basename["profile"]["suggestion"], "cleaned suggestion")
+
+    def test_inference_jsonl_conditions_keep_records_without_profile_for_failure_logging(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"load_jsonl_conditions", "condition_for_image"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"json": json, "Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lq_path = root / "lq.png"
+            jsonl_path = root / "valid.cleaned.jsonl"
+            record = {
+                "lq_path": str(lq_path),
+                "hq_path": str(root / "hq.png"),
+                "result": {"degradation_vector": {"noise": 0.4}},
+            }
+            jsonl_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            index = namespace["load_jsonl_conditions"](jsonl_path)
+            condition = namespace["condition_for_image"](index, lq_path)
+
+        self.assertIsNotNone(condition)
+        self.assertIsNone(condition["profile"])
+        self.assertEqual(condition["result"]["degradation_vector"]["noise"], 0.4)
+        self.assertEqual(condition["record"]["lq_path"], str(lq_path))
+
+    def test_inference_failure_log_records_missing_jsonl_match_and_missing_profile(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "append_inference_failure"
+            ),
+            None,
+        )
+        self.assertIsNotNone(helper)
+
+        namespace = {"json": json, "Path": Path}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_path = root / "out" / "inference_failures.jsonl"
+            namespace["append_inference_failure"](
+                log_path,
+                image_path=root / "missing.png",
+                reason="missing_jsonl_match",
+                condition=None,
+            )
+            namespace["append_inference_failure"](
+                log_path,
+                image_path=root / "no_profile.png",
+                reason="missing_unipercept_raw.profile",
+                condition={"record": {"lq_path": "lq.png", "hq_path": "hq.png"}},
+            )
+
+            failures = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(failures[0]["reason"], "missing_jsonl_match")
+        self.assertEqual(failures[0]["image_path"], str(root / "missing.png"))
+        self.assertEqual(failures[1]["reason"], "missing_unipercept_raw.profile")
+        self.assertEqual(failures[1]["lq_path"], "lq.png")
+        self.assertEqual(failures[1]["hq_path"], "hq.png")
+
     def test_flux2_klein_smoke_config_is_isolated(self):
         main_config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
         config_path = Path("configs/train_rg_flux2_klein_sr_smoke_256.yaml")
@@ -509,15 +643,21 @@ class RGFluxSRComponentTests(unittest.TestCase):
         from models.prompt_builder import build_sr_prompt
 
         prompt = build_sr_prompt(
-            {"suggestions": ["recover fine textures"]},
+            {
+                "iqa": {"overall_quality": "IQA evidence remains."},
+                "suggestion": "recover fine textures",
+                "iaa": {"comprehensive": "IAA evidence remains."},
+            },
             use_prompt=True,
             use_suggestions=False,
         )
 
         self.assertNotIn("recover fine textures", prompt)
+        self.assertIn("IQA evidence remains.", prompt)
+        self.assertIn("IAA evidence remains.", prompt)
         self.assertIn("Super-resolve this low-quality image", prompt)
 
-    def test_jsonl_dataset_reads_pair_and_ignores_raw_fields(self):
+    def test_jsonl_dataset_uses_cleaned_profile_prompt_and_keeps_result_conditions(self):
         if torch is None:
             self.skipTest("torch is not installed in this environment")
         from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset
@@ -531,6 +671,16 @@ class RGFluxSRComponentTests(unittest.TestCase):
                 "lq_path": str(lq_path),
                 "raw_degradation_params": {"blur": 999.0},
                 "raw_qwen_response": "must be ignored",
+                "unipercept_raw": {
+                    "profile": {
+                        "iqa": {
+                            "distortion_location": "cleaned iqa location",
+                            "overall_quality": "cleaned iqa quality",
+                        },
+                        "suggestion": "cleaned profile suggestion",
+                        "iaa": {"comprehensive": "cleaned iaa comprehensive"},
+                    }
+                },
                 "result": {
                     "reasoning": {"degradation_analysis": "offline result"},
                     "suggestions": ["enhance edge sharpness"],
@@ -558,12 +708,59 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(sample["lq_up"].shape, (3, 32, 32))
         self.assertGreaterEqual(float(sample["hq"].min()), -1.0)
         self.assertLessEqual(float(sample["hq"].max()), 1.0)
-        self.assertIn("offline result", sample["prompt"])
+        self.assertIn("cleaned iqa location", sample["prompt"])
+        self.assertIn("cleaned profile suggestion", sample["prompt"])
+        self.assertIn("cleaned iaa comprehensive", sample["prompt"])
+        self.assertNotIn("offline result", sample["prompt"])
         self.assertEqual(sample["degradation_vector"].shape, (8,))
         self.assertAlmostEqual(float(sample["degradation_vector"][0]), 0.1)
         self.assertAlmostEqual(float(sample["degradation_vector"][3]), 0.0)
         self.assertEqual(float(sample["score"]), 47.0)
         self.assertEqual(sample["suggestions"], ["enhance edge sharpness"])
+
+    def test_jsonl_dataset_skips_records_without_cleaned_profile(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hq_path, lq_path = self._make_pair(root)
+            jsonl_path = root / "valid.jsonl"
+            missing_profile = {
+                "hq_path": str(hq_path),
+                "lq_path": str(lq_path),
+                "result": {"reasoning": {"degradation_analysis": "old invalid reasoning"}},
+            }
+            valid_profile = {
+                "hq_path": str(hq_path),
+                "lq_path": str(lq_path),
+                "unipercept_raw": {
+                    "profile": {
+                        "iqa": {"overall_quality": "valid cleaned quality"},
+                        "suggestion": "valid cleaned suggestion",
+                        "iaa": {"comprehensive": "valid cleaned aesthetic"},
+                    }
+                },
+                "result": {"score": 12, "degradation_vector": {"blur": 0.4}},
+            }
+            jsonl_path.write_text(
+                json.dumps(missing_profile) + "\n" + json.dumps(valid_profile) + "\n",
+                encoding="utf-8",
+            )
+
+            dataset = RGFluxSRJsonlDataset(
+                jsonl_path=str(jsonl_path),
+                crop_size=32,
+                scale=4,
+                mode="val",
+                use_prompt=True,
+            )
+            sample = dataset[0]
+
+        self.assertEqual(len(dataset), 1)
+        self.assertIn("valid cleaned quality", sample["prompt"])
+        self.assertNotIn("old invalid reasoning", sample["prompt"])
 
     def test_degradation_vector_encoder_outputs_context_tokens(self):
         if torch is None:

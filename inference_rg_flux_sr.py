@@ -57,7 +57,7 @@ def list_images(input_path):
     return []
 
 
-def load_jsonl_results(jsonl_path):
+def load_jsonl_conditions(jsonl_path):
     if not jsonl_path:
         return {}
     index = {}
@@ -73,19 +73,45 @@ def load_jsonl_results(jsonl_path):
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            profile = None
+            unipercept_raw = record.get("unipercept_raw")
+            if isinstance(unipercept_raw, dict) and isinstance(unipercept_raw.get("profile"), dict):
+                profile = unipercept_raw["profile"]
             result = record.get("result")
             if not isinstance(result, dict):
-                continue
+                result = {}
+            condition = {
+                "profile": profile,
+                "result": result,
+                "record": record,
+            }
             for key in ("lq_path", "hq_path"):
                 value = record.get(key)
                 if value:
-                    index[str(Path(value))] = result
-                    index[Path(value).name] = result
+                    index[str(Path(value))] = condition
+                    index[Path(value).name] = condition
     return index
 
 
-def result_for_image(result_index, image_path):
-    return result_index.get(str(image_path)) or result_index.get(image_path.name) or {}
+def condition_for_image(condition_index, image_path):
+    return condition_index.get(str(image_path)) or condition_index.get(image_path.name)
+
+
+def append_inference_failure(log_path, image_path, reason, condition=None):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "image_path": str(image_path),
+        "reason": reason,
+    }
+    record = condition.get("record") if isinstance(condition, dict) else None
+    if isinstance(record, dict):
+        for key in ("lq_path", "hq_path"):
+            value = record.get(key)
+            if value:
+                payload[key] = value
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def degradation_tensor(result, device, dtype, use_degradation_vector=True):
@@ -131,19 +157,44 @@ def main(args):
     artist.load_trainable(args.checkpoint, is_trainable=False)
     artist.eval()
 
-    result_index = load_jsonl_results(args.jsonl_path)
+    condition_index = load_jsonl_conditions(args.jsonl_path)
     image_paths = list_images(args.input)
     if not image_paths:
         raise FileNotFoundError(f"No input images found: {args.input}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    failure_log_path = output_dir / "inference_failures.jsonl"
     to_pil = transforms.ToPILImage()
 
     for image_path in tqdm(image_paths, desc="RG-FLUX-SR inference"):
-        result = result_for_image(result_index, image_path)
+        if args.jsonl_path:
+            condition = condition_for_image(condition_index, image_path)
+            if condition is None:
+                append_inference_failure(
+                    failure_log_path,
+                    image_path=image_path,
+                    reason="missing_jsonl_match",
+                    condition=None,
+                )
+                print(f"[inference] skipped {image_path}: missing JSONL match", flush=True)
+                continue
+            profile = condition.get("profile")
+            if not isinstance(profile, dict):
+                append_inference_failure(
+                    failure_log_path,
+                    image_path=image_path,
+                    reason="missing_unipercept_raw.profile",
+                    condition=condition,
+                )
+                print(f"[inference] skipped {image_path}: missing unipercept_raw.profile", flush=True)
+                continue
+            result = condition.get("result") if isinstance(condition.get("result"), dict) else {}
+        else:
+            profile = {}
+            result = {}
         prompt = build_sr_prompt(
-            result,
+            profile,
             use_prompt=args.use_prompt,
             use_suggestions=args.use_suggestions,
         )
