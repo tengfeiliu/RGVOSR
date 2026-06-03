@@ -91,6 +91,70 @@ class UniPerceptRawCacheTests(unittest.TestCase):
 
         self.assertEqual(seen, {"a.png", "b.png"})
 
+    def test_main_skips_seen_hq_paths_by_default(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeDegradation:
+            def __init__(self, opt_name, device=None):
+                self.opt_name = opt_name
+                self.device = device
+
+        class FakeAnalyzer:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        fake_torch = types.SimpleNamespace(
+            device=lambda value: value,
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        )
+        fake_degradation_module = types.SimpleNamespace(RealESRGAN_degradation=FakeDegradation)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "existing.png"
+            new = root / "new.png"
+            output = root / "valid.jsonl"
+            invalid = root / "invalid.jsonl"
+            output.write_text(json.dumps({"hq_path": str(existing)}) + "\n", encoding="utf-8")
+            invalid.write_text("", encoding="utf-8")
+
+            args = types.SimpleNamespace(
+                input="unused",
+                limit=0,
+                output=str(output),
+                invalid_output=str(invalid),
+                resume=False,
+                device="cpu",
+                opt_name="params_realsr.yml",
+                unipercept_model_path=str(root),
+                unipercept_repo=None,
+                unipercept_command=None,
+                unipercept_backend="profile",
+            )
+
+            with mock.patch.object(module, "parse_args", return_value=args), mock.patch.object(
+                module, "list_hq_images", return_value=[existing, new]
+            ), mock.patch.object(module, "UniPerceptRawAnalyzer", FakeAnalyzer), mock.patch.object(
+                module, "process_image",
+                return_value={
+                    "hq_path": str(new),
+                    "lq_path": "lq.png",
+                    "raw_degradation_params": {},
+                    "unipercept_raw": {},
+                    "result": module.default_empty_result(),
+                },
+            ) as process_image, mock.patch.dict(
+                "sys.modules",
+                {
+                    "torch": fake_torch,
+                    "dataloaders.realesrgan_gpu": fake_degradation_module,
+                },
+            ):
+                module.main()
+
+        self.assertEqual(process_image.call_count, 1)
+        self.assertEqual(process_image.call_args.args[0], new)
+
     def test_reward_backend_requires_local_model_path(self):
         from tools import generate_unipercept_raw_cache as module
 

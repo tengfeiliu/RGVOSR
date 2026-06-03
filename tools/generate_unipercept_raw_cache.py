@@ -817,7 +817,7 @@ def main():
     if args.limit > 0:
         images = images[: args.limit]
 
-    seen = load_seen_hq_paths(args.output, args.invalid_output) if args.resume else set()
+    seen = load_seen_hq_paths(args.output, args.invalid_output)
 
     import torch
 
@@ -843,6 +843,7 @@ def main():
         try:
             record = process_image(image_path, args, degradation, device, analyzer)
             append_jsonl(args.output, record)
+            seen.add(image_key)
         except Exception as exc:
             append_jsonl(
                 args.invalid_output,
@@ -851,6 +852,7 @@ def main():
                     "reason": str(exc),
                 },
             )
+            seen.add(image_key)
 
 
 if __name__ == "__main__":
