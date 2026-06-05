@@ -38,5 +38,6 @@ class LLMClient:
             model=self.model,
             temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
+            extra_body={"enable_thinking": False},
         )
         return response.choices[0].message.content or ""
