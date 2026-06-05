@@ -4,6 +4,8 @@ import argparse
 import copy
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .cleaner import ProfileCleaner
@@ -20,6 +22,19 @@ from .llm_client import LLMClient
 from .validators import validate_profile_structure, validate_strict_separation
 
 
+_ERROR_LOG_LOCK = threading.Lock()
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Clean UniPercept IAA/IQA profiles in JSON or JSONL records.")
     parser.add_argument("--input", required=True, help="Input JSON, JSONL, or directory.")
@@ -33,6 +48,7 @@ def build_parser():
     parser.add_argument("--temperature", type=float, default=float(os.getenv("PROFILE_CLEANER_TEMPERATURE", DEFAULT_TEMPERATURE)))
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--limit", type=int, default=0, help="Maximum records to process from each input file. 0 means no limit.")
+    parser.add_argument("--workers", type=positive_int, default=4, help="Number of records to clean concurrently.")
     parser.add_argument("--dry-run", action="store_true", help="Validate records without calling the LLM or writing outputs.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--error-log", default=DEFAULT_ERROR_LOG)
@@ -102,8 +118,9 @@ def append_error(error_log: Path, input_file: Path, item_index: int, error: str,
         "error": str(error),
         "profile_summary": profile_summary(profile),
     }
-    with error_log.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with _ERROR_LOG_LOCK:
+        with error_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def clean_record(record, index, total, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False, progress=True):
@@ -141,11 +158,37 @@ def clean_record(record, index, total, cleaner, input_file: Path, error_log: Pat
     return output_record
 
 
-def clean_records(records, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False, progress=True):
-    cleaned = []
+def clean_records(records, cleaner, input_file: Path, error_log: Path, dry_run=False, verbose=False, progress=True, workers=1):
     total = len(records)
-    for index, record in enumerate(records):
-        cleaned.append(clean_record(record, index, total, cleaner, input_file, error_log, dry_run, verbose, progress))
+    if workers <= 1 or total <= 1:
+        return [
+            clean_record(record, index, total, cleaner, input_file, error_log, dry_run, verbose, progress)
+            for index, record in enumerate(records)
+        ]
+
+    cleaned = [None] * total
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(clean_record, record, index, total, cleaner, input_file, error_log, dry_run, verbose, progress): (
+                index,
+                record,
+            )
+            for index, record in enumerate(records)
+        }
+        for future in as_completed(futures):
+            index, record = futures[future]
+            try:
+                cleaned[index] = future.result()
+            except Exception as exc:
+                if not dry_run:
+                    append_error(error_log, input_file, index, str(exc), get_nested_profile(record))
+                if progress:
+                    print(f"[profile_cleaner] {input_file}: record {index + 1}/{total} future failed: {exc}", flush=True)
+                cleaned[index] = copy.deepcopy(record)
+
+    missing_indexes = [index for index, record in enumerate(cleaned) if record is None]
+    if missing_indexes:
+        raise RuntimeError(f"Missing cleaned records for indexes: {missing_indexes}")
     return cleaned
 
 
@@ -180,6 +223,31 @@ def iter_input_output_files(input_path: Path, output_path: Path, recursive=False
         yield input_path, output_path
 
 
+def clean_jsonl_record(record, index, total, cleaner, input_file: Path, error_log: Path, verbose=False):
+    hq_path = get_hq_path(record)
+    cleaned_record = clean_record(
+        record,
+        index,
+        total,
+        cleaner,
+        input_file,
+        error_log,
+        False,
+        verbose,
+        True,
+    )
+    return index, hq_path, cleaned_record
+
+
+def write_jsonl_result(handle, record: dict, hq_path, completed_hq_paths: set, written_hq_paths: set):
+    if hq_path and hq_path in written_hq_paths:
+        raise RuntimeError(f"Duplicate hq_path write attempted: {hq_path}")
+    append_jsonl_record(handle, record)
+    if hq_path:
+        completed_hq_paths.add(hq_path)
+        written_hq_paths.add(hq_path)
+
+
 def process_file(input_file: Path, output_file: Path, cleaner, args):
     file_jsonl = args.jsonl or input_file.suffix.lower() == ".jsonl"
     records = load_json_or_jsonl(input_file, jsonl=file_jsonl)
@@ -187,6 +255,7 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
         records = records[: args.limit]
     print(f"[profile_cleaner] Processing file {input_file} -> {output_file} records={len(records)}", flush=True)
     if file_jsonl and not args.dry_run:
+        error_log = Path(args.error_log)
         completed_hq_paths = set()
         resume = output_file.exists() and not args.overwrite
         if resume:
@@ -195,40 +264,114 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
                 f"[profile_cleaner] Resuming {output_file}: completed_hq_paths={len(completed_hq_paths)}",
                 flush=True,
             )
+        scheduled_hq_paths = set()
+        written_hq_paths = set()
+        scheduled_count = 0
+        appended_count = 0
+        failed_future_count = 0
         output_file.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if resume else "w"
         skipped = 0
-        appended = 0
+        total = len(records)
         with output_file.open(mode, encoding="utf-8") as handle:
-            total = len(records)
-            for index, record in enumerate(records):
-                hq_path = get_hq_path(record)
-                if not args.overwrite and hq_path and hq_path in completed_hq_paths:
-                    skipped += 1
-                    print(
-                        f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped hq_path={hq_path}",
-                        flush=True,
-                    )
-                    continue
-                cleaned_record = clean_record(
-                    record,
-                    index,
-                    total,
-                    cleaner,
-                    input_file=input_file,
-                    error_log=Path(args.error_log),
-                    dry_run=False,
-                    verbose=args.verbose,
-                    progress=True,
-                )
-                append_jsonl_record(handle, cleaned_record)
-                appended += 1
-                if hq_path and not args.overwrite:
-                    completed_hq_paths.add(hq_path)
-        if resume:
-            print(f"[profile_cleaner] Wrote {output_file} appended={appended} skipped={skipped}", flush=True)
-        else:
-            print(f"[profile_cleaner] Wrote {output_file}", flush=True)
+            if args.workers <= 1:
+                for index, record in enumerate(records):
+                    hq_path = get_hq_path(record)
+                    if hq_path and hq_path in completed_hq_paths:
+                        skipped += 1
+                        print(
+                            f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped hq_path={hq_path}",
+                            flush=True,
+                        )
+                        continue
+                    if hq_path and hq_path in scheduled_hq_paths:
+                        skipped += 1
+                        print(
+                            f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped duplicate hq_path={hq_path}",
+                            flush=True,
+                        )
+                        continue
+                    if hq_path:
+                        scheduled_hq_paths.add(hq_path)
+                    scheduled_count += 1
+                    try:
+                        cleaned_record = clean_record(
+                            record,
+                            index,
+                            total,
+                            cleaner,
+                            input_file=input_file,
+                            error_log=error_log,
+                            dry_run=False,
+                            verbose=args.verbose,
+                            progress=True,
+                        )
+                    except Exception as exc:
+                        failed_future_count += 1
+                        append_error(error_log, input_file, index, str(exc), get_nested_profile(record))
+                        print(
+                            f"[profile_cleaner] {input_file}: record {index + 1}/{total} future failed: {exc}",
+                            flush=True,
+                        )
+                        cleaned_record = copy.deepcopy(record)
+                    write_jsonl_result(handle, cleaned_record, hq_path, completed_hq_paths, written_hq_paths)
+                    appended_count += 1
+            else:
+                with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                    futures = {}
+                    for index, record in enumerate(records):
+                        hq_path = get_hq_path(record)
+                        if hq_path and hq_path in completed_hq_paths:
+                            skipped += 1
+                            print(
+                                f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped hq_path={hq_path}",
+                                flush=True,
+                            )
+                            continue
+                        if hq_path and hq_path in scheduled_hq_paths:
+                            skipped += 1
+                            print(
+                                f"[profile_cleaner] {input_file}: record {index + 1}/{total} skipped duplicate hq_path={hq_path}",
+                                flush=True,
+                            )
+                            continue
+                        if hq_path:
+                            scheduled_hq_paths.add(hq_path)
+                        scheduled_count += 1
+                        future = executor.submit(
+                            clean_jsonl_record,
+                            record,
+                            index,
+                            total,
+                            cleaner,
+                            input_file,
+                            error_log,
+                            args.verbose,
+                        )
+                        futures[future] = (index, record, hq_path)
+                    for future in as_completed(futures):
+                        index, record, hq_path = futures[future]
+                        try:
+                            _, hq_path, cleaned_record = future.result()
+                        except Exception as exc:
+                            failed_future_count += 1
+                            append_error(error_log, input_file, index, str(exc), get_nested_profile(record))
+                            print(
+                                f"[profile_cleaner] {input_file}: record {index + 1}/{total} future failed: {exc}",
+                                flush=True,
+                            )
+                            cleaned_record = copy.deepcopy(record)
+                        write_jsonl_result(handle, cleaned_record, hq_path, completed_hq_paths, written_hq_paths)
+                        appended_count += 1
+
+        if appended_count != scheduled_count:
+            raise RuntimeError(
+                f"JSONL write count mismatch for {output_file}: appended={appended_count} scheduled={scheduled_count}"
+            )
+        print(
+            f"[profile_cleaner] Wrote {output_file} appended={appended_count} skipped={skipped} failed_futures={failed_future_count}",
+            flush=True,
+        )
         return len(records)
 
     cleaned = clean_records(
@@ -239,6 +382,7 @@ def process_file(input_file: Path, output_file: Path, cleaner, args):
         dry_run=args.dry_run,
         verbose=args.verbose,
         progress=True,
+        workers=args.workers,
     )
     if not args.dry_run:
         save_json_or_jsonl(cleaned, output_file, jsonl=file_jsonl, overwrite=args.overwrite)

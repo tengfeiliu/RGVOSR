@@ -31,7 +31,7 @@ condition:
   deg_vector_dim: 8
   deg_token_count: 0
   deg_hidden_dim: 512
-  lr_cond_mode: latent_adapter
+  lr_cond_mode: latent_concat
   lr_token_count: 8
   condition_dropout: 0.1
   visual_feature_dim: 768
