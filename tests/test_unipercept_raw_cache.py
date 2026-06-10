@@ -219,7 +219,9 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         from tools import generate_unipercept_raw_cache as module
 
         class Completed:
+            returncode = 0
             stdout = "raw response"
+            stderr = ""
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "UniPercept"
@@ -241,10 +243,11 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertEqual(result, {"iaa": "raw response", "iqa": "raw response", "ista": "raw response"})
         self.assertEqual(run.call_count, 3)
         first_command = run.call_args_list[0].args[0]
-        self.assertIn(str(script), first_command)
+        self.assertIn(str(Path(module.__file__).resolve().parent / "_unipercept_conversation_wrapper.py"), first_command)
         self.assertIn("--model_path", first_command)
         self.assertIn("--image", first_command)
         self.assertIn("--prompt", first_command)
+        self.assertEqual(run.call_args_list[0].kwargs["cwd"], str(repo))
         first_env = run.call_args_list[0].kwargs["env"]
         self.assertEqual(first_env["HF_HUB_OFFLINE"], "1")
         self.assertEqual(first_env["TRANSFORMERS_OFFLINE"], "1")
@@ -326,7 +329,7 @@ class UniPerceptRawCacheTests(unittest.TestCase):
                 module.UniPerceptRawAnalyzer,
                 "_load_reward_inferencer",
                 return_value=FakeRewardInferencer(),
-            ), mock.patch.object(module.subprocess, "run", return_value=Completed()) as run:
+            ), mock.patch.object(module.UniPerceptRawAnalyzer, "_chat_prompt", return_value="profile response") as chat:
                 analyzer = module.UniPerceptRawAnalyzer(
                     device="cuda",
                     model_path=model_dir,
@@ -335,7 +338,7 @@ class UniPerceptRawCacheTests(unittest.TestCase):
                 )
                 result = analyzer.analyze("lq.png")
 
-        self.assertEqual(run.call_count, 13)
+        self.assertEqual(chat.call_count, 13)
         self.assertEqual(result["iaa"], 100)
         self.assertEqual(result["iqa"], 20)
         self.assertEqual(result["ista"], 80)
@@ -434,6 +437,122 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertIn("recover fine textures", record["result"]["suggestions"])
         self.assertEqual(record["result"]["score"], compute_score(record["result"]["degradation_vector"]))
         self.assertNotEqual(record["result"]["score"], 60)
+
+    def test_process_inference_lr_image_uses_matching_hq_path(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeAnalyzer:
+            def analyze(self, image_path):
+                return {
+                    "profile": {
+                        "iaa": {"comprehensive": "Simple centered composition."},
+                        "iqa": {
+                            "distortion_location": "Artifacts affect the background.",
+                            "distortion_severity": "Mild visible degradation.",
+                            "distortion_type": "Blur and noise.",
+                            "overall_quality": "Usable low-resolution input.",
+                        },
+                        "ista": {"structural_annotation": {}, "raw_structural_annotation": ""},
+                    }
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lr_dir = root / "test_LR"
+            hr_dir = root / "test_HR"
+            lr_dir.mkdir()
+            hr_dir.mkdir()
+            lq_path = self._make_image(lr_dir / "sample.png")
+            hq_path = self._make_image(hr_dir / "sample.png")
+
+            record = module.process_inference_lr_image("dreal", lq_path, hr_dir, FakeAnalyzer())
+
+        self.assertEqual(record["dataset_name"], "dreal")
+        self.assertEqual(record["lq_path"], str(lq_path))
+        self.assertEqual(record["hq_path"], str(hq_path))
+        self.assertTrue(record["has_gt"])
+        self.assertFalse(record["raw_degradation_params"]["degradation_generated"])
+        self.assertEqual(record["result"]["degradation_vector"]["blur"], 0.0)
+
+    def test_process_inference_lr_image_without_hq_uses_lq_as_compat_hq_path(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeAnalyzer:
+            def analyze(self, image_path):
+                return {"profile": {"iaa": {}, "iqa": {}, "ista": {}}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lq_dir = root / "RealLQ250"
+            lq_dir.mkdir()
+            lq_path = self._make_image(lq_dir / "image.jpg")
+
+            record = module.process_inference_lr_image("reallq250", lq_path, None, FakeAnalyzer())
+
+        self.assertEqual(record["dataset_name"], "reallq250")
+        self.assertEqual(record["lq_path"], str(lq_path))
+        self.assertEqual(record["hq_path"], str(lq_path))
+        self.assertFalse(record["has_gt"])
+
+    def test_main_inference_lr_mode_uses_dataset_dirs_and_skips_seen_lq_paths(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        class FakeAnalyzer:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def analyze(self, image_path):
+                return {"profile": {"iaa": {}, "iqa": {}, "ista": {}}}
+
+        fake_torch = types.SimpleNamespace(
+            device=lambda value: value,
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lr_dir = root / "test_LR"
+            hr_dir = root / "test_HR"
+            lr_dir.mkdir()
+            hr_dir.mkdir()
+            seen_lq = self._make_image(lr_dir / "seen.png")
+            new_lq = self._make_image(lr_dir / "new.png")
+            self._make_image(hr_dir / "seen.png")
+            self._make_image(hr_dir / "new.png")
+            output = root / "valid.jsonl"
+            invalid = root / "invalid.jsonl"
+            output.write_text(json.dumps({"lq_path": str(seen_lq)}) + "\n", encoding="utf-8")
+            invalid.write_text("", encoding="utf-8")
+
+            args = types.SimpleNamespace(
+                input="unused",
+                inference_lr_mode=True,
+                dataset_dirs=[f"dreal={lr_dir}"],
+                hq_dirs=[f"dreal={hr_dir}"],
+                limit=0,
+                output=str(output),
+                invalid_output=str(invalid),
+                resume=True,
+                device="cpu",
+                opt_name="params_realsr.yml",
+                unipercept_model_path=str(root),
+                unipercept_repo=None,
+                unipercept_command=None,
+                unipercept_backend="profile",
+                lq_output_dir="unused_lq",
+                resize_bak=True,
+            )
+
+            with mock.patch.object(module, "parse_args", return_value=args), mock.patch.object(
+                module, "UniPerceptRawAnalyzer", FakeAnalyzer
+            ), mock.patch.dict("sys.modules", {"torch": fake_torch}):
+                module.main()
+
+            records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual([record.get("lq_path") for record in records], [str(seen_lq), str(new_lq)])
+        self.assertEqual(records[1]["hq_path"], str(hr_dir / "new.png"))
+        self.assertTrue(records[1]["has_gt"])
 
 
 if __name__ == "__main__":

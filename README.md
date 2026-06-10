@@ -582,7 +582,89 @@ python tools/generate_unipercept_raw_cache.py \
 }
 ```
 
-### 2. 配置千问/OpenAI-Compatible API
+### 2. 生成推理测试集 UniPercept Raw Profile
+
+这个命令用于已经存在的 LR 推理测试集。它不会再调用 RealESRGAN 二次退化，而是直接把测试集 LR 图片作为 `lq_path` 做 UniPercept 分析。DRealSR 和 RealSR 有同名 HR 图片，所以会从 `test_HR` 自动匹配真实 `hq_path`；RealLR200 和 RealLQ250 没有 GT 时会写入 `hq_path == lq_path` 和 `has_gt: false`。
+
+先用 `--limit 2` 跑小样本，确认路径、模型和输出结构正常：
+
+```bash
+python tools/generate_unipercept_raw_cache.py \
+  --inference-lr-mode \
+  --dataset-dirs \
+    dreal=/data/datasets/omgsr_eval/DrealSR_CenterCrop-20260428T063453Z-3-001/DrealSR_CenterCrop/test_LR \
+    realsr=/data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_LR \
+    reallr200=/data/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+    reallq250=/data/datasets/omgsr_eval/RealLQ250/lq \
+  --hq-dirs \
+    dreal=/data/datasets/omgsr_eval/DrealSR_CenterCrop-20260428T063453Z-3-001/DrealSR_CenterCrop/test_HR \
+    realsr=/data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_HR \
+  --output datasets/inference_unipercept_raw.jsonl \
+  --invalid-output datasets/inference_unipercept_invalid.jsonl \
+  --unipercept-repo /data/code/UniPercept/ \
+  --unipercept-model-path /data/models/UniPercept/ \
+  --unipercept-backend profile \
+  --device cuda \
+  --limit 2 \
+  --resume
+```
+
+确认无误后去掉 `--limit 2` 跑完整四个推理测试集：
+
+```bash
+python tools/generate_unipercept_raw_cache.py \
+  --inference-lr-mode \
+  --dataset-dirs \
+    dreal=/data/datasets/omgsr_eval/DrealSR_CenterCrop-20260428T063453Z-3-001/DrealSR_CenterCrop/test_LR \
+    realsr=/data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_LR \
+    reallr200=/data/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+    reallq250=/data/datasets/omgsr_eval/RealLQ250/lq \
+  --hq-dirs \
+    dreal=/data/datasets/omgsr_eval/DrealSR_CenterCrop-20260428T063453Z-3-001/DrealSR_CenterCrop/test_HR \
+    realsr=/data/datasets/omgsr_eval/RealSR_CenterCrop-20260428T063513Z-3-001/RealSR_CenterCrop/test_HR \
+  --output datasets/inference_unipercept_raw.jsonl \
+  --invalid-output datasets/inference_unipercept_invalid.jsonl \
+  --unipercept-repo /data/code/UniPercept/ \
+  --unipercept-model-path /data/models/UniPercept/ \
+  --unipercept-backend profile \
+  --device cuda \
+  --resume
+```
+
+然后清洗成推理可直接读取的 JSONL：
+
+```bash
+python -m profile_cleaner.cli \
+  --input datasets/inference_unipercept_raw.jsonl \
+  --output datasets/inference_cleaned.jsonl \
+  --jsonl \
+  --model qwen-plus \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --verbose
+```
+
+清洗完成后，推理命令中的 `--jsonl_path` 指向 `datasets/inference_cleaned.jsonl`。例如对 DRealSR 跑 FLUX.2-klein 推理：
+
+```bash
+python inference_rg_flux_sr.py \
+  --input /data/datasets/omgsr_eval/DrealSR_CenterCrop-20260428T063453Z-3-001/DrealSR_CenterCrop/test_LR \
+  --output_dir outputs/rg_flux2_klein_dreal \
+  --checkpoint path/to/checkpoint/rg_flux_adapters \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --jsonl_path datasets/inference_cleaned.jsonl \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16
+```
+
+推理测试集输出字段说明：
+- `dataset_name`：数据集名称，例如 `dreal`、`realsr`、`reallr200`、`reallq250`。
+- `lq_path`：原始 LR 测试图片路径，也是推理输入匹配的主要 key。
+- `hq_path`：DRealSR/RealSR 为同名 HR 图片；无 GT 数据集则等于 `lq_path`。
+- `has_gt`：是否存在真实 HR/GT，后续有参考指标只应对 `true` 的样本计算。
+- `raw_degradation_params.degradation_generated: false`：表示该记录没有生成合成退化，只分析已有 LR 图。
+
+### 3. 配置千问/OpenAI-Compatible API
 
 `profile_cleaner` 使用 OpenAI-compatible Chat Completions 接口。当前默认指向阿里云 DashScope 兼容接口：
 
@@ -602,7 +684,7 @@ export PROFILE_CLEANER_TEMPERATURE=0
 --temperature 0
 ```
 
-### 3. 优化 Profile Cleaner 输出
+### 4. 优化 Profile Cleaner 输出
 
 `profile_cleaner` 只替换 `record.unipercept_raw.profile`，不会修改 `hq_path`、`lq_path`、`raw_degradation_params`、`unipercept_raw.raw_reward`、外层 `result` 等字段。JSONL 模式会完成一条写一条，长任务中断时更容易保留已完成输出。
 

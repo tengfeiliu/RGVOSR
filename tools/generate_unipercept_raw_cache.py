@@ -275,6 +275,70 @@ def list_hq_images(input_path):
     return _expand_source(input_path, visited=set())
 
 
+def parse_named_paths(entries, option_name):
+    named_paths = {}
+    for entry in entries or []:
+        if "=" not in entry:
+            raise ValueError(f"{option_name} entries must use name=path format: {entry}")
+        name, raw_path = entry.split("=", 1)
+        name = name.strip()
+        raw_path = raw_path.strip()
+        if not name or not raw_path:
+            raise ValueError(f"{option_name} entries must use non-empty name=path format: {entry}")
+        if name in named_paths:
+            raise ValueError(f"Duplicate dataset name in {option_name}: {name}")
+        named_paths[name] = Path(raw_path).expanduser()
+    return named_paths
+
+
+def list_inference_lr_items(dataset_dirs, hq_dirs=None):
+    dataset_roots = parse_named_paths(dataset_dirs, "--dataset-dirs")
+    if not dataset_roots:
+        raise ValueError("--dataset-dirs is required when --inference-lr-mode is enabled")
+    hq_roots = parse_named_paths(hq_dirs, "--hq-dirs")
+
+    items = []
+    for dataset_name, lr_root in dataset_roots.items():
+        images = _expand_source(lr_root, visited=set())
+        hq_root = hq_roots.get(dataset_name)
+        for image_path in images:
+            items.append(
+                {
+                    "dataset_name": dataset_name,
+                    "lq_path": image_path,
+                    "lr_root": lr_root,
+                    "hq_dir": hq_root,
+                }
+            )
+    return items
+
+
+def resolve_matching_hq_path(lq_path, hq_dir, lr_root=None):
+    if hq_dir is None:
+        return None
+
+    lq_path = Path(lq_path)
+    hq_dir = Path(hq_dir)
+    candidates = []
+    if lr_root is not None:
+        try:
+            candidates.append(hq_dir / lq_path.relative_to(Path(lr_root)))
+        except ValueError:
+            pass
+    candidates.append(hq_dir / lq_path.name)
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+    tried = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"Missing matching HQ image for {lq_path}. Tried: {tried}")
+
+
 def stable_lq_name(image_path):
     image_path = Path(image_path)
     digest = hashlib.sha1(str(image_path).encode("utf-8")).hexdigest()[:10]
@@ -760,6 +824,28 @@ def process_image(image_path, args, degradation, device, analyzer):
     }
 
 
+def process_inference_lr_image(dataset_name, lq_path, hq_dir, analyzer, lr_root=None):
+    lq_path = Path(lq_path)
+    hq_path = resolve_matching_hq_path(lq_path, hq_dir, lr_root=lr_root) if hq_dir is not None else lq_path
+    has_gt = hq_dir is not None
+    meta = {
+        "source": "inference_lr",
+        "degradation_generated": False,
+        "dataset_name": dataset_name,
+    }
+    unipercept_raw = analyzer.analyze(lq_path)
+    result = build_result_from_unipercept_profile(meta, unipercept_raw)
+    return {
+        "dataset_name": dataset_name,
+        "lq_path": str(lq_path),
+        "hq_path": str(hq_path),
+        "has_gt": has_gt,
+        "raw_degradation_params": to_jsonable(meta),
+        "unipercept_raw": to_jsonable(unipercept_raw),
+        "result": result,
+    }
+
+
 def load_seen_hq_paths(output, invalid_output):
     seen = set()
     seen.update(read_jsonl_paths(output, key="hq_path"))
@@ -767,11 +853,45 @@ def load_seen_hq_paths(output, invalid_output):
     return seen
 
 
+def load_seen_lq_paths(output, invalid_output):
+    seen = set()
+    seen.update(read_jsonl_paths(output, key="lq_path"))
+    seen.update(read_jsonl_paths(invalid_output, key="lq_path"))
+    return seen
+
+
+def resolve_device_name(device_name):
+    if device_name != "auto":
+        return device_name
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate synthetic LQ images and raw UniPercept IAA/IQA/ISTA JSONL cache."
     )
     parser.add_argument("--input", default="configs/train_txt/train_dataset_txt.txt", help="HQ image, directory, txt list, or train dataset config.")
+    parser.add_argument(
+        "--inference-lr-mode",
+        action="store_true",
+        help="Analyze existing inference LR images directly and do not generate synthetic LQ images.",
+    )
+    parser.add_argument(
+        "--dataset-dirs",
+        nargs="+",
+        default=None,
+        help="Inference LR datasets in name=path format. Required with --inference-lr-mode.",
+    )
+    parser.add_argument(
+        "--hq-dirs",
+        nargs="*",
+        default=None,
+        help="Optional GT/HR directories in name=path format for datasets whose LR/HR image names match.",
+    )
     parser.add_argument("--lq-output-dir", default="datasets/LSDIR_unipercept_lq", help="Directory for generated LQ PNG images.")
     parser.add_argument("--output", default="datasets/LSDIR_unipercept_raw_cache/valid.jsonl", help="Valid raw UniPercept cache JSONL path.")
     parser.add_argument("--invalid-output", default="datasets/LSDIR_unipercept_raw_cache/invalid.jsonl", help="Invalid/error JSONL path.")
@@ -813,6 +933,49 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.device = resolve_device_name(args.device)
+
+    if getattr(args, "inference_lr_mode", False):
+        items = list_inference_lr_items(getattr(args, "dataset_dirs", None), getattr(args, "hq_dirs", None))
+        if args.limit > 0:
+            items = items[: args.limit]
+
+        seen = load_seen_lq_paths(args.output, args.invalid_output)
+        analyzer = UniPerceptRawAnalyzer(
+            device=args.device,
+            model_path=args.unipercept_model_path,
+            unipercept_repo=args.unipercept_repo,
+            command=args.unipercept_command,
+            backend=args.unipercept_backend,
+        )
+
+        for item in items:
+            lq_path = item["lq_path"]
+            image_key = str(lq_path)
+            if image_key in seen:
+                continue
+            try:
+                record = process_inference_lr_image(
+                    item["dataset_name"],
+                    lq_path,
+                    item["hq_dir"],
+                    analyzer,
+                    lr_root=item["lr_root"],
+                )
+                append_jsonl(args.output, record)
+                seen.add(image_key)
+            except Exception as exc:
+                payload = {
+                    "dataset_name": item["dataset_name"],
+                    "lq_path": image_key,
+                    "reason": str(exc),
+                }
+                if item["hq_dir"] is not None:
+                    payload["hq_dir"] = str(item["hq_dir"])
+                append_jsonl(args.invalid_output, payload)
+                seen.add(image_key)
+        return
+
     images = list_hq_images(args.input)
     if args.limit > 0:
         images = images[: args.limit]
@@ -820,9 +983,6 @@ def main():
     seen = load_seen_hq_paths(args.output, args.invalid_output)
 
     import torch
-
-    if args.device == "auto":
-        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(args.device)
 
     from dataloaders.realesrgan_gpu import RealESRGAN_degradation
