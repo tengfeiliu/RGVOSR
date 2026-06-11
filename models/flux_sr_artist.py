@@ -1,3 +1,4 @@
+import contextlib
 import importlib
 import json
 import os
@@ -97,6 +98,62 @@ def _clip_position_embedding_length(text_pipeline):
     if weight is None:
         return None
     return int(weight.shape[0])
+
+
+def _lora_parameter_name(name):
+    return "lora" in str(name).lower()
+
+
+def _adapter_parameter_name(name):
+    return any(key in name for key in ("degradation_encoder", "lr_condition_encoder", "visual_condition_adapter"))
+
+
+def _maybe_gathered_parameters(parameters):
+    parameters = list(parameters)
+    if not parameters:
+        return contextlib.nullcontext()
+    try:
+        from deepspeed import zero
+    except Exception:
+        return contextlib.nullcontext()
+    gathered_parameters = getattr(zero, "GatheredParameters", None)
+    if gathered_parameters is None:
+        return contextlib.nullcontext()
+    return gathered_parameters(parameters, modifier_rank=0)
+
+
+def _gathered_named_parameter_state(module, name_predicate):
+    named_parameters = [(name, param) for name, param in module.named_parameters() if name_predicate(name)]
+    with _maybe_gathered_parameters(param for _, param in named_parameters):
+        return {name: param.detach().cpu().clone() for name, param in named_parameters}
+
+
+def _load_state_dict_with_shape_check(module, state, checkpoint_path, state_label):
+    module_state = module.state_dict()
+    mismatches = []
+    zero3_partition_names = []
+    for name, tensor in state.items():
+        expected = module_state.get(name)
+        if expected is None or not hasattr(tensor, "shape"):
+            continue
+        if tuple(tensor.shape) != tuple(expected.shape):
+            mismatches.append((name, tuple(tensor.shape), tuple(expected.shape)))
+            if tensor.numel() == 0:
+                zero3_partition_names.append(name)
+
+    if mismatches:
+        preview = "; ".join(f"{name}: checkpoint {got} != model {expected}" for name, got, expected in mismatches[:8])
+        if zero3_partition_names:
+            raise RuntimeError(
+                f"{state_label} checkpoint at {checkpoint_path} contains a ZeRO-3 partitioned tensor "
+                f"instead of a gathered full tensor ({zero3_partition_names[0]}). "
+                "This checkpoint was likely saved before ZeRO-3 gather-safe adapter saving was enabled. "
+                "Please re-save or resume training with the updated code and use a newly saved checkpoint. "
+                f"Shape mismatches: {preview}"
+            )
+        raise RuntimeError(f"{state_label} checkpoint at {checkpoint_path} has incompatible tensor shapes: {preview}")
+
+    return module.load_state_dict(state, strict=False)
 
 
 class FluxSRArtist(nn.Module):
@@ -474,17 +531,9 @@ class FluxSRArtist(nn.Module):
             json.dump({"flux_backend": "flux1"}, handle, indent=2)
         if self.use_lora and hasattr(self.transformer, "save_pretrained"):
             self.transformer.save_pretrained(output_dir / "flux_adapter")
-            lora_state = {
-                name: param.detach().cpu()
-                for name, param in self.transformer.state_dict().items()
-                if "lora" in name.lower()
-            }
+            lora_state = _gathered_named_parameter_state(self.transformer, _lora_parameter_name)
             torch.save(lora_state, output_dir / "flux_lora_state.pt")
-        trainable_state = {
-            name: param.detach().cpu()
-            for name, param in self.state_dict().items()
-            if any(key in name for key in ("degradation_encoder", "lr_condition_encoder", "visual_condition_adapter"))
-        }
+        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name)
         torch.save(trainable_state, output_dir / "condition_adapters.pt")
 
     def load_trainable(self, checkpoint_dir, is_trainable=True):
@@ -503,7 +552,7 @@ class FluxSRArtist(nn.Module):
         lora_state_path = checkpoint_dir / "flux_lora_state.pt"
         if lora_state_path.exists() and self.use_lora:
             state = torch.load(lora_state_path, map_location="cpu")
-            self.transformer.load_state_dict(state, strict=False)
+            _load_state_dict_with_shape_check(self.transformer, state, lora_state_path, "FLUX.1 LoRA")
         elif adapter_dir.exists() and self.use_lora and not hasattr(self.transformer, "peft_config"):
             from peft import PeftModel
 
@@ -512,4 +561,4 @@ class FluxSRArtist(nn.Module):
         adapter_state = checkpoint_dir / "condition_adapters.pt"
         if adapter_state.exists():
             state = torch.load(adapter_state, map_location="cpu")
-            self.load_state_dict(state, strict=False)
+            _load_state_dict_with_shape_check(self, state, adapter_state, "condition adapter")

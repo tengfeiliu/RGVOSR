@@ -574,6 +574,29 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("flux2_klein_lora_state.pt", source)
         self.assertIn("rg_flux_checkpoint_meta.json", source)
         self.assertNotIn("pooled_projections", source)
+        self.assertIn("_gathered_named_parameter_state", source)
+        self.assertIn("_load_state_dict_with_shape_check", source)
+
+    def test_adapter_checkpoint_loader_reports_zero3_partitioned_tensors(self):
+        source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _load_state_dict_with_shape_check", source)
+        self.assertIn("ZeRO-3 partitioned tensor", source)
+        self.assertIn("tensor.numel() == 0", source)
+        self.assertIn("module.load_state_dict(state, strict=False)", source)
+
+    def test_flux1_and_flux2_checkpoint_saves_gather_zero3_trainable_parameters(self):
+        flux1_source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
+        flux2_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+
+        self.assertIn("GatheredParameters", flux1_source)
+        self.assertIn("_gathered_named_parameter_state", flux1_source)
+        self.assertIn("_adapter_parameter_name", flux1_source)
+        self.assertIn("_lora_parameter_name", flux1_source)
+        self.assertIn("_gathered_named_parameter_state(self.transformer", flux1_source)
+        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name)", flux1_source)
+        self.assertIn("_gathered_named_parameter_state(self.transformer", flux2_source)
+        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name)", flux2_source)
 
     def test_flux2_encode_prompt_filters_kwargs_by_pipeline_signature(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")

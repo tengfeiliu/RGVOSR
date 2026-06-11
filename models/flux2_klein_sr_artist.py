@@ -10,7 +10,11 @@ from models.flux_sr_artist import (
     _cfg,
     _clear_hf_deepspeed_config,
     _dtype_from_config,
+    _adapter_parameter_name,
+    _gathered_named_parameter_state,
     _import_hf_deepspeed_config,
+    _load_state_dict_with_shape_check,
+    _lora_parameter_name,
     _module_device,
 )
 from models.lr_condition_encoder import LRConditionEncoder
@@ -529,17 +533,9 @@ class Flux2KleinSRArtist(nn.Module):
             json.dump(metadata, handle, indent=2)
         if self.use_lora and hasattr(self.transformer, "save_pretrained"):
             self.transformer.save_pretrained(output_dir / "flux2_klein_adapter")
-            lora_state = {
-                name: param.detach().cpu()
-                for name, param in self.transformer.state_dict().items()
-                if "lora" in name.lower()
-            }
+            lora_state = _gathered_named_parameter_state(self.transformer, _lora_parameter_name)
             torch.save(lora_state, output_dir / "flux2_klein_lora_state.pt")
-        trainable_state = {
-            name: param.detach().cpu()
-            for name, param in self.state_dict().items()
-            if any(key in name for key in ("degradation_encoder", "lr_condition_encoder", "visual_condition_adapter"))
-        }
+        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name)
         torch.save(trainable_state, output_dir / "condition_adapters.pt")
 
     def load_trainable(self, checkpoint_dir, is_trainable=True):
@@ -559,7 +555,7 @@ class Flux2KleinSRArtist(nn.Module):
         lora_state_path = checkpoint_dir / "flux2_klein_lora_state.pt"
         if lora_state_path.exists() and self.use_lora:
             state = torch.load(lora_state_path, map_location="cpu")
-            self.transformer.load_state_dict(state, strict=False)
+            _load_state_dict_with_shape_check(self.transformer, state, lora_state_path, "FLUX.2-klein LoRA")
         elif adapter_dir.exists() and self.use_lora and not hasattr(self.transformer, "peft_config"):
             from peft import PeftModel
 
@@ -569,4 +565,4 @@ class Flux2KleinSRArtist(nn.Module):
         adapter_state = checkpoint_dir / "condition_adapters.pt"
         if adapter_state.exists():
             state = torch.load(adapter_state, map_location="cpu")
-            self.load_state_dict(state, strict=False)
+            _load_state_dict_with_shape_check(self, state, adapter_state, "condition adapter")
