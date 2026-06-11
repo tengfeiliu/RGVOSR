@@ -16,8 +16,8 @@ model:
   context_dim: 15360
 
 data:
-  jsonl_path: datasets/LSDIR_cache/valid.jsonl
-  crop_size: 256
+  jsonl_path: datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl
+  crop_size: 512
   scale: 4
   batch_size: 1
   num_workers: 4
