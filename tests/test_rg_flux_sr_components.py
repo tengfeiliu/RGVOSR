@@ -588,15 +588,20 @@ class RGFluxSRComponentTests(unittest.TestCase):
     def test_flux1_and_flux2_checkpoint_saves_gather_zero3_trainable_parameters(self):
         flux1_source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
         flux2_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
 
         self.assertIn("GatheredParameters", flux1_source)
         self.assertIn("_gathered_named_parameter_state", flux1_source)
         self.assertIn("_adapter_parameter_name", flux1_source)
         self.assertIn("_lora_parameter_name", flux1_source)
-        self.assertIn("_gathered_named_parameter_state(self.transformer", flux1_source)
-        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name)", flux1_source)
-        self.assertIn("_gathered_named_parameter_state(self.transformer", flux2_source)
-        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name)", flux2_source)
+        self.assertIn("self.transformer,", flux1_source)
+        self.assertIn("self.transformer,", flux2_source)
+        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name, collect_state=save_files)", flux1_source)
+        self.assertIn("_gathered_named_parameter_state(self, _adapter_parameter_name, collect_state=save_files)", flux2_source)
+        self.assertIn("collect_state=save_files", flux1_source)
+        self.assertIn("collect_state=save_files", flux2_source)
+        self.assertIn("save_trainable(checkpoint_dir / \"rg_flux_adapters\", save_files=accelerator.is_main_process)", train_source)
+        self.assertNotIn("if not accelerator.is_main_process:\n        return\n    checkpoint_dir = Path(checkpoint_dir)", train_source)
 
     def test_flux2_encode_prompt_filters_kwargs_by_pipeline_signature(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")

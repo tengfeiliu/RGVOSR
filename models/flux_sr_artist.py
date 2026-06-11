@@ -122,9 +122,15 @@ def _maybe_gathered_parameters(parameters):
     return gathered_parameters(parameters, modifier_rank=0)
 
 
-def _gathered_named_parameter_state(module, name_predicate):
+def _has_deepspeed_partitioned_parameters(module):
+    return any(hasattr(param, "ds_id") for param in module.parameters())
+
+
+def _gathered_named_parameter_state(module, name_predicate, collect_state=True):
     named_parameters = [(name, param) for name, param in module.named_parameters() if name_predicate(name)]
     with _maybe_gathered_parameters(param for _, param in named_parameters):
+        if not collect_state:
+            return {}
         return {name: param.detach().cpu().clone() for name, param in named_parameters}
 
 
@@ -524,17 +530,25 @@ class FluxSRArtist(nn.Module):
             packed_pred = packed_pred[:, lr_token_count:]
         return _unpack_latents(packed_pred, height, width, channels).to(dtype=z_t.dtype)
 
-    def save_trainable(self, output_dir):
+    def save_trainable(self, output_dir, save_files=True):
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
-            json.dump({"flux_backend": "flux1"}, handle, indent=2)
+        if save_files:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
+                json.dump({"flux_backend": "flux1"}, handle, indent=2)
         if self.use_lora and hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(output_dir / "flux_adapter")
-            lora_state = _gathered_named_parameter_state(self.transformer, _lora_parameter_name)
-            torch.save(lora_state, output_dir / "flux_lora_state.pt")
-        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name)
-        torch.save(trainable_state, output_dir / "condition_adapters.pt")
+            if save_files and not _has_deepspeed_partitioned_parameters(self.transformer):
+                self.transformer.save_pretrained(output_dir / "flux_adapter")
+            lora_state = _gathered_named_parameter_state(
+                self.transformer,
+                _lora_parameter_name,
+                collect_state=save_files,
+            )
+            if save_files:
+                torch.save(lora_state, output_dir / "flux_lora_state.pt")
+        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name, collect_state=save_files)
+        if save_files:
+            torch.save(trainable_state, output_dir / "condition_adapters.pt")
 
     def load_trainable(self, checkpoint_dir, is_trainable=True):
         checkpoint_dir = Path(checkpoint_dir)

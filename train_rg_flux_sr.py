@@ -268,12 +268,14 @@ def resolve_resume_checkpoint(output_dir, resume_ckpt=None, auto_resume=True):
 
 def save_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir, global_step):
     accelerator.wait_for_everyone()
+    checkpoint_dir = Path(checkpoint_dir)
+    if accelerator.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    unwrapped = accelerator.unwrap_model(artist)
+    unwrapped.save_trainable(checkpoint_dir / "rg_flux_adapters", save_files=accelerator.is_main_process)
+    accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    unwrapped = accelerator.unwrap_model(artist)
-    unwrapped.save_trainable(checkpoint_dir / "rg_flux_adapters")
     torch.save(
         {
             "global_step": global_step,

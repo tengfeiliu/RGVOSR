@@ -12,6 +12,7 @@ from models.flux_sr_artist import (
     _dtype_from_config,
     _adapter_parameter_name,
     _gathered_named_parameter_state,
+    _has_deepspeed_partitioned_parameters,
     _import_hf_deepspeed_config,
     _load_state_dict_with_shape_check,
     _lora_parameter_name,
@@ -525,18 +526,26 @@ class Flux2KleinSRArtist(nn.Module):
             packed_pred = packed_pred[:, lr_token_count:]
         return _unflatten_image_tokens(packed_pred, height, width).to(dtype=z_t.dtype)
 
-    def save_trainable(self, output_dir):
+    def save_trainable(self, output_dir, save_files=True):
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         metadata = {"flux_backend": self.backend_name}
-        with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2)
+        if save_files:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
         if self.use_lora and hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(output_dir / "flux2_klein_adapter")
-            lora_state = _gathered_named_parameter_state(self.transformer, _lora_parameter_name)
-            torch.save(lora_state, output_dir / "flux2_klein_lora_state.pt")
-        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name)
-        torch.save(trainable_state, output_dir / "condition_adapters.pt")
+            if save_files and not _has_deepspeed_partitioned_parameters(self.transformer):
+                self.transformer.save_pretrained(output_dir / "flux2_klein_adapter")
+            lora_state = _gathered_named_parameter_state(
+                self.transformer,
+                _lora_parameter_name,
+                collect_state=save_files,
+            )
+            if save_files:
+                torch.save(lora_state, output_dir / "flux2_klein_lora_state.pt")
+        trainable_state = _gathered_named_parameter_state(self, _adapter_parameter_name, collect_state=save_files)
+        if save_files:
+            torch.save(trainable_state, output_dir / "condition_adapters.pt")
 
     def load_trainable(self, checkpoint_dir, is_trainable=True):
         checkpoint_dir = Path(checkpoint_dir)
