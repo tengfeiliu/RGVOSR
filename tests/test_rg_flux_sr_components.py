@@ -640,6 +640,13 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("save_trainable(checkpoint_dir / \"rg_flux_adapters\", save_files=accelerator.is_main_process)", train_source)
         self.assertNotIn("if not accelerator.is_main_process:\n        return\n    checkpoint_dir = Path(checkpoint_dir)", train_source)
 
+    def test_training_state_resume_uses_non_weights_only_load(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("def load_training_state", train_source)
+        self.assertIn('torch.load(state_path, map_location="cpu", weights_only=False)', train_source)
+        self.assertIn("state = load_training_state(state_path)", train_source)
+
     def test_flux2_encode_prompt_filters_kwargs_by_pipeline_signature(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
         tree = ast.parse(source)

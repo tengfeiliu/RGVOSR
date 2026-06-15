@@ -286,6 +286,13 @@ def save_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_
     )
 
 
+def load_training_state(state_path):
+    try:
+        return torch.load(state_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(state_path, map_location="cpu")
+
+
 def load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir):
     checkpoint_dir = Path(checkpoint_dir)
     adapter_dir = checkpoint_dir / "rg_flux_adapters"
@@ -295,7 +302,7 @@ def load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_
     state_path = checkpoint_dir / "training_state.pt"
     global_step = 0
     if state_path.exists():
-        state = torch.load(state_path, map_location="cpu")
+        state = load_training_state(state_path)
         optimizer.load_state_dict(state.get("optimizer", {}))
         lr_scheduler.load_state_dict(state.get("lr_scheduler", {}))
         global_step = int(state.get("global_step", 0))
