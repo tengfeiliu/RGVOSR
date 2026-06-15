@@ -136,30 +136,40 @@ def _gathered_named_parameter_state(module, name_predicate, collect_state=True):
 
 def _load_state_dict_with_shape_check(module, state, checkpoint_path, state_label):
     module_state = module.state_dict()
+    module_parameters = dict(module.named_parameters())
     mismatches = []
-    zero3_partition_names = []
+    checkpoint_zero3_partition_names = []
+    load_parameters = []
     for name, tensor in state.items():
         expected = module_state.get(name)
         if expected is None or not hasattr(tensor, "shape"):
             continue
+        expected_param = module_parameters.get(name)
+        if expected_param is not None and hasattr(expected_param, "ds_id"):
+            load_parameters.append(expected_param)
         if tuple(tensor.shape) != tuple(expected.shape):
-            mismatches.append((name, tuple(tensor.shape), tuple(expected.shape)))
             if tensor.numel() == 0:
-                zero3_partition_names.append(name)
+                mismatches.append((name, tuple(tensor.shape), tuple(expected.shape)))
+                checkpoint_zero3_partition_names.append(name)
+                continue
+            if expected_param is not None and hasattr(expected_param, "ds_id"):
+                continue
+            mismatches.append((name, tuple(tensor.shape), tuple(expected.shape)))
 
     if mismatches:
         preview = "; ".join(f"{name}: checkpoint {got} != model {expected}" for name, got, expected in mismatches[:8])
-        if zero3_partition_names:
+        if checkpoint_zero3_partition_names:
             raise RuntimeError(
                 f"{state_label} checkpoint at {checkpoint_path} contains a ZeRO-3 partitioned tensor "
-                f"instead of a gathered full tensor ({zero3_partition_names[0]}). "
+                f"instead of a gathered full tensor ({checkpoint_zero3_partition_names[0]}). "
                 "This checkpoint was likely saved before ZeRO-3 gather-safe adapter saving was enabled. "
                 "Please re-save or resume training with the updated code and use a newly saved checkpoint. "
                 f"Shape mismatches: {preview}"
             )
         raise RuntimeError(f"{state_label} checkpoint at {checkpoint_path} has incompatible tensor shapes: {preview}")
 
-    return module.load_state_dict(state, strict=False)
+    with _maybe_gathered_parameters(load_parameters):
+        return module.load_state_dict(state, strict=False)
 
 
 class FluxSRArtist(nn.Module):

@@ -617,6 +617,9 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("def _load_state_dict_with_shape_check", source)
         self.assertIn("ZeRO-3 partitioned tensor", source)
         self.assertIn("tensor.numel() == 0", source)
+        self.assertIn("module_parameters = dict(module.named_parameters())", source)
+        self.assertIn('hasattr(expected_param, "ds_id")', source)
+        self.assertIn("with _maybe_gathered_parameters(load_parameters):", source)
         self.assertIn("module.load_state_dict(state, strict=False)", source)
 
     def test_flux1_and_flux2_checkpoint_saves_gather_zero3_trainable_parameters(self):
