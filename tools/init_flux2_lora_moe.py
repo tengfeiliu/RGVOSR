@@ -1,12 +1,17 @@
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 import yaml
 
-from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
-from models.flux_sr_artist import _load_state_dict_with_shape_check
-from models.rg_flux_artist_factory import build_rg_flux_artist
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn  # noqa: E402
+from models.flux_sr_artist import _load_state_dict_with_shape_check  # noqa: E402
+from models.rg_flux_artist_factory import build_rg_flux_artist  # noqa: E402
 
 
 def load_yaml(path):
