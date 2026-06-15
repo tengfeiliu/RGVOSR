@@ -1,16 +1,8 @@
 import contextlib
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-@dataclass
-class RouterOutput:
-    logits: torch.Tensor
-    alpha: torch.Tensor
-    features: torch.Tensor
 
 
 def route_logits(logits, mode="soft", top_k=2, temperature=1.0):
@@ -197,7 +189,7 @@ class ProfileLatentRouter(nn.Module):
         ).to(dtype=head_logits.dtype)
         logits = head_logits + self.prototype_scale * proto_logits
         alpha = route_logits(logits, mode=routing_mode, top_k=top_k, temperature=temperature)
-        return RouterOutput(logits=logits, alpha=alpha, features=features)
+        return logits, alpha, features
 
 
 def iter_moe_lora_layers(module):
@@ -223,18 +215,43 @@ def set_shared_lora_trainable(module, trainable):
         layer.set_shared_trainable(trainable)
 
 
+def _maybe_gathered_parameters(parameters):
+    parameters = list(parameters)
+    if not parameters:
+        return contextlib.nullcontext()
+    try:
+        from deepspeed import zero
+    except Exception:
+        return contextlib.nullcontext()
+    gathered_parameters = getattr(zero, "GatheredParameters", None)
+    if gathered_parameters is None:
+        return contextlib.nullcontext()
+    return gathered_parameters(parameters, modifier_rank=0)
+
+
 def moe_diversity_loss(layers):
-    losses = []
-    for layer in layers:
-        a = F.normalize(layer.routed_lora_A.flatten(1).float(), dim=-1)
-        b = F.normalize(layer.routed_lora_B.flatten(1).float(), dim=-1)
-        sim_a = a @ a.t()
-        sim_b = b @ b.t()
-        mask = torch.triu(torch.ones_like(sim_a, dtype=torch.bool), diagonal=1)
-        if mask.any():
-            losses.append(sim_a[mask].pow(2).mean() + sim_b[mask].pow(2).mean())
-    if not losses:
+    layers = list(layers)
+    if not layers:
         return torch.tensor(0.0)
+    parameters = []
+    for layer in layers:
+        parameters.extend([layer.routed_lora_A, layer.routed_lora_B])
+    losses = []
+    with _maybe_gathered_parameters(parameters):
+        for layer in layers:
+            if layer.routed_lora_A.ndim < 2 or layer.routed_lora_B.ndim < 2:
+                continue
+            if layer.routed_lora_A.numel() == 0 or layer.routed_lora_B.numel() == 0:
+                continue
+            a = F.normalize(layer.routed_lora_A.flatten(1).float(), dim=-1)
+            b = F.normalize(layer.routed_lora_B.flatten(1).float(), dim=-1)
+            sim_a = a @ a.t()
+            sim_b = b @ b.t()
+            mask = torch.triu(torch.ones_like(sim_a, dtype=torch.bool), diagonal=1)
+            if mask.any():
+                losses.append(sim_a[mask].pow(2).mean() + sim_b[mask].pow(2).mean())
+    if not losses:
+        return parameters[0].new_zeros(())
     return torch.stack(losses).mean()
 
 

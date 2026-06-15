@@ -58,11 +58,11 @@ class LoRAMoETests(unittest.TestCase):
                 hidden_dim=32,
                 latent_branch=mode,
             )
-            output = router(prompt_embeds, z_lr, routing_mode="soft", top_k=2, temperature=1.5)
-            self.assertEqual(output.logits.shape, (3, 4))
-            self.assertEqual(output.alpha.shape, (3, 4))
-            self.assertEqual(output.features.shape, (3, 32))
-            self.assertTrue(torch.allclose(output.alpha.sum(dim=-1), torch.ones(3), atol=1e-6))
+            logits, alpha, features = router(prompt_embeds, z_lr, routing_mode="soft", top_k=2, temperature=1.5)
+            self.assertEqual(logits.shape, (3, 4))
+            self.assertEqual(alpha.shape, (3, 4))
+            self.assertEqual(features.shape, (3, 32))
+            self.assertTrue(torch.allclose(alpha.sum(dim=-1), torch.ones(3), atol=1e-6))
 
     def test_moe_auxiliary_losses_are_differentiable(self):
         from models.lora_moe import (

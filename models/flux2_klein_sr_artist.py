@@ -413,7 +413,7 @@ class Flux2KleinSRArtist(nn.Module):
     def moe_auxiliary_losses(self):
         if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
             return {}
-        alpha = self._last_moe_router_output.alpha
+        alpha = self._last_moe_router_output["alpha"]
         layers = list(iter_moe_lora_layers(self.transformer))
         encourage_high = self._last_moe_stage == "warmup"
         return {
@@ -427,7 +427,7 @@ class Flux2KleinSRArtist(nn.Module):
     def moe_log_stats(self):
         if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
             return {}
-        alpha = self._last_moe_router_output.alpha.detach().float()
+        alpha = self._last_moe_router_output["alpha"].detach().float()
         top1 = alpha.argmax(dim=-1)
         logs = {
             "router/temperature": float(self.moe_temperature),
@@ -716,15 +716,19 @@ class Flux2KleinSRArtist(nn.Module):
         if self.is_lora_moe_enabled():
             if z_lr is None:
                 raise ValueError("z_lr is required when model.lora_backend='moe'")
-            router_output = self.moe_router(
+            router_logits, router_alpha, router_features = self.moe_router(
                 prompt_embeds=prompt_embeds,
                 z_lr=z_lr.to(prompt_embeds.device),
                 routing_mode=self.moe_routing_mode,
                 top_k=self.moe_top_k,
                 temperature=self.moe_temperature,
             )
-            self._last_moe_router_output = router_output
-            routing_context = moe_routing(self.transformer, router_output.alpha)
+            self._last_moe_router_output = {
+                "logits": router_logits,
+                "alpha": router_alpha,
+                "features": router_features,
+            }
+            routing_context = moe_routing(self.transformer, router_alpha)
         with routing_context:
             model_out = self.transformer(
                 hidden_states=hidden_states,
