@@ -577,6 +577,35 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("_gathered_named_parameter_state", source)
         self.assertIn("_load_state_dict_with_shape_check", source)
 
+    def test_flux2_lora_moe_backend_is_optional_and_checkpoint_is_separate(self):
+        source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        config = yaml.safe_load(Path("configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml").read_text(encoding="utf-8"))
+
+        self.assertIn('self.lora_backend = str(_cfg(config, "model.lora_backend", "peft")).lower()', source)
+        self.assertIn('if self.lora_backend == "moe":', source)
+        self.assertIn('if self.lora_backend != "moe" and not bool(_cfg(self.config, "training.freeze_flux_transformer", True)):', source)
+        self.assertIn("SharedRoutedMoELoRALinear", source)
+        self.assertIn("ProfileLatentRouter", source)
+        self.assertIn("flux2_klein_lora_moe_state.pt", source)
+        self.assertIn("set_moe_training_schedule", train_source)
+        self.assertIn("moe_auxiliary_losses", train_source)
+        self.assertIn("model.lora_moe.init_from_single_lora", train_source)
+        self.assertIn("initialize_moe_from_single_lora(init_single_lora)", train_source)
+        self.assertEqual(config["model"]["lora_backend"], "moe")
+        self.assertEqual(config["model"]["lora_moe"]["top_k"], 2)
+        self.assertTrue(config["training"]["freeze_flux_transformer"])
+        self.assertGreater(config["loss"]["router_div_weight"], 0)
+
+    def test_flux2_lora_moe_init_tool_loads_single_lora_and_initializes_prototypes(self):
+        source = Path("tools/init_flux2_lora_moe.py").read_text(encoding="utf-8")
+
+        self.assertIn("initialize_moe_from_single_lora", source)
+        self.assertIn("prototype_num_samples", source)
+        self.assertIn("kmeans", source)
+        self.assertIn("compute_router_features", source)
+        self.assertIn("flux2_klein_lora_moe_state.pt", Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8"))
+
     def test_adapter_checkpoint_loader_reports_zero3_partitioned_tensors(self):
         source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
 

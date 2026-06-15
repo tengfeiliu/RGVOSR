@@ -55,6 +55,7 @@ data:
 | `configs/train_rg_flux_sr_ms_smoke_256.yaml` | 2 卡低显存 smoke 配置，`crop_size=256`，用于验证训练链路。 |
 | `configs/train_rg_flux_sr_ms.yaml` | 512 正式训练配置，推荐 8 卡或更大显存。 |
 | `configs/train_rg_flux2_klein_sr_smoke_256.yaml` | FLUX.2-klein 2 卡 256 smoke 配置，默认 `model.flux_backend=flux2_klein`。 |
+| `configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml` | FLUX.2-klein LoRA-MoE 256 smoke 配置，默认 `model.lora_backend=moe`。 |
 | `configs/accelerate/zero3_bf16_cpu_offload.yaml` | 2 卡 ZeRO-3 + CPU offload，用于 24GB 卡 smoke test。 |
 | `configs/accelerate/zero3_bf16_param_offload.yaml` | 2 卡 ZeRO-3 配置，optimizer 不 offload；可按显存情况设置 `offload_param_device` 为 `cpu` 或 `none`。 |
 | `configs/accelerate/zero3_bf16.yaml` | 8 卡 ZeRO-3，无 CPU offload，用于正式训练。 |
@@ -134,6 +135,106 @@ evaluation:
 
 如果显存不足，优先把 `vae_device` 改回 `cpu`，并把 `configs/accelerate/zero3_bf16_param_offload.yaml` 中的 `offload_param_device` 改成 `cpu`。如果想恢复自动续训，把 `training.auto_resume` 改成 `true`，但 ZeRO-3 下旧 LoRA checkpoint 可能需要单独的安全加载逻辑。
 
+### FLUX.2-klein LoRA-MoE 训练流程
+
+LoRA-MoE 是 FLUX.2-klein 的可选后端。默认 single-LoRA 路径不变，只有配置中显式设置 `model.lora_backend: moe` 时才启用。MoE 版本会保持 FLUX.2 transformer 主干冻结，只训练 shared LoRA、routed LoRA experts、router 和现有 condition adapters。
+
+#### Stage 0：训练 Single-LoRA Baseline
+
+先用当前 FLUX.2-klein single-LoRA 配置训练一个稳定 baseline。这个 checkpoint 后续用于初始化 shared LoRA 和 routed experts。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16_param_offload.yaml \
+  --num_processes 2 \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml
+```
+
+Stage 0 输出的 adapter 目录通常类似：
+
+```text
+exp_rg_flux_sr/<single_lora_exp>/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters
+```
+
+#### Stage 1：从 Single-LoRA 初始化 LoRA-MoE
+
+这个命令会把 Stage 0 的 single-LoRA 权重复制到 shared LoRA，并用 `baseline + small perturbation` 初始化 routed experts。它还会从 JSONL 中抽样，按当前 `latent_branch` 提取 router feature，并用 K-means 初始化 prototypes。
+
+```bash
+python tools/init_flux2_lora_moe.py \
+  --config configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml \
+  --single_lora_checkpoint exp_rg_flux_sr/<single_lora_exp>/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters \
+  --output exp_rg_flux_sr/init_flux2_moe/rg_flux_adapters \
+  --prototype_num_samples 128 \
+  --device cuda \
+  --dtype bf16
+```
+
+输出目录中会包含：
+
+```text
+exp_rg_flux_sr/init_flux2_moe/rg_flux_adapters/
+|-- rg_flux_checkpoint_meta.json
+|-- flux2_klein_lora_moe_state.pt
+`-- condition_adapters.pt
+```
+
+#### Stage 2/3：启动 LoRA-MoE 训练
+
+MoE 训练使用 `configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml`。训练时会自动按进度切换：
+
+- 前 `warmup_ratio` steps：full softmax routing，shared LoRA 可冻结，temperature 从 `2.0` 逐步到 `1.5`。
+- warm-up 之后：Top-2 routing，shared LoRA 解冻，temperature 逐步降到 `0.7`。
+
+如果使用 Stage 1 生成的 MoE checkpoint，可以把配置里的 `training.resume_ckpt` 改成 `exp_rg_flux_sr/init_flux2_moe`，或在命令前临时改 YAML。然后运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+TOKENIZERS_PARALLELISM=false \
+accelerate launch \
+  --config_file configs/accelerate/zero3_bf16_param_offload.yaml \
+  --num_processes 2 \
+  train_rg_flux_sr.py \
+  --config configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml
+```
+
+也可以不使用 Stage 1 工具，而是在 MoE 配置里直接设置：
+
+```yaml
+model:
+  lora_moe:
+    init_from_single_lora: exp_rg_flux_sr/<single_lora_exp>/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters
+```
+
+这种方式会在训练启动时从 single-LoRA 初始化 MoE，但不会预先 K-means 初始化 prototypes。正式实验更推荐先跑 Stage 1 工具。
+
+#### LoRA-MoE 关键配置
+
+```yaml
+model:
+  lora_backend: moe
+  lora_moe:
+    num_routed_experts: 4
+    top_k: 2
+    latent_branch: stat_conv
+    router_hidden_dim: 1024
+    warmup_ratio: 0.1
+    init_temperature: 2.0
+    final_temperature: 0.7
+    shared_always_active: true
+    freeze_shared_during_warmup: true
+
+loss:
+  router_div_weight: 1.0e-3
+  router_entropy_weight: 1.0e-4
+  router_balance_weight: 1.0e-4
+```
+
+训练日志会额外记录 `loss_div`、`loss_entropy`、`loss_balance`、`router/temperature`、`router/entropy` 和每个 expert 的 usage/top1 占比。
+
 ### 8 卡 512 Dry-Run
 
 这个命令用正式 512 配置先跑 1 个 step，适合在正式训练前检查 8 卡 ZeRO-3、模型路径、数据路径和显存是否正常。
@@ -209,6 +310,24 @@ python inference_rg_flux_sr.py \
   --num_inference_steps 25 \
   --upscale 4
 ```
+
+### FLUX.2-klein LoRA-MoE Checkpoint 推理
+
+MoE 推理仍然使用同一个 `inference_rg_flux_sr.py`。只要 `--config` 指向 MoE 配置，`--checkpoint` 指向包含 `flux2_klein_lora_moe_state.pt` 的 `rg_flux_adapters` 目录，脚本会自动启用 Top-2 routing。
+
+```bash
+python inference_rg_flux_sr.py \
+  --input path/to/lq_or_folder \
+  --output_dir outputs/rg_flux2_klein_lora_moe_sr \
+  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_latent_concat_size256_flux2_klein_lora_moe_smoke256/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters \
+  --config configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml \
+  --jsonl_path datasets/inference_cleaned.jsonl \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16
+```
+
+MoE 推理依赖 cleaned profile 构造 prompt，因此推荐使用 `datasets/inference_cleaned.jsonl` 或同结构 JSONL。若 JSONL 中找不到输入图片对应记录，推理脚本会跳过该图片并写入 `inference_failures.jsonl`。
 
 参数说明：
 

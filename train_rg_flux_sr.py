@@ -617,6 +617,15 @@ def main(config_path, dry_run=False):
     )
 
     artist = build_rg_flux_artist(config)
+    init_single_lora = cfg(config, "model.lora_moe.init_from_single_lora", None)
+    if init_single_lora and not cfg(config, "training.resume_ckpt", None) and hasattr(artist, "initialize_moe_from_single_lora"):
+        loaded_lora_tensors = artist.initialize_moe_from_single_lora(init_single_lora)
+        if accelerator.is_main_process:
+            local_logger.info(
+                "Initialized LoRA-MoE from single-LoRA checkpoint %s (%s tensors).",
+                init_single_lora,
+                loaded_lora_tensors,
+            )
     trainable_named_params = [(name, param) for name, param in artist.named_parameters() if param.requires_grad]
     trainable_params = [param for _, param in trainable_named_params]
     if not trainable_named_params:
@@ -684,6 +693,9 @@ def main(config_path, dry_run=False):
         disable=not accelerator.is_local_main_process,
     )
     fm_weight = float(cfg(config, "loss.fm_weight", 1.0))
+    router_div_weight = float(cfg(config, "loss.router_div_weight", 0.0))
+    router_entropy_weight = float(cfg(config, "loss.router_entropy_weight", 0.0))
+    router_balance_weight = float(cfg(config, "loss.router_balance_weight", 0.0))
     checkpoint_dir = output_dir / "checkpoints"
     save_every = int(cfg(config, "training.save_every", 5000))
     log_every = int(cfg(config, "training.log_every", 100))
@@ -700,6 +712,11 @@ def main(config_path, dry_run=False):
             prompts = batch["prompt"]
 
             unwrapped_artist = accelerator.unwrap_model(artist)
+            moe_schedule = (
+                unwrapped_artist.set_moe_training_schedule(global_step, max_steps)
+                if hasattr(unwrapped_artist, "set_moe_training_schedule")
+                else {"enabled": False}
+            )
             with torch.no_grad():
                 z_hr = unwrapped_artist.encode_images(hq).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
@@ -730,6 +747,20 @@ def main(config_path, dry_run=False):
                         raise RuntimeError(f"v_pred shape {tuple(v_pred.shape)} != target {tuple(v_target.shape)}")
                     loss_fm = torch.nn.functional.mse_loss(v_pred.float(), v_target.float())
                     loss = fm_weight * loss_fm
+                    moe_aux = (
+                        unwrapped_artist.moe_auxiliary_losses()
+                        if hasattr(unwrapped_artist, "moe_auxiliary_losses")
+                        else {}
+                    )
+                    loss_div = moe_aux.get("div")
+                    loss_entropy = moe_aux.get("entropy")
+                    loss_balance = moe_aux.get("balance")
+                    if loss_div is not None and router_div_weight:
+                        loss = loss + router_div_weight * loss_div
+                    if loss_entropy is not None and router_entropy_weight:
+                        loss = loss + router_entropy_weight * loss_entropy
+                    if loss_balance is not None and router_balance_weight:
+                        loss = loss + router_balance_weight * loss_balance
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and float(cfg(config, "training.max_grad_norm", 1.0)) > 0:
@@ -747,6 +778,20 @@ def main(config_path, dry_run=False):
                         "loss_fm": loss_fm.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                     }
+                    if loss_div is not None:
+                        logs["loss_div"] = loss_div.detach().item()
+                    if loss_entropy is not None:
+                        logs["loss_entropy"] = loss_entropy.detach().item()
+                    if loss_balance is not None:
+                        logs["loss_balance"] = loss_balance.detach().item()
+                    if moe_schedule.get("enabled"):
+                        logs["router/temperature"] = moe_schedule.get("temperature", 0.0)
+                        moe_logs = (
+                            unwrapped_artist.moe_log_stats()
+                            if hasattr(unwrapped_artist, "moe_log_stats")
+                            else {}
+                        )
+                        logs.update(moe_logs)
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
                 if save_every > 0 and global_step % save_every == 0:

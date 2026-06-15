@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 import json
 from pathlib import Path
@@ -19,6 +20,17 @@ from models.flux_sr_artist import (
     _module_device,
 )
 from models.lr_condition_encoder import LRConditionEncoder
+from models.lora_moe import (
+    ProfileLatentRouter,
+    SharedRoutedMoELoRALinear,
+    iter_moe_lora_layers,
+    moe_diversity_loss,
+    moe_routing,
+    routing_balance_loss,
+    routing_entropy,
+    routing_entropy_loss,
+    set_shared_lora_trainable,
+)
 from models.visual_condition_adapter import VisualConditionAdapter
 from rg_flux_fm import convert_sigma_to_flux_timestep
 
@@ -28,6 +40,15 @@ def _module_dtype(module, default=torch.float32):
         return next(module.parameters()).dtype
     except StopIteration:
         return default
+
+
+def _moe_parameter_name(name):
+    return (
+        name.startswith("moe_router.")
+        or "shared_lora_" in name
+        or "routed_lora_" in name
+        or ".prototypes" in name
+    )
 
 
 def _patchify_latents(latents):
@@ -107,6 +128,9 @@ class Flux2KleinSRArtist(nn.Module):
         self.use_degradation_vector = bool(_cfg(config, "condition.use_degradation_vector", True))
         self.use_visual_semantic_tokens = bool(_cfg(config, "condition.use_visual_semantic_tokens", False))
         self.use_lora = bool(_cfg(config, "model.use_lora", True))
+        self.lora_backend = str(_cfg(config, "model.lora_backend", "peft")).lower()
+        if self.lora_backend not in {"peft", "moe"}:
+            raise ValueError(f"Unsupported model.lora_backend: {self.lora_backend}")
         self.text_encoder_device = str(_cfg(config, "model.text_encoder_device", "cpu"))
         self.text_encoder_dtype = _dtype_from_config(_cfg(config, "model.text_encoder_dtype", "fp32"))
         self.vae_device = str(_cfg(config, "model.vae_device", "cpu"))
@@ -124,6 +148,12 @@ class Flux2KleinSRArtist(nn.Module):
         self.image_token_dim = int(_cfg(config, "model.image_token_dim", self.latent_channels))
         self.latent_mean = None
         self.latent_std = None
+        self.moe_router = None
+        self.moe_routing_mode = "soft"
+        self.moe_temperature = float(_cfg(config, "model.lora_moe.init_temperature", 2.0))
+        self.moe_top_k = int(_cfg(config, "model.lora_moe.top_k", 2))
+        self._last_moe_router_output = None
+        self._last_moe_stage = "peft"
 
         self._load_flux2_modules()
         self._infer_dimensions()
@@ -282,6 +312,9 @@ class Flux2KleinSRArtist(nn.Module):
     def _apply_lora(self):
         if not self.use_lora:
             return
+        if self.lora_backend == "moe":
+            self._apply_lora_moe()
+            return
         try:
             from peft import LoraConfig, PeftModel
         except ModuleNotFoundError as exc:
@@ -297,15 +330,181 @@ class Flux2KleinSRArtist(nn.Module):
         )
         self.transformer = PeftModel(self.transformer, lora_config, adapter_name="flux2_klein_adapter")
 
+    def _replace_linear_module(self, module_name, new_module):
+        parent_name, _, child_name = module_name.rpartition(".")
+        parent = self.transformer.get_submodule(parent_name) if parent_name else self.transformer
+        if child_name.isdigit() and isinstance(parent, (nn.Sequential, nn.ModuleList)):
+            parent[int(child_name)] = new_module
+        else:
+            setattr(parent, child_name, new_module)
+
+    def _build_moe_router(self):
+        moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+        self.moe_top_k = int(moe_cfg.get("top_k", 2))
+        self.moe_temperature = float(moe_cfg.get("init_temperature", 2.0))
+        self.moe_router = ProfileLatentRouter(
+            prompt_dim=self.context_dim,
+            latent_channels=self.latent_channels,
+            num_experts=int(moe_cfg.get("num_routed_experts", 4)),
+            hidden_dim=int(moe_cfg.get("router_hidden_dim", 1024)),
+            latent_branch=str(moe_cfg.get("latent_branch", "stat_conv")),
+        )
+
+    def _apply_lora_moe(self):
+        moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+        rank = int(_cfg(self.config, "model.lora_rank", 8))
+        alpha = int(_cfg(self.config, "model.lora_alpha", rank))
+        num_experts = int(moe_cfg.get("num_routed_experts", 4))
+        dropout = float(moe_cfg.get("dropout", 0.0))
+        targets = set(self._resolve_lora_targets())
+        replaced = 0
+        for name, module in list(self.transformer.named_modules()):
+            if name in targets and isinstance(module, nn.Linear):
+                wrapped = SharedRoutedMoELoRALinear(
+                    module,
+                    rank=rank,
+                    alpha=alpha,
+                    num_routed_experts=num_experts,
+                    dropout=dropout,
+                )
+                self._replace_linear_module(name, wrapped)
+                replaced += 1
+        if replaced == 0:
+            raise RuntimeError("LoRA-MoE requested but no target nn.Linear modules were replaced.")
+        self._build_moe_router()
+
+    def is_lora_moe_enabled(self):
+        return self.use_lora and self.lora_backend == "moe" and self.moe_router is not None
+
+    def set_moe_training_schedule(self, global_step=0, max_steps=1):
+        if not self.is_lora_moe_enabled():
+            return {"enabled": False}
+        moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+        warmup_ratio = float(moe_cfg.get("warmup_ratio", 0.1))
+        init_temp = float(moe_cfg.get("init_temperature", 2.0))
+        final_temp = float(moe_cfg.get("final_temperature", 0.7))
+        max_steps = max(int(max_steps), 1)
+        progress = min(max(float(global_step) / float(max_steps), 0.0), 1.0)
+        in_warmup = progress < warmup_ratio
+        if in_warmup:
+            local_progress = progress / max(warmup_ratio, 1e-8)
+            self.moe_routing_mode = "soft"
+            self.moe_temperature = init_temp + (1.5 - init_temp) * local_progress
+            if bool(moe_cfg.get("freeze_shared_during_warmup", True)):
+                set_shared_lora_trainable(self.transformer, False)
+        else:
+            local_progress = (progress - warmup_ratio) / max(1.0 - warmup_ratio, 1e-8)
+            self.moe_routing_mode = "topk"
+            self.moe_temperature = 1.5 + (final_temp - 1.5) * local_progress
+            set_shared_lora_trainable(self.transformer, True)
+        self._last_moe_stage = "warmup" if in_warmup else "topk"
+        return {
+            "enabled": True,
+            "stage": self._last_moe_stage,
+            "routing_mode": self.moe_routing_mode,
+            "temperature": self.moe_temperature,
+        }
+
+    def compute_router_features(self, prompt_embeds, z_lr):
+        if not self.is_lora_moe_enabled():
+            raise RuntimeError("compute_router_features requires model.lora_backend: moe")
+        return self.moe_router.router_features(prompt_embeds, z_lr)
+
+    def moe_auxiliary_losses(self):
+        if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
+            return {}
+        alpha = self._last_moe_router_output.alpha
+        layers = list(iter_moe_lora_layers(self.transformer))
+        encourage_high = self._last_moe_stage == "warmup"
+        return {
+            "div": moe_diversity_loss(layers).to(device=alpha.device),
+            "entropy": routing_entropy_loss(alpha, encourage_high_entropy=encourage_high),
+            "balance": routing_balance_loss(alpha),
+            "entropy_value": routing_entropy(alpha).detach(),
+            "alpha": alpha.detach(),
+        }
+
+    def moe_log_stats(self):
+        if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
+            return {}
+        alpha = self._last_moe_router_output.alpha.detach().float()
+        top1 = alpha.argmax(dim=-1)
+        logs = {
+            "router/temperature": float(self.moe_temperature),
+            "router/entropy": float(routing_entropy(alpha).item()),
+        }
+        for idx in range(alpha.shape[-1]):
+            logs[f"router/expert_{idx}_usage"] = float(alpha[:, idx].mean().item())
+            logs[f"router/top1_expert_{idx}"] = float((top1 == idx).float().mean().item())
+        return logs
+
+    def initialize_moe_from_single_lora(self, checkpoint_dir, perturb_scale=0.01):
+        if not self.is_lora_moe_enabled():
+            raise RuntimeError("initialize_moe_from_single_lora requires model.lora_backend: moe")
+        checkpoint_dir = Path(checkpoint_dir)
+        if (checkpoint_dir / "rg_flux_adapters").exists():
+            checkpoint_dir = checkpoint_dir / "rg_flux_adapters"
+        lora_state_path = checkpoint_dir / "flux2_klein_lora_state.pt"
+        if not lora_state_path.exists():
+            raise FileNotFoundError(f"Single LoRA state not found: {lora_state_path}")
+        single_state = torch.load(lora_state_path, map_location="cpu")
+
+        loaded = 0
+        with torch.no_grad():
+            for state_name, tensor in single_state.items():
+                if ".lora_A." in state_name:
+                    module_name = state_name.split(".lora_A.", 1)[0].removeprefix("base_model.model.")
+                    attr = "A"
+                elif ".lora_B." in state_name:
+                    module_name = state_name.split(".lora_B.", 1)[0].removeprefix("base_model.model.")
+                    attr = "B"
+                else:
+                    continue
+                try:
+                    module = self.transformer.get_submodule(module_name)
+                except AttributeError:
+                    continue
+                if not isinstance(module, SharedRoutedMoELoRALinear):
+                    continue
+                if attr == "A":
+                    target = tensor.to(device=module.shared_lora_A.device, dtype=module.shared_lora_A.dtype)
+                    if tuple(target.shape) != tuple(module.shared_lora_A.shape):
+                        raise RuntimeError(
+                            f"LoRA A shape mismatch for {module_name}: checkpoint {tuple(target.shape)} "
+                            f"vs MoE {tuple(module.shared_lora_A.shape)}"
+                        )
+                    module.shared_lora_A.copy_(target)
+                    for expert_idx in range(module.num_routed_experts):
+                        noise = torch.randn_like(target) * max(target.float().std().item(), 1e-6) * float(perturb_scale)
+                        module.routed_lora_A[expert_idx].copy_(target + noise)
+                else:
+                    target = tensor.to(device=module.shared_lora_B.device, dtype=module.shared_lora_B.dtype)
+                    if tuple(target.shape) != tuple(module.shared_lora_B.shape):
+                        raise RuntimeError(
+                            f"LoRA B shape mismatch for {module_name}: checkpoint {tuple(target.shape)} "
+                            f"vs MoE {tuple(module.shared_lora_B.shape)}"
+                        )
+                    module.shared_lora_B.copy_(target)
+                    for expert_idx in range(module.num_routed_experts):
+                        noise = torch.randn_like(target) * max(target.float().std().item(), 1e-6) * float(perturb_scale)
+                        module.routed_lora_B[expert_idx].copy_(target + noise)
+                loaded += 1
+        if loaded == 0:
+            raise RuntimeError(f"No matching FLUX.2 single-LoRA tensors were loaded from {lora_state_path}")
+        return loaded
+
     def _apply_train_strategy(self):
         self.transformer.requires_grad_(False)
-        if not bool(_cfg(self.config, "training.freeze_flux_transformer", True)):
+        if self.lora_backend != "moe" and not bool(_cfg(self.config, "training.freeze_flux_transformer", True)):
             self.transformer.requires_grad_(True)
         self._apply_lora()
 
         for module in (self.degradation_encoder, self.lr_condition_encoder, self.visual_condition_adapter):
             module.train()
             module.requires_grad_(True)
+        if self.moe_router is not None:
+            self.moe_router.train()
+            self.moe_router.requires_grad_(True)
 
         disable_gradient_checkpointing = bool(
             _cfg(self.config, "_runtime.disable_transformer_gradient_checkpointing", False)
@@ -512,15 +711,30 @@ class Flux2KleinSRArtist(nn.Module):
             img_ids = torch.cat([lr_img_ids, img_ids], dim=1)
 
         flux_timestep = convert_sigma_to_flux_timestep(timestep.to(z_t.device), self.timestep_mode).to(dtype=hidden_states.dtype)
-        model_out = self.transformer(
-            hidden_states=hidden_states,
-            timestep=flux_timestep,
-            guidance=None,
-            encoder_hidden_states=context,
-            txt_ids=txt_ids,
-            img_ids=img_ids,
-            return_dict=False,
-        )
+        routing_context = contextlib.nullcontext()
+        self._last_moe_router_output = None
+        if self.is_lora_moe_enabled():
+            if z_lr is None:
+                raise ValueError("z_lr is required when model.lora_backend='moe'")
+            router_output = self.moe_router(
+                prompt_embeds=prompt_embeds,
+                z_lr=z_lr.to(prompt_embeds.device),
+                routing_mode=self.moe_routing_mode,
+                top_k=self.moe_top_k,
+                temperature=self.moe_temperature,
+            )
+            self._last_moe_router_output = router_output
+            routing_context = moe_routing(self.transformer, router_output.alpha)
+        with routing_context:
+            model_out = self.transformer(
+                hidden_states=hidden_states,
+                timestep=flux_timestep,
+                guidance=None,
+                encoder_hidden_states=context,
+                txt_ids=txt_ids,
+                img_ids=img_ids,
+                return_dict=False,
+            )
         packed_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out.sample
         if lr_token_count:
             packed_pred = packed_pred[:, lr_token_count:]
@@ -528,12 +742,26 @@ class Flux2KleinSRArtist(nn.Module):
 
     def save_trainable(self, output_dir, save_files=True):
         output_dir = Path(output_dir)
-        metadata = {"flux_backend": self.backend_name}
+        metadata = {
+            "flux_backend": self.backend_name,
+            "lora_backend": self.lora_backend,
+        }
+        if self.is_lora_moe_enabled():
+            moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+            metadata["lora_moe"] = {
+                "num_routed_experts": int(moe_cfg.get("num_routed_experts", 4)),
+                "top_k": int(moe_cfg.get("top_k", 2)),
+                "latent_branch": str(moe_cfg.get("latent_branch", "stat_conv")),
+            }
         if save_files:
             output_dir.mkdir(parents=True, exist_ok=True)
             with (output_dir / "rg_flux_checkpoint_meta.json").open("w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, indent=2)
-        if self.use_lora and hasattr(self.transformer, "save_pretrained"):
+        if self.is_lora_moe_enabled():
+            moe_state = _gathered_named_parameter_state(self, _moe_parameter_name, collect_state=save_files)
+            if save_files:
+                torch.save(moe_state, output_dir / "flux2_klein_lora_moe_state.pt")
+        elif self.use_lora and hasattr(self.transformer, "save_pretrained"):
             if save_files and not _has_deepspeed_partitioned_parameters(self.transformer):
                 self.transformer.save_pretrained(output_dir / "flux2_klein_adapter")
             lora_state = _gathered_named_parameter_state(
@@ -560,9 +788,17 @@ class Flux2KleinSRArtist(nn.Module):
         if (checkpoint_dir / "flux_lora_state.pt").exists() and not (checkpoint_dir / "flux2_klein_lora_state.pt").exists():
             raise RuntimeError("This looks like a FLUX.1 checkpoint. Use a FLUX.2-klein adapter checkpoint instead.")
 
+        moe_state_path = checkpoint_dir / "flux2_klein_lora_moe_state.pt"
         adapter_dir = checkpoint_dir / "flux2_klein_adapter"
         lora_state_path = checkpoint_dir / "flux2_klein_lora_state.pt"
-        if lora_state_path.exists() and self.use_lora:
+        if moe_state_path.exists():
+            if not self.is_lora_moe_enabled():
+                raise RuntimeError("This checkpoint uses LoRA-MoE. Set model.lora_backend: moe.")
+            state = torch.load(moe_state_path, map_location="cpu")
+            _load_state_dict_with_shape_check(self, state, moe_state_path, "FLUX.2-klein LoRA-MoE")
+        elif self.is_lora_moe_enabled() and (lora_state_path.exists() or adapter_dir.exists()):
+            raise RuntimeError("This checkpoint uses single LoRA. Use tools/init_flux2_lora_moe.py before MoE training.")
+        elif lora_state_path.exists() and self.use_lora:
             state = torch.load(lora_state_path, map_location="cpu")
             _load_state_dict_with_shape_check(self.transformer, state, lora_state_path, "FLUX.2-klein LoRA")
         elif adapter_dir.exists() and self.use_lora and not hasattr(self.transformer, "peft_config"):

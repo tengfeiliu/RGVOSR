@@ -156,6 +156,8 @@ def main(args):
     artist = build_rg_flux_artist(config).to(device=device)
     artist.load_trainable(args.checkpoint, is_trainable=False)
     artist.eval()
+    if hasattr(artist, "set_moe_training_schedule"):
+        artist.set_moe_training_schedule(global_step=1, max_steps=1)
 
     condition_index = load_jsonl_conditions(args.jsonl_path)
     image_paths = list_images(args.input)
