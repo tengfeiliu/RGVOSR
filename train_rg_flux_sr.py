@@ -266,6 +266,23 @@ def resolve_resume_checkpoint(output_dir, resume_ckpt=None, auto_resume=True):
     return find_latest_checkpoint(output_dir, None)
 
 
+def training_state_rank_path(checkpoint_dir, rank):
+    return Path(checkpoint_dir) / f"training_state_rank-{int(rank):05d}.pt"
+
+
+def _optimizer_requires_rank_state_dict(optimizer):
+    inner_optimizer = getattr(optimizer, "optimizer", optimizer)
+    return hasattr(inner_optimizer, "dp_process_group") and hasattr(inner_optimizer, "_rigid_load_state_dict")
+
+
+def _is_rank_keyed_optimizer_state(optimizer_state, rank):
+    if isinstance(optimizer_state, dict):
+        return int(rank) in optimizer_state
+    if isinstance(optimizer_state, (list, tuple)):
+        return int(rank) < len(optimizer_state)
+    return False
+
+
 def save_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir, global_step):
     accelerator.wait_for_everyone()
     checkpoint_dir = Path(checkpoint_dir)
@@ -274,12 +291,26 @@ def save_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_
     unwrapped = accelerator.unwrap_model(artist)
     unwrapped.save_trainable(checkpoint_dir / "rg_flux_adapters", save_files=accelerator.is_main_process)
     accelerator.wait_for_everyone()
+    rank = int(accelerator.process_index)
+    optimizer_state = optimizer.state_dict()
+    if _optimizer_requires_rank_state_dict(optimizer):
+        optimizer_state = {rank: optimizer_state}
+    torch.save(
+        {
+            "global_step": global_step,
+            "optimizer": optimizer_state,
+            "lr_scheduler": lr_scheduler.state_dict(),
+        },
+        training_state_rank_path(checkpoint_dir, rank),
+    )
+    accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
     torch.save(
         {
             "global_step": global_step,
-            "optimizer": optimizer.state_dict(),
+            "num_processes": int(accelerator.num_processes),
+            "rank_state_pattern": "training_state_rank-{rank:05d}.pt",
             "lr_scheduler": lr_scheduler.state_dict(),
         },
         checkpoint_dir / "training_state.pt",
@@ -293,19 +324,30 @@ def load_training_state(state_path):
         return torch.load(state_path, map_location="cpu")
 
 
-def load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir):
+def load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_dir, resume_training_state=True):
     checkpoint_dir = Path(checkpoint_dir)
     adapter_dir = checkpoint_dir / "rg_flux_adapters"
     unwrapped = accelerator.unwrap_model(artist)
     unwrapped.load_trainable(adapter_dir if adapter_dir.exists() else checkpoint_dir, is_trainable=True)
 
-    state_path = checkpoint_dir / "training_state.pt"
+    rank = int(accelerator.process_index)
+    rank_state_path = training_state_rank_path(checkpoint_dir, rank)
+    state_path = rank_state_path if rank_state_path.exists() else checkpoint_dir / "training_state.pt"
     global_step = 0
     if state_path.exists():
         state = load_training_state(state_path)
-        optimizer.load_state_dict(state.get("optimizer", {}))
-        lr_scheduler.load_state_dict(state.get("lr_scheduler", {}))
         global_step = int(state.get("global_step", 0))
+        if resume_training_state:
+            optimizer_state = state.get("optimizer", {})
+            if _optimizer_requires_rank_state_dict(optimizer) and not _is_rank_keyed_optimizer_state(optimizer_state, rank):
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint_dir} was saved without rank-local ZeRO-3 optimizer state for rank {rank}. "
+                    "A full optimizer/scheduler resume is not reliable from this checkpoint. "
+                    "Use a checkpoint saved with rank-local training_state_rank-*.pt files, or set "
+                    "training.resume_training_state: false to explicitly load model/adapters only with a fresh optimizer."
+                )
+            optimizer.load_state_dict(optimizer_state)
+            lr_scheduler.load_state_dict(state.get("lr_scheduler", {}))
     return global_step
 
 
@@ -684,7 +726,17 @@ def main(config_path, dry_run=False):
     if resume_path:
         if accelerator.is_main_process:
             logger.info("Loading RG-FLUX-SR-MS state from %s", resume_path)
-        global_step = load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, resume_path)
+        resume_training_state = cfg_bool(config, "training.resume_training_state", True)
+        if accelerator.is_main_process and not resume_training_state:
+            logger.warning("training.resume_training_state is false; optimizer and scheduler state will not be restored.")
+        global_step = load_rg_checkpoint(
+            accelerator,
+            artist,
+            optimizer,
+            lr_scheduler,
+            resume_path,
+            resume_training_state=resume_training_state,
+        )
 
     if accelerator.is_main_process and report_to is not None:
         accelerator.init_trackers(

@@ -646,6 +646,14 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("def load_training_state", train_source)
         self.assertIn('torch.load(state_path, map_location="cpu", weights_only=False)', train_source)
         self.assertIn("state = load_training_state(state_path)", train_source)
+        self.assertIn("def training_state_rank_path", train_source)
+        self.assertIn("training_state_rank-{rank:05d}.pt", train_source)
+        self.assertIn("optimizer_state = {rank: optimizer_state}", train_source)
+        self.assertIn("_optimizer_requires_rank_state_dict", train_source)
+        self.assertIn("_is_rank_keyed_optimizer_state", train_source)
+        self.assertIn("resume_training_state=resume_training_state", train_source)
+        self.assertIn("training.resume_training_state", train_source)
+        self.assertIn("was saved without rank-local ZeRO-3 optimizer state", train_source)
 
     def test_flux2_encode_prompt_filters_kwargs_by_pipeline_signature(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
