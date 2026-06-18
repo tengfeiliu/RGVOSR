@@ -29,6 +29,11 @@ from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_coll
 from metrics.rg_sr_metrics import DEFAULT_OMGSR_METRICS, evaluate_dataset_dirs
 from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.prompt_builder import build_sr_prompt
+from models.text_embedding_cache import (
+    get_text_embedding_cache,
+    normalize_text_encoding_mode,
+    resolve_prompt_embeddings,
+)
 from rg_flux_fm import build_flow_matching_inputs, sample_multistep_fm, sample_sigma
 
 
@@ -426,7 +431,16 @@ def evaluation_logs_from_summary(summary_json):
     return logs
 
 
-def run_rg_flux_evaluation(accelerator, artist, config, exp_name, global_step, weight_dtype, local_logger=None):
+def run_rg_flux_evaluation(
+    accelerator,
+    artist,
+    config,
+    exp_name,
+    global_step,
+    weight_dtype,
+    text_embedding_cache=None,
+    local_logger=None,
+):
     if not bool(cfg(config, "evaluation.enabled", False)):
         return None
     eval_every = int(cfg(config, "evaluation.eval_every", 500))
@@ -471,10 +485,14 @@ def run_rg_flux_evaluation(accelerator, artist, config, exp_name, global_step, w
                     align=int(cfg(config, "data.vae_align", 16)),
                 ).to(accelerator.device, dtype=weight_dtype)
                 z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype)
-                prompt_embeds, pooled_prompt_embeds, text_ids = unwrapped_artist.encode_prompts(
-                    [prompt],
+                prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
+                    artist=unwrapped_artist,
+                    prompts=[prompt],
+                    image_keys=[record["lq_path"]],
+                    config=config,
                     device=accelerator.device,
                     dtype=weight_dtype,
+                    cache=text_embedding_cache,
                 )
                 degradation_vector = degradation_tensor_from_result(
                     result,
@@ -541,6 +559,7 @@ def main(config_path, dry_run=False):
     config.setdefault("data", {})
     config.setdefault("condition", {})
     config.setdefault("evaluation", {})
+    config.setdefault("text_encoding", {})
 
     report_to = normalize_report_to(cfg(config, "training.report_to", None))
     exp_name = cfg(config, "training.exp_name", None) or make_experiment_name(config)
@@ -574,6 +593,8 @@ def main(config_path, dry_run=False):
         local_logger.info("  training.grad_accum_steps = %s", grad_accum)
         local_logger.info("  effective global batch = %s", effective_batch)
         local_logger.info("  text_encoder_device = %s", cfg(config, "model.text_encoder_device", "cpu"))
+        local_logger.info("  text_encoding.mode = %s", normalize_text_encoding_mode(config))
+        local_logger.info("  text_encoding.cache_dir = %s", cfg(config, "text_encoding.cache_dir", None))
         local_logger.info("  vae_device = %s", cfg(config, "model.vae_device", "cpu"))
         local_logger.info("  max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
         crop_size = int(cfg(config, "data.crop_size", 512))
@@ -716,6 +737,10 @@ def main(config_path, dry_run=False):
 
     artist, optimizer, dataloader, lr_scheduler = accelerator.prepare(artist, optimizer, dataloader, lr_scheduler)
     weight_dtype = weight_dtype_from_accelerator(accelerator)
+    text_embedding_cache = get_text_embedding_cache(
+        config,
+        dtype=cfg(config, "text_encoding.dtype", cfg(config, "model.dtype", "bf16")),
+    )
 
     global_step = 0
     resume_path = resolve_resume_checkpoint(
@@ -779,10 +804,14 @@ def main(config_path, dry_run=False):
             with torch.no_grad():
                 z_hr = unwrapped_artist.encode_images(hq).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-                prompt_embeds, pooled_prompt_embeds, text_ids = unwrapped_artist.encode_prompts(
-                    prompts,
+                prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
+                    artist=unwrapped_artist,
+                    prompts=prompts,
+                    image_keys=batch["lq_path"],
+                    config=config,
                     device=accelerator.device,
                     dtype=weight_dtype,
+                    cache=text_embedding_cache,
                 )
                 dino_tokens = unwrapped_artist.extract_visual_tokens(lq_up)
                 sigma = sample_sigma(z_hr.shape[0], z_hr.device, sampling=sigma_sampling).to(dtype=weight_dtype)
@@ -869,6 +898,7 @@ def main(config_path, dry_run=False):
                     exp_name,
                     global_step,
                     weight_dtype,
+                    text_embedding_cache=text_embedding_cache,
                     local_logger=local_logger if accelerator.is_main_process else None,
                 )
                 if accelerator.is_main_process and eval_summary is not None:

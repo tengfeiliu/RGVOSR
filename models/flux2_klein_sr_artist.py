@@ -31,6 +31,7 @@ from models.lora_moe import (
     routing_entropy_loss,
     set_shared_lora_trainable,
 )
+from models.text_embedding_cache import normalize_text_encoding_mode, text_encoder_should_load
 from models.visual_condition_adapter import VisualConditionAdapter
 from rg_flux_fm import convert_sigma_to_flux_timestep
 
@@ -133,6 +134,8 @@ class Flux2KleinSRArtist(nn.Module):
             raise ValueError(f"Unsupported model.lora_backend: {self.lora_backend}")
         self.text_encoder_device = str(_cfg(config, "model.text_encoder_device", "cpu"))
         self.text_encoder_dtype = _dtype_from_config(_cfg(config, "model.text_encoder_dtype", "fp32"))
+        self.text_encoding_mode = normalize_text_encoding_mode(config)
+        self.load_text_encoder = text_encoder_should_load(config)
         self.vae_device = str(_cfg(config, "model.vae_device", "cpu"))
         default_vae_dtype = "fp32" if self.vae_device.lower() == "cpu" else _cfg(config, "model.dtype", "bf16")
         self.vae_dtype = _dtype_from_config(_cfg(config, "model.vae_dtype", default_vae_dtype))
@@ -177,11 +180,13 @@ class Flux2KleinSRArtist(nn.Module):
 
     def _load_flux2_modules(self):
         try:
-            from diffusers import AutoencoderKLFlux2, Flux2KleinPipeline, Flux2Transformer2DModel
+            from diffusers import AutoencoderKLFlux2, Flux2Transformer2DModel
+            if self.load_text_encoder:
+                from diffusers import Flux2KleinPipeline
         except (ImportError, ModuleNotFoundError) as exc:
             raise ImportError(
-                "FLUX.2-klein support requires a diffusers version with "
-                "AutoencoderKLFlux2, Flux2KleinPipeline, and Flux2Transformer2DModel."
+                "FLUX.2-klein support requires compatible AutoencoderKLFlux2 and Flux2Transformer2DModel "
+                "components, plus Flux2KleinPipeline when online text encoding is enabled."
             ) from exc
 
         vae = AutoencoderKLFlux2.from_pretrained(
@@ -211,14 +216,15 @@ class Flux2KleinSRArtist(nn.Module):
                 _clear_hf_deepspeed_config()
                 hf_ds_config = None
 
-        self.text_pipeline = Flux2KleinPipeline.from_pretrained(
-            self.flux_model_path,
-            transformer=None,
-            vae=None,
-            torch_dtype=self.text_encoder_dtype,
-        )
-        if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
-            self.text_pipeline.to(self.text_encoder_device)
+        if self.load_text_encoder:
+            self.text_pipeline = Flux2KleinPipeline.from_pretrained(
+                self.flux_model_path,
+                transformer=None,
+                vae=None,
+                torch_dtype=self.text_encoder_dtype,
+            )
+            if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
+                self.text_pipeline.to(self.text_encoder_device)
 
         self.vae.requires_grad_(False)
         self.vae.eval()
@@ -552,6 +558,11 @@ class Flux2KleinSRArtist(nn.Module):
 
     @torch.no_grad()
     def encode_prompts(self, prompts, device=None, dtype=None):
+        if self.text_pipeline is None:
+            raise RuntimeError(
+                "Text encoder is disabled because text_encoding.mode='cached'. "
+                "Load prompt embeddings from text_encoding.cache_dir instead."
+            )
         if isinstance(prompts, str):
             prompts = [prompts]
         if self.text_encoder_device.lower() == "cpu" and hasattr(self.text_pipeline, "to"):

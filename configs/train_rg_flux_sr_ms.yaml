@@ -15,6 +15,13 @@ model:
   latent_channels: 16
   context_dim: 4096
 
+text_encoding:
+  mode: online
+  cache_dir: null
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+
 data:
   jsonl_path: datasets/LSDIR_cache/valid.jsonl
   crop_size: 512

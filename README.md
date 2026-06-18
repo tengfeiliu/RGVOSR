@@ -279,6 +279,60 @@ accelerate launch \
   --dry_run
 ```
 
+## Text Embedding 离线缓存
+
+离线缓存会预先生成 `prompt_embeds`、`pooled_prompt_embeds` 和 `text_ids`。训练或推理设置为 `cached` 后不会加载 text encoder、tokenizer 或 text pipeline，可减少 CPU/GPU 内存占用。
+
+### 生成 Text Embedding Cache
+
+下面的命令读取 cleaned JSONL 并生成缓存。`--resume --skip-existing` 会读取已有 manifest，跳过 prompt 和 encoder 配置均未变化的有效缓存。
+
+```bash
+python tools/cache_rg_flux_text_embeddings.py \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --jsonl_path datasets/inference_cleaned.jsonl \
+  --output_dir datasets/text_embed_cache/flux2_klein_inference \
+  --device cuda \
+  --dtype bf16 \
+  --resume \
+  --skip-existing
+```
+
+强制全部重新生成时使用 `--overwrite`。建议先加 `--limit 2` 做小样本检查。
+
+### 训练使用 Cache
+
+在训练配置中设置：
+
+```yaml
+text_encoding:
+  mode: cached
+  cache_dir: datasets/text_embed_cache/flux2_klein_train
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+```
+
+`online` 保持原有在线编码；`auto` 优先读取缓存，未命中时在线编码，因此仍会加载 text encoder。
+
+### 推理使用 Cache
+
+```bash
+python inference_rg_flux_sr.py \
+  --input path/to/lq_or_folder \
+  --output_dir outputs/rg_flux2_cached \
+  --checkpoint path/to/checkpoint/rg_flux_adapters \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --jsonl_path datasets/inference_cleaned.jsonl \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_inference \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16
+```
+
+cached 模式下，如果图片、prompt hash、encoder signature 或 embedding 文件不匹配，程序会直接报错，不会静默使用错误缓存。
+
 ## RG-FLUX-SR 推理命令
 
 ### 单张图片或文件夹推理

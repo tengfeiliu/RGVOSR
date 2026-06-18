@@ -14,6 +14,7 @@ from tqdm import tqdm
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.prompt_builder import build_sr_prompt
+from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
 from rg_flux_fm import sample_multistep_fm
 
 
@@ -140,9 +141,15 @@ def prepare_lq_up(image_path, upscale, align=16, min_size=None):
 def main(args):
     config = load_config(args.checkpoint, args.config)
     config.setdefault("condition", {})
+    config.setdefault("text_encoding", {})
     config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
     config["condition"]["use_prompt"] = args.use_prompt
     config["condition"]["use_degradation_vector"] = args.use_degradation_vector
+    config["condition"]["use_suggestions"] = args.use_suggestions
+    if args.text_encoding_mode is not None:
+        config["text_encoding"]["mode"] = args.text_encoding_mode
+    if args.text_embedding_cache is not None:
+        config["text_encoding"]["cache_dir"] = args.text_embedding_cache
 
     dtype = {
         "fp32": torch.float32,
@@ -156,6 +163,10 @@ def main(args):
     artist = build_rg_flux_artist(config).to(device=device)
     artist.load_trainable(args.checkpoint, is_trainable=False)
     artist.eval()
+    text_embedding_cache = get_text_embedding_cache(
+        config,
+        dtype=cfg(config, "text_encoding.dtype", args.dtype),
+    )
     if hasattr(artist, "set_moe_training_schedule"):
         artist.set_moe_training_schedule(global_step=1, max_steps=1)
 
@@ -170,6 +181,7 @@ def main(args):
     to_pil = transforms.ToPILImage()
 
     for image_path in tqdm(image_paths, desc="RG-FLUX-SR inference"):
+        condition = None
         if args.jsonl_path:
             condition = condition_for_image(condition_index, image_path)
             if condition is None:
@@ -210,7 +222,20 @@ def main(args):
 
         with torch.no_grad():
             z_lr = artist.encode_images(lq_up).to(device=device, dtype=dtype)
-            prompt_embeds, pooled_prompt_embeds, text_ids = artist.encode_prompts([prompt], device=device, dtype=dtype)
+            cache_image_key = str(image_path)
+            if isinstance(condition, dict):
+                record = condition.get("record")
+                if isinstance(record, dict) and record.get("lq_path"):
+                    cache_image_key = record["lq_path"]
+            prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
+                artist=artist,
+                prompts=[prompt],
+                image_keys=[cache_image_key],
+                config=config,
+                device=device,
+                dtype=dtype,
+                cache=text_embedding_cache,
+            )
             degradation_vector = degradation_tensor(result, device, dtype, args.use_degradation_vector)
             dino_tokens = artist.extract_visual_tokens(lq_up)
             sr_latent = sample_multistep_fm(
@@ -242,6 +267,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", required=True, help="RG-FLUX-SR-MS adapter checkpoint directory.")
     parser.add_argument("--config", default=None)
     parser.add_argument("--jsonl_path", default=None)
+    parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)
+    parser.add_argument("--text_embedding_cache", default=None)
     parser.add_argument("--num_inference_steps", type=int, default=25)
     parser.add_argument("--lr_cond_mode", choices=["latent_adapter", "latent_concat"], default=None)
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)

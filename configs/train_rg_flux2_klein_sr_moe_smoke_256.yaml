@@ -27,6 +27,13 @@ model:
     freeze_shared_during_warmup: true
     init_from_single_lora: null
 
+text_encoding:
+  mode: online
+  cache_dir: null
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+
 data:
   jsonl_path: datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl
   crop_size: 256

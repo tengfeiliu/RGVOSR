@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from models.degradation_vector_encoder import DegradationVectorEncoder
 from models.lr_condition_encoder import LRConditionEncoder
+from models.text_embedding_cache import normalize_text_encoding_mode, text_encoder_should_load
 from models.visual_condition_adapter import VisualConditionAdapter
 from rg_flux_fm import convert_sigma_to_flux_timestep
 
@@ -189,6 +190,8 @@ class FluxSRArtist(nn.Module):
         self.use_lora = bool(_cfg(config, "model.use_lora", True))
         self.text_encoder_device = str(_cfg(config, "model.text_encoder_device", "cpu"))
         self.text_encoder_dtype = _dtype_from_config(_cfg(config, "model.text_encoder_dtype", "fp32"))
+        self.text_encoding_mode = normalize_text_encoding_mode(config)
+        self.load_text_encoder = text_encoder_should_load(config)
         self.vae_device = str(_cfg(config, "model.vae_device", "cpu"))
         default_vae_dtype = "fp32" if self.vae_device.lower() == "cpu" else _cfg(config, "model.dtype", "bf16")
         self.vae_dtype = _dtype_from_config(_cfg(config, "model.vae_dtype", default_vae_dtype))
@@ -224,7 +227,9 @@ class FluxSRArtist(nn.Module):
 
     def _load_flux_modules(self):
         try:
-            from diffusers import AutoencoderKL, FluxPipeline, FluxTransformer2DModel
+            from diffusers import AutoencoderKL, FluxTransformer2DModel
+            if self.load_text_encoder:
+                from diffusers import FluxPipeline
         except ModuleNotFoundError as exc:
             raise ImportError(
                 "RG-FLUX-SR-MS requires diffusers with FLUX support. "
@@ -258,18 +263,22 @@ class FluxSRArtist(nn.Module):
                 _clear_hf_deepspeed_config()
                 hf_ds_config = None
 
-        self.text_pipeline = FluxPipeline.from_pretrained(
-            self.flux_model_path,
-            transformer=None,
-            vae=None,
-            torch_dtype=self.text_encoder_dtype,
-        )
-        self._validate_text_pipeline()
-        if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
-            self.text_pipeline.to(self.text_encoder_device)
+        if self.load_text_encoder:
+            self.text_pipeline = FluxPipeline.from_pretrained(
+                self.flux_model_path,
+                transformer=None,
+                vae=None,
+                torch_dtype=self.text_encoder_dtype,
+            )
+            self._validate_text_pipeline()
+            if self.text_encoder_device and self.text_encoder_device.lower() != "cpu":
+                self.text_pipeline.to(self.text_encoder_device)
         self.vae.requires_grad_(False)
         self.vae.eval()
-        for module in (getattr(self.text_pipeline, "text_encoder", None), getattr(self.text_pipeline, "text_encoder_2", None)):
+        for module in (
+            getattr(self.text_pipeline, "text_encoder", None),
+            getattr(self.text_pipeline, "text_encoder_2", None),
+        ):
             if module is not None:
                 module.requires_grad_(False)
                 module.eval()
@@ -421,6 +430,11 @@ class FluxSRArtist(nn.Module):
 
     @torch.no_grad()
     def encode_prompts(self, prompts, device=None, dtype=None):
+        if self.text_pipeline is None:
+            raise RuntimeError(
+                "Text encoder is disabled because text_encoding.mode='cached'. "
+                "Load prompt embeddings from text_encoding.cache_dir instead."
+            )
         if isinstance(prompts, str):
             prompts = [prompts]
         text_device = self.text_encoder_device if self.text_encoder_device else "cpu"
