@@ -65,8 +65,8 @@ training:
   lr_lora: 5.0e-5
   weight_decay: 0.01
   grad_accum_steps: 1
-  save_every: 1
-  log_every: 1
+  save_every: 100
+  log_every: 100
   output_dir: exp_rg_flux_sr
   logging_dir: logs
   report_to: none
@@ -81,8 +81,8 @@ training:
   lr_scheduler: constant_with_warmup
   lr_warmup_steps: 0
   lr_num_cycles: 1
-  resume_ckpt: null
-  auto_resume: false
+  resume_ckpt: exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_latent_concat_size256_flux2_klein_lora_moe_smoke256/checkpoints/checkpoint-00000700
+  auto_resume: true
   suffix: "_flux2_klein_lora_moe_smoke256"
 
 flow_matching:
