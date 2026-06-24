@@ -173,6 +173,15 @@ class TextEmbeddingCacheStaticTests(unittest.TestCase):
         self.assertIn("--text_encoding_mode", inference_source)
         self.assertIn("--text_embedding_cache", inference_source)
 
+    def test_moe_initializer_uses_shared_embedding_resolver(self):
+        source = Path("tools/init_flux2_lora_moe.py").read_text(encoding="utf-8")
+
+        self.assertIn("get_text_embedding_cache", source)
+        self.assertIn("resolve_prompt_embeddings(", source)
+        self.assertIn('image_keys=batch["lq_path"]', source)
+        self.assertIn('text_encoding_config.get("dtype") or args.dtype', source)
+        self.assertNotIn("artist.encode_prompts(", source)
+
 
 if __name__ == "__main__":
     unittest.main()

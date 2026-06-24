@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn  # noqa: E402
 from models.flux_sr_artist import _load_state_dict_with_shape_check  # noqa: E402
 from models.rg_flux_artist_factory import build_rg_flux_artist  # noqa: E402
+from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings  # noqa: E402
 
 
 def load_yaml(path):
@@ -59,7 +60,7 @@ def load_condition_adapters(artist, single_lora_checkpoint):
 
 
 @torch.no_grad()
-def initialize_prototypes(artist, config, device, dtype, num_samples):
+def initialize_prototypes(artist, config, device, dtype, num_samples, text_embedding_cache):
     jsonl_path = config.get("data", {}).get("jsonl_path")
     if not jsonl_path or int(num_samples) <= 0:
         return 0
@@ -80,7 +81,15 @@ def initialize_prototypes(artist, config, device, dtype, num_samples):
             break
         lq_up = batch["lq_up"].to(device=device, dtype=dtype)
         z_lr = artist.encode_images(lq_up).to(device=device, dtype=dtype)
-        prompt_embeds, _, _ = artist.encode_prompts(batch["prompt"], device=device, dtype=dtype)
+        prompt_embeds, _, _ = resolve_prompt_embeddings(
+            artist=artist,
+            prompts=batch["prompt"],
+            image_keys=batch["lq_path"],
+            config=config,
+            device=device,
+            dtype=dtype,
+            cache=text_embedding_cache,
+        )
         features.append(artist.compute_router_features(prompt_embeds, z_lr).detach().float().cpu())
     if not features:
         return 0
@@ -101,8 +110,20 @@ def main(args):
     artist = build_rg_flux_artist(config).to(device=device)
     artist.initialize_moe_from_single_lora(args.single_lora_checkpoint, perturb_scale=args.perturb_scale)
     load_condition_adapters(artist, args.single_lora_checkpoint)
+    text_encoding_config = config.get("text_encoding", {}) or {}
+    text_embedding_cache = get_text_embedding_cache(
+        config,
+        dtype=text_encoding_config.get("dtype") or args.dtype,
+    )
 
-    initialized = initialize_prototypes(artist, config, device, dtype, args.prototype_num_samples)
+    initialized = initialize_prototypes(
+        artist,
+        config,
+        device,
+        dtype,
+        args.prototype_num_samples,
+        text_embedding_cache,
+    )
     print(f"[init_flux2_lora_moe] initialized prototypes from {initialized} samples", flush=True)
 
     output = Path(args.output)

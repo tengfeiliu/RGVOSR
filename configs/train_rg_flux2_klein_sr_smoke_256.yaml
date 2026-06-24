@@ -16,8 +16,13 @@ model:
   context_dim: 15360
 
 text_encoding:
-  mode: online
-  cache_dir: null
+  # mode: online
+  # cache_dir: null
+  # strict: true
+  # dtype: bf16
+  # validate_prompt_hash: true
+  mode: cached
+  cache_dir: datasets/text_embed_cache/flux2_klein_text_encoding
   strict: true
   dtype: bf16
   validate_prompt_hash: true
@@ -53,8 +58,8 @@ training:
   lr_lora: 5.0e-5
   weight_decay: 0.01
   grad_accum_steps: 1
-  save_every: 1
-  log_every: 1
+  save_every: 2000
+  log_every: 2000
   output_dir: exp_rg_flux_sr
   logging_dir: logs
   report_to: none
@@ -71,7 +76,7 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_smoke256_v0611"
+  suffix: "_flux2_klein_smoke256_v0621"
 
 flow_matching:
   sigma_sampling: uniform
