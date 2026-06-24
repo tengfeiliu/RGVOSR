@@ -9,7 +9,7 @@ model:
   max_prompt_sequence_length: 512
   use_lora: true
   lora_rank: 8
-  lora_alpha: 8
+  lora_alpha: 4
   gradient_checkpointing: false
   guidance_scale: 1.0
   latent_channels: 128
@@ -36,16 +36,16 @@ data:
   vae_align: 16
 
 condition:
-  use_prompt: true
-  use_suggestions: true
-  use_degradation_vector: true
+  use_prompt: false
+  use_suggestions: false
+  use_degradation_vector: false
   use_visual_semantic_tokens: false
   deg_vector_dim: 8
   deg_token_count: 0
   deg_hidden_dim: 512
   lr_cond_mode: latent_concat
-  lr_token_count: 8
-  condition_dropout: 0.1
+  lr_token_count: 1024
+  condition_dropout: 0
   visual_feature_dim: 768
   visual_token_count: 64
 
@@ -53,11 +53,11 @@ training:
   stage: A
   freeze_flux_transformer: true
   unfreeze_last_n_blocks: 0
-  max_steps: 100000
+  max_steps: 10000
   lr_adapter: 1.0e-4
   lr_lora: 5.0e-5
   weight_decay: 0.01
-  grad_accum_steps: 1
+  grad_accum_steps: 8
   save_every: 2000
   log_every: 2000
   output_dir: exp_rg_flux_sr
@@ -72,7 +72,7 @@ training:
   max_grad_norm: 1.0
   deepspeed_optimizer_offload_device: none
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 0
+  lr_warmup_steps: 500
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
