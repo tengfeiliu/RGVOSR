@@ -484,7 +484,10 @@ def run_rg_flux_evaluation(
                     upscale=int(cfg(config, "data.scale", 4)),
                     align=int(cfg(config, "data.vae_align", 16)),
                 ).to(accelerator.device, dtype=weight_dtype)
-                z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype)
+                z_lr = unwrapped_artist.encode_images(
+                    lq_up,
+                    sample=lr_cond_mode != "flux2_image_concat",
+                ).to(accelerator.device, dtype=weight_dtype)
                 prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
                     artist=unwrapped_artist,
                     prompts=[prompt],
@@ -803,7 +806,10 @@ def main(config_path, dry_run=False):
             )
             with torch.no_grad():
                 z_hr = unwrapped_artist.encode_images(hq).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-                z_lr = unwrapped_artist.encode_images(lq_up).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+                z_lr = unwrapped_artist.encode_images(
+                    lq_up,
+                    sample=lr_cond_mode != "flux2_image_concat",
+                ).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
                     artist=unwrapped_artist,
                     prompts=prompts,

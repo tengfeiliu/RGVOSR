@@ -75,12 +75,16 @@ def initialize_prototypes(artist, config, device, dtype, num_samples, text_embed
         vae_align=int(config.get("data", {}).get("vae_align", 16)),
     )
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=rg_flux_collate_fn)
+    lr_cond_mode = config.get("condition", {}).get("lr_cond_mode", "latent_adapter")
     features = []
     for batch in loader:
         if len(features) >= int(num_samples):
             break
         lq_up = batch["lq_up"].to(device=device, dtype=dtype)
-        z_lr = artist.encode_images(lq_up).to(device=device, dtype=dtype)
+        z_lr = artist.encode_images(
+            lq_up,
+            sample=lr_cond_mode != "flux2_image_concat",
+        ).to(device=device, dtype=dtype)
         prompt_embeds, _, _ = resolve_prompt_embeddings(
             artist=artist,
             prompts=batch["prompt"],

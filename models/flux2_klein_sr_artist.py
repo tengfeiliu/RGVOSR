@@ -88,6 +88,12 @@ def _latent_image_ids(batch_size, height, width, device, dtype):
     return ids.expand(batch_size, -1, -1)
 
 
+def _condition_image_ids(batch_size, height, width, device, dtype, time_id=10):
+    ids = _latent_image_ids(batch_size, height, width, device, dtype).clone()
+    ids[..., 0] = time_id
+    return ids
+
+
 def _retrieve_latents(encoded, sample=True):
     if hasattr(encoded, "latent_dist"):
         latent_dist = encoded.latent_dist
@@ -711,7 +717,9 @@ class Flux2KleinSRArtist(nn.Module):
         )
 
         img_ids = _latent_image_ids(bsz, height, width, z_t.device, hidden_states.dtype)
+        target_token_count = hidden_states.shape[1]
         lr_token_count = 0
+        native_image_concat = False
         if lr_cond_mode == "latent_concat":
             if z_lr is None:
                 raise ValueError("z_lr is required when lr_cond_mode='latent_concat'")
@@ -720,6 +728,29 @@ class Flux2KleinSRArtist(nn.Module):
             hidden_states = torch.cat([lr_tokens, hidden_states], dim=1)
             lr_img_ids = self._extra_text_ids(bsz, lr_token_count, z_t.device, hidden_states.dtype, token_type=4)
             img_ids = torch.cat([lr_img_ids, img_ids], dim=1)
+        elif lr_cond_mode == "flux2_image_concat":
+            if z_lr is None:
+                raise ValueError("z_lr is required when lr_cond_mode='flux2_image_concat'")
+            lr_tokens = self.lr_condition_encoder(
+                z_lr.to(device=z_t.device, dtype=hidden_states.dtype),
+                mode="flux2_image_concat",
+            )
+            lr_height, lr_width = z_lr.shape[-2:]
+            lr_img_ids = _condition_image_ids(
+                bsz,
+                lr_height,
+                lr_width,
+                z_t.device,
+                hidden_states.dtype,
+                time_id=10,
+            )
+            if lr_tokens.shape[1] != lr_img_ids.shape[1]:
+                raise RuntimeError(
+                    f"FLUX.2 LR token count {lr_tokens.shape[1]} does not match image id count {lr_img_ids.shape[1]}"
+                )
+            hidden_states = torch.cat([hidden_states, lr_tokens], dim=1)
+            img_ids = torch.cat([img_ids, lr_img_ids], dim=1)
+            native_image_concat = True
 
         flux_timestep = convert_sigma_to_flux_timestep(timestep.to(z_t.device), self.timestep_mode).to(dtype=hidden_states.dtype)
         routing_context = contextlib.nullcontext()
@@ -751,7 +782,9 @@ class Flux2KleinSRArtist(nn.Module):
                 return_dict=False,
             )
         packed_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out.sample
-        if lr_token_count:
+        if native_image_concat:
+            packed_pred = packed_pred[:, :target_token_count]
+        elif lr_token_count:
             packed_pred = packed_pred[:, lr_token_count:]
         return _unflatten_image_tokens(packed_pred, height, width).to(dtype=z_t.dtype)
 

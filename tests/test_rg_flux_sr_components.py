@@ -577,6 +577,31 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("_gathered_named_parameter_state", source)
         self.assertIn("_load_state_dict_with_shape_check", source)
 
+    def test_flux2_native_image_concat_uses_pretrained_condition_layout(self):
+        artist_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        encoder_source = Path("models/lr_condition_encoder.py").read_text(encoding="utf-8")
+        inference_source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn('"flux2_image_concat"', encoder_source)
+        self.assertIn('if mode == "flux2_image_concat":', encoder_source)
+        self.assertIn("return z_lr.flatten(2).transpose(1, 2)", encoder_source)
+        self.assertIn("def _condition_image_ids(", artist_source)
+        self.assertIn("time_id=10", artist_source)
+        self.assertIn("hidden_states = torch.cat([hidden_states, lr_tokens], dim=1)", artist_source)
+        self.assertIn("img_ids = torch.cat([img_ids, lr_img_ids], dim=1)", artist_source)
+        self.assertIn("packed_pred = packed_pred[:, :target_token_count]", artist_source)
+        self.assertIn('"flux2_image_concat"', inference_source)
+
+    def test_flux2_native_image_concat_uses_deterministic_lr_latents(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        inference_source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        init_source = Path("tools/init_flux2_lora_moe.py").read_text(encoding="utf-8")
+
+        expected = 'sample=lr_cond_mode != "flux2_image_concat"'
+        self.assertGreaterEqual(train_source.count(expected), 2)
+        self.assertIn(expected, inference_source)
+        self.assertIn(expected, init_source)
+
     def test_flux2_lora_moe_backend_is_optional_and_checkpoint_is_separate(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
         train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")

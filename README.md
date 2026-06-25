@@ -54,8 +54,8 @@ data:
 | --- | --- |
 | `configs/train_rg_flux_sr_ms_smoke_256.yaml` | 2 卡低显存 smoke 配置，`crop_size=256`，用于验证训练链路。 |
 | `configs/train_rg_flux_sr_ms.yaml` | 512 正式训练配置，推荐 8 卡或更大显存。 |
-| `configs/train_rg_flux2_klein_sr_smoke_256.yaml` | FLUX.2-klein 2 卡 256 smoke 配置，默认 `model.flux_backend=flux2_klein`。 |
-| `configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml` | FLUX.2-klein LoRA-MoE 256 smoke 配置，默认 `model.lora_backend=moe`。 |
+| `configs/train_rg_flux2_klein_sr_smoke_256.yaml` | FLUX.2-klein Single-LoRA 实验配置，默认使用原生 `flux2_image_concat` LR 图像条件。实际 crop 大小以 YAML 中的 `data.crop_size` 为准。 |
+| `configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml` | FLUX.2-klein LoRA-MoE 实验配置，默认使用原生 `flux2_image_concat` LR 图像条件和 `model.lora_backend=moe`。 |
 | `configs/accelerate/zero3_bf16_cpu_offload.yaml` | 2 卡 ZeRO-3 + CPU offload，用于 24GB 卡 smoke test。 |
 | `configs/accelerate/zero3_bf16_param_offload.yaml` | 2 卡 ZeRO-3 配置，optimizer 不 offload；可按显存情况设置 `offload_param_device` 为 `cpu` 或 `none`。 |
 | `configs/accelerate/zero3_bf16.yaml` | 8 卡 ZeRO-3，无 CPU offload，用于正式训练。 |
@@ -100,9 +100,9 @@ accelerate launch \
   --config configs/train_rg_flux_sr_ms_smoke_256.yaml
 ```
 
-### 2 卡 FLUX.2-klein 256 Smoke 训练
+### FLUX.2-klein Single-LoRA 训练
 
-这个命令用于启动 FLUX.2-klein base 后端的 256 smoke 训练。配置文件会走 `Flux2KleinSRArtist`，基础模型路径默认是 `/data/models/FLUX.2-klein-base-4B`。当前建议先用 2 卡 256 验证链路，后续再逐步放大 crop、token 数或迁移到更多显存。
+这个命令用于启动 FLUX.2-klein base 后端的 Single-LoRA 训练。配置文件会走 `Flux2KleinSRArtist`，基础模型路径默认是 `/data/models/FLUX.2-klein-base-4B`，LR 条件默认使用 `flux2_image_concat`。配置文件名保留了早期的 `smoke_256` 命名，实际训练尺寸以 YAML 中的 `data.crop_size` 为准。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -123,11 +123,13 @@ model:
   text_encoder_device: cpu
   vae_device: cuda
 
+condition:
+  lr_cond_mode: flux2_image_concat
+
 training:
-  grad_accum_steps: 1
+  grad_accum_steps: 8
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_smoke256_v2"
 
 evaluation:
   enabled: false
@@ -135,13 +137,43 @@ evaluation:
 
 如果显存不足，优先把 `vae_device` 改回 `cpu`，并把 `configs/accelerate/zero3_bf16_param_offload.yaml` 中的 `offload_param_device` 改成 `cpu`。如果想恢复自动续训，把 `training.auto_resume` 改成 `true`，但 ZeRO-3 下旧 LoRA checkpoint 可能需要单独的安全加载逻辑。
 
+#### FLUX.2 原生 LR 图像条件：`flux2_image_concat`
+
+FLUX.2 Single-LoRA 和 LoRA-MoE 配置默认使用：
+
+```yaml
+condition:
+  lr_cond_mode: flux2_image_concat
+```
+
+该模式复用 FLUX.2-Klein 预训练的图像条件布局：
+
+- LR 图像通过 VAE posterior `mode()` 进行确定性编码。
+- patchify 和 latent normalization 后的 LR latent 直接作为 image token，不经过 `concat_proj`、一维池化或额外 type embedding。
+- Transformer 输入顺序为 `[生成 token, LR 条件 token]`。
+- 生成 token 使用二维位置 ID `(T=0, H, W, L=0)`，LR 条件 token 使用 `(T=10, H, W, L=0)`。
+- Transformer 输出只保留前面的生成 token，LR 条件 token 的输出不会进入 FM loss。
+
+在该模式下，LR token 数由输入尺寸和 FLUX.2 VAE/patchify 过程自动决定。例如当前 512 crop 会产生 `32 × 32 = 1024` 个 LR 条件 token。配置中的 `condition.lr_token_count` 不参与 `flux2_image_concat`，它只对旧的 `latent_adapter` 和 `latent_concat` 模式生效。
+
+旧模式仍然保留：
+
+```yaml
+condition:
+  lr_cond_mode: latent_adapter  # LR token 加入 text/context 序列
+  # 或
+  lr_cond_mode: latent_concat   # 旧版投影后 image-token concat
+```
+
+旧 `latent_concat` checkpoint 是在不同的 token 顺序、投影方式和位置 ID 下训练的。虽然代码仍可加载这类 checkpoint，但不建议直接用于 `flux2_image_concat` 正式推理或继续训练；建议从 FLUX.2 base 重新训练 Single-LoRA，再据此初始化 LoRA-MoE。
+
 ### FLUX.2-klein LoRA-MoE 训练流程
 
 LoRA-MoE 是 FLUX.2-klein 的可选后端。默认 single-LoRA 路径不变，只有配置中显式设置 `model.lora_backend: moe` 时才启用。MoE 版本会保持 FLUX.2 transformer 主干冻结，只训练 shared LoRA、routed LoRA experts、router 和现有 condition adapters。
 
 #### Stage 0：训练 Single-LoRA Baseline
 
-先用当前 FLUX.2-klein single-LoRA 配置训练一个稳定 baseline。这个 checkpoint 后续用于初始化 shared LoRA 和 routed experts。
+先用当前 FLUX.2-klein Single-LoRA 配置和相同的 `flux2_image_concat` 条件模式训练一个稳定 baseline。这个 checkpoint 后续用于初始化 shared LoRA 和 routed experts。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -283,55 +315,125 @@ accelerate launch \
 
 离线缓存会预先生成 `prompt_embeds`、`pooled_prompt_embeds` 和 `text_ids`。训练或推理设置为 `cached` 后不会加载 text encoder、tokenizer 或 text pipeline，可减少 CPU/GPU 内存占用。
 
-### 生成 Text Embedding Cache
+`condition.use_prompt` 和 `condition.use_suggestions` 会改变实际 prompt，并且属于 text embedding cache signature 的一部分。生成缓存、训练和推理时三者必须保持一致；修改这两个参数后，需要使用新的缓存目录或重新生成缓存。
 
-下面的命令读取 cleaned JSONL 并生成缓存。`--resume --skip-existing` 会读取已有 manifest，跳过 prompt 和 encoder 配置均未变化的有效缓存。
+### 场景一：`use_prompt=true`、`use_suggestions=true`
+
+该模式会根据每张图片的 IQA、IAA 和 restoration suggestion 构造不同 prompt，因此需要遍历完整 JSONL，为各图片生成对应的 text embedding。
+
+训练配置：
+
+```yaml
+condition:
+  use_prompt: true
+  use_suggestions: true
+
+text_encoding:
+  mode: cached
+  cache_dir: datasets/text_embed_cache/flux2_klein_train_full_prompt
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+```
+
+生成训练集缓存：
 
 ```bash
 python tools/cache_rg_flux_text_embeddings.py \
   --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
-  --jsonl_path datasets/inference_cleaned.jsonl \
-  --output_dir datasets/text_embed_cache/flux2_klein_inference \
+  --jsonl_path datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --output_dir datasets/text_embed_cache/flux2_klein_train_full_prompt \
   --device cuda \
   --dtype bf16 \
   --resume \
   --skip-existing
 ```
 
-强制全部重新生成时使用 `--overwrite`。建议先加 `--limit 2` 做小样本检查。
+推理集通常包含不同图片和不同 prompt，需要针对推理 JSONL 单独生成缓存：
 
-### 训练使用 Cache
-
-在训练配置中设置：
-
-```yaml
-text_encoding:
-  mode: cached
-  cache_dir: datasets/text_embed_cache/flux2_klein_train
-  strict: true
-  dtype: bf16
-  validate_prompt_hash: true
+```bash
+python tools/cache_rg_flux_text_embeddings.py \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --jsonl_path datasets/inference_cleaned.jsonl \
+  --output_dir datasets/text_embed_cache/flux2_klein_inference_full_prompt \
+  --device cuda \
+  --dtype bf16 \
+  --resume \
+  --skip-existing
 ```
 
-`online` 保持原有在线编码；`auto` 优先读取缓存，未命中时在线编码，因此仍会加载 text encoder。
-
-### 推理使用 Cache
+推理命令：
 
 ```bash
 python inference_rg_flux_sr.py \
   --input path/to/lq_or_folder \
-  --output_dir outputs/rg_flux2_cached \
+  --output_dir outputs/rg_flux2_cached_full_prompt \
   --checkpoint path/to/checkpoint/rg_flux_adapters \
   --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
   --jsonl_path datasets/inference_cleaned.jsonl \
   --text_encoding_mode cached \
-  --text_embedding_cache datasets/text_embed_cache/flux2_klein_inference \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_inference_full_prompt \
+  --use_prompt \
+  --use_suggestions \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16
 ```
 
-cached 模式下，如果图片、prompt hash、encoder signature 或 embedding 文件不匹配，程序会直接报错，不会静默使用错误缓存。
+### 场景二：`use_prompt=false`、`use_suggestions=false`
+
+该模式忽略每张图片的 profile，所有样本统一使用 `models/prompt_builder.py` 中的 `DEFAULT_SR_PROMPT`。由于 prompt 和 encoder signature 完全相同，只需要在线编码一条合法 JSONL 记录，训练、推理、Single-LoRA 和 LoRA-MoE 都可以复用同一个 embedding 文件。
+
+训练配置：
+
+```yaml
+condition:
+  use_prompt: false
+  use_suggestions: false
+
+text_encoding:
+  mode: cached
+  cache_dir: datasets/text_embed_cache/flux2_klein_fixed_sr_prompt
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+```
+
+使用 `--limit 1` 只生成一次固定 prompt embedding：
+
+```bash
+python tools/cache_rg_flux_text_embeddings.py \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --jsonl_path datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl \
+  --output_dir datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --device cuda \
+  --dtype bf16 \
+  --limit 1 \
+  --overwrite
+```
+
+缓存 resolver 会先按图片路径查询，未命中时再按 `prompt_hash + encoder_signature` 查询，因此其他训练或推理图片可以读取同一份固定 prompt embedding，不需要逐图生成或逐图注册 manifest。Single-LoRA 与 LoRA-MoE 配置只要基础模型、文本长度、文本 dtype 和上述两个 condition 开关一致，也可以指向同一个缓存目录。
+
+独立推理脚本的 `--use_prompt` 和 `--use_suggestions` 默认值均为 `true`，会覆盖 YAML，所以固定 prompt 模式必须显式传入两个否定参数：
+
+```bash
+python inference_rg_flux_sr.py \
+  --input path/to/lq_or_folder \
+  --output_dir outputs/rg_flux2_cached_fixed_prompt \
+  --checkpoint path/to/checkpoint/rg_flux_adapters \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16
+```
+
+如果推理仍需要读取 JSONL 中的 degradation vector，可以继续传入 `--jsonl_path datasets/inference_cleaned.jsonl`；它不会改变固定的 `DEFAULT_SR_PROMPT`。
+
+强制全部重新生成时使用 `--overwrite`。逐图 prompt 模式建议先加 `--limit 2` 做小样本检查。`online` 保持在线编码；`auto` 优先读取缓存，未命中时在线编码，因此仍会加载 text encoder。`cached` 模式下如果 prompt hash、encoder signature 或 embedding 文件不匹配，程序会直接报错，不会静默使用错误缓存。
 
 ## RG-FLUX-SR 推理命令
 
@@ -358,12 +460,17 @@ FLUX.2-klein 推理仍使用 `inference_rg_flux_sr.py`，关键是 `--config` �
 python inference_rg_flux_sr.py \
   --input path/to/lq_or_folder \
   --output_dir outputs/rg_flux2_klein_sr \
-  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_latent_adapter_size256_flux2_klein_smoke256_v2/checkpoints/checkpoint-00000001/rg_flux_adapters \
+  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_smoke256_v0621/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters \
   --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
   --jsonl_path datasets/LSDIR_cache/valid.jsonl \
+  --lr_cond_mode flux2_image_concat \
+  --no-use_prompt \
+  --no-use_suggestions \
   --num_inference_steps 25 \
   --upscale 4
 ```
+
+通常无需显式传入 `--lr_cond_mode`，因为配置文件已经设置为 `flux2_image_concat`；这里保留该参数是为了强调推理条件模式必须与训练一致。当前配置的 `use_prompt=false`、`use_suggestions=false` 会被独立推理 CLI 的默认值覆盖，因此必须显式传入两个 `--no-*` 参数。
 
 ### FLUX.2-klein LoRA-MoE Checkpoint 推理
 
@@ -373,15 +480,18 @@ MoE 推理仍然使用同一个 `inference_rg_flux_sr.py`。只要 `--config` �
 python inference_rg_flux_sr.py \
   --input path/to/lq_or_folder \
   --output_dir outputs/rg_flux2_klein_lora_moe_sr \
-  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_latent_concat_size256_flux2_klein_lora_moe_smoke256/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters \
+  --checkpoint exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_lora_moe_smoke256/checkpoints/checkpoint-XXXXXXXX/rg_flux_adapters \
   --config configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml \
   --jsonl_path datasets/inference_cleaned.jsonl \
+  --lr_cond_mode flux2_image_concat \
+  --no-use_prompt \
+  --no-use_suggestions \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16
 ```
 
-MoE 推理依赖 cleaned profile 构造 prompt，因此推荐使用 `datasets/inference_cleaned.jsonl` 或同结构 JSONL。若 JSONL 中找不到输入图片对应记录，推理脚本会跳过该图片并写入 `inference_failures.jsonl`。
+如果 `use_prompt=true`，MoE 推理依赖 cleaned profile 构造 prompt，推荐使用 `datasets/inference_cleaned.jsonl` 或同结构 JSONL。当前配置中 `use_prompt=false`、`use_suggestions=false` 时，所有图片使用固定 `DEFAULT_SR_PROMPT`；此时 JSONL 仅在还需要 degradation vector 或其他记录字段时才需要。若传入了 `--jsonl_path` 但找不到输入图片对应记录，推理脚本会跳过该图片并写入 `inference_failures.jsonl`。
 
 参数说明：
 
@@ -389,6 +499,7 @@ MoE 推理依赖 cleaned profile 构造 prompt，因此推荐使用 `datasets/in
 - `--output_dir`：SR 图片输出目录。
 - `--checkpoint`：训练保存的 adapter 目录，通常指向 `.../checkpoint-XXXXXXXX/rg_flux_adapters`。
 - `--config`：训练时使用的配置。推理会用其中的模型路径、条件模式等设置。
+- `--lr_cond_mode`：LR 条件模式；FLUX.2 新训练推荐 `flux2_image_concat`，并且必须与 checkpoint 的训练模式一致。
 - `--jsonl_path`：可选，用于读取 RG/VOSR 分析结果并构造 prompt 与 degradation vector。
 - `--num_inference_steps`：flow matching 采样步数，越大通常越慢。
 - `--upscale`：输入图先 bicubic 放大的倍率，默认超分倍率通常用 4。
@@ -480,7 +591,13 @@ eval/<exp_name>/step-XXXXXXXX/
 
 ### `lr_token_count`
 
-LR latent adapter 产生的条件 token 数。token 越多，条件信息越丰富，但显存也更高。smoke 配置中是 16，正式配置中是 64。
+该参数只影响 `latent_adapter` 和旧版 `latent_concat`：
+
+- `latent_adapter`：控制加入 text/context 序列的 LR 条件 token 数。
+- `latent_concat`：控制经过池化和 `concat_proj` 后加入 image 序列的 LR token 数。
+- `flux2_image_concat`：忽略该参数，直接使用完整的 FLUX.2 LR 空间 token；token 数由输入尺寸自动决定。
+
+对于当前推荐的 `flux2_image_concat`，不要通过增大 `lr_token_count` 来增强 LR 条件。
 
 ### `num_inference_steps`
 

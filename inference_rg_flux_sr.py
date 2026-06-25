@@ -146,6 +146,7 @@ def main(args):
     config["condition"]["use_prompt"] = args.use_prompt
     config["condition"]["use_degradation_vector"] = args.use_degradation_vector
     config["condition"]["use_suggestions"] = args.use_suggestions
+    lr_cond_mode = config["condition"]["lr_cond_mode"]
     if args.text_encoding_mode is not None:
         config["text_encoding"]["mode"] = args.text_encoding_mode
     if args.text_embedding_cache is not None:
@@ -221,7 +222,10 @@ def main(args):
         lq_up = lq_up.to(device=device, dtype=dtype)
 
         with torch.no_grad():
-            z_lr = artist.encode_images(lq_up).to(device=device, dtype=dtype)
+            z_lr = artist.encode_images(
+                lq_up,
+                sample=lr_cond_mode != "flux2_image_concat",
+            ).to(device=device, dtype=dtype)
             cache_image_key = str(image_path)
             if isinstance(condition, dict):
                 record = condition.get("record")
@@ -247,7 +251,7 @@ def main(args):
                 degradation_vector=degradation_vector,
                 z_lr=z_lr,
                 dino_tokens=dino_tokens,
-                lr_cond_mode=config["condition"]["lr_cond_mode"],
+                lr_cond_mode=lr_cond_mode,
                 num_steps=args.num_inference_steps,
                 device=device,
                 dtype=dtype,
@@ -270,7 +274,11 @@ if __name__ == "__main__":
     parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)
     parser.add_argument("--text_embedding_cache", default=None)
     parser.add_argument("--num_inference_steps", type=int, default=25)
-    parser.add_argument("--lr_cond_mode", choices=["latent_adapter", "latent_concat"], default=None)
+    parser.add_argument(
+        "--lr_cond_mode",
+        choices=["latent_adapter", "latent_concat", "flux2_image_concat"],
+        default=None,
+    )
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=True)

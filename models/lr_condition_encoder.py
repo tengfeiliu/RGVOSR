@@ -21,7 +21,7 @@ class LRConditionEncoder(nn.Module):
         self.image_token_dim = int(image_token_dim or latent_channels * 4)
         if self.num_tokens < 0:
             raise ValueError("num_tokens must be non-negative")
-        if mode not in {"latent_adapter", "latent_concat"}:
+        if mode not in {"latent_adapter", "latent_concat", "flux2_image_concat"}:
             raise ValueError(f"Unsupported LR condition mode: {mode}")
 
         self.adapter_proj = nn.Linear(self.latent_channels, self.context_dim)
@@ -44,6 +44,16 @@ class LRConditionEncoder(nn.Module):
 
     def forward(self, z_lr, mode=None):
         mode = mode or self.mode
+        if mode == "flux2_image_concat":
+            if z_lr.shape[1] != self.latent_channels:
+                raise ValueError(f"Expected {self.latent_channels} latent channels, got {z_lr.shape[1]}")
+            if self.latent_channels != self.image_token_dim:
+                raise ValueError(
+                    "flux2_image_concat requires packed LR latent channels to match the transformer image token dim, "
+                    f"got {self.latent_channels} and {self.image_token_dim}"
+                )
+            return z_lr.flatten(2).transpose(1, 2)
+
         tokens = self._pool_tokens(z_lr)
         if mode == "latent_adapter":
             tokens = self.adapter_proj(tokens.to(dtype=self.adapter_proj.weight.dtype))
