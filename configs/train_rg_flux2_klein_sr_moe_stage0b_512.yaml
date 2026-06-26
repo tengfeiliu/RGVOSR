@@ -8,19 +8,26 @@ model:
   vae_dtype: fp32
   max_prompt_sequence_length: 512
   use_lora: true
+  lora_backend: moe
   lora_rank: 32
   lora_alpha: 32
   gradient_checkpointing: false
   guidance_scale: 1.0
   latent_channels: 128
   context_dim: 15360
+  lora_moe:
+    num_routed_experts: 4
+    top_k: 2
+    latent_branch: stat_conv
+    router_hidden_dim: 1024
+    warmup_ratio: 0.1
+    init_temperature: 2.0
+    final_temperature: 0.7
+    shared_always_active: true
+    freeze_shared_during_warmup: true
+    init_from_single_lora: null
 
 text_encoding:
-  # mode: online
-  # cache_dir: null
-  # strict: true
-  # dtype: bf16
-  # validate_prompt_hash: true
   mode: cached
   cache_dir: datasets/text_embed_cache/flux2_klein_text_encoding
   strict: true
@@ -50,16 +57,18 @@ condition:
   visual_token_count: 64
 
 training:
-  stage: A
+  stage: "0B"
   freeze_flux_transformer: true
   unfreeze_last_n_blocks: 0
-  max_steps: 10000
+  max_steps: 20000
   lr_adapter: 1.0e-4
   lr_lora: 5.0e-5
   weight_decay: 0.01
   grad_accum_steps: 8
-  save_every: 2000
-  log_every: 2000
+  save_every: 1000
+  log_every: 1000
+  loss_record_every: 1
+  loss_record_formats: [jsonl, csv]
   output_dir: exp_rg_flux_sr
   logging_dir: logs
   report_to: none
@@ -76,7 +85,7 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_smoke256_v0621"
+  suffix: "_flux2_klein_lora_moe_stage0b512"
 
 flow_matching:
   sigma_sampling: uniform
@@ -96,5 +105,16 @@ evaluation:
 
 loss:
   fm_weight: 1.0
-  latent_weight: 0.0
-  perceptual_weight: 0.0
+  latent_weight: 0.10
+  charb_weight: 1.0
+  down_weight: 0.50
+  down_mode: area
+  lpips_weight: 0.25
+  lpips_warmup_start: 2000
+  lpips_warmup_end: 6000
+  lpips_resize: 256
+  image_loss_every: 1
+  lpips_every: 1
+  router_div_weight: 0.0
+  router_entropy_weight: 0.0
+  router_balance_weight: 0.0

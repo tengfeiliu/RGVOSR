@@ -9,8 +9,8 @@ model:
   max_prompt_sequence_length: 512
   use_lora: true
   lora_backend: moe
-  lora_rank: 8
-  lora_alpha: 8
+  lora_rank: 32
+  lora_alpha: 32
   gradient_checkpointing: false
   guidance_scale: 1.0
   latent_channels: 128

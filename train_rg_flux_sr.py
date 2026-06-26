@@ -1,5 +1,7 @@
 import argparse
 import copy
+import csv
+import datetime
 import inspect
 import json
 import logging
@@ -7,6 +9,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -38,6 +41,7 @@ from rg_flux_fm import build_flow_matching_inputs, sample_multistep_fm, sample_s
 
 
 logger = get_logger(__name__)
+_LPIPS_LOSS_MODEL = None
 
 
 def load_config(config_path):
@@ -63,6 +67,260 @@ def cfg_bool(config, path, default=False):
         if value in {"0", "false", "no", "n", "off", "none", "null", ""}:
             return False
     return bool(value)
+
+
+def normalize_loss_record_formats(formats):
+    if formats is None:
+        return ["jsonl", "csv"]
+    if isinstance(formats, str):
+        value = formats.strip()
+        if value.lower() in {"", "none", "null", "false", "off", "no"}:
+            return []
+        formats = [part.strip() for part in value.split(",")]
+    normalized = []
+    for item in formats:
+        value = str(item).strip().lower()
+        if value in {"jsonl", "csv"} and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+class LossHistoryRecorder:
+    def __init__(self, logging_dir, formats=("jsonl", "csv")):
+        self.logging_dir = Path(logging_dir)
+        self.logging_dir.mkdir(parents=True, exist_ok=True)
+        self.formats = normalize_loss_record_formats(formats)
+        self.jsonl_path = self.logging_dir / "loss_history.jsonl"
+        self.csv_path = self.logging_dir / "loss_history.csv"
+        self.summary_path = self.logging_dir / "loss_summary.json"
+        self.csv_fieldnames = None
+        if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
+            with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.reader(handle)
+                self.csv_fieldnames = next(reader, None)
+
+    @staticmethod
+    def _metric_value(value):
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "item"):
+            value = value.item()
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _record(self, global_step, logs):
+        record = {
+            "global_step": int(global_step),
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        for key, value in logs.items():
+            if key in {"global_step", "time"}:
+                continue
+            record[key] = self._metric_value(value)
+        return record
+
+    def _append_jsonl(self, record):
+        with self.jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _append_csv(self, record):
+        if self.csv_fieldnames is None:
+            self.csv_fieldnames = ["global_step", "time"] + [
+                key for key in record.keys() if key not in {"global_step", "time"}
+            ]
+        file_exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
+        with self.csv_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.csv_fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+
+    def _write_summary(self, record):
+        summary = {}
+        if self.summary_path.exists():
+            try:
+                summary = json.loads(self.summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                summary = {}
+        summary["last_step"] = int(record["global_step"])
+        summary["last"] = record
+        for key in ("loss_total", "loss_fm"):
+            if key not in record:
+                continue
+            min_key = f"min_{key}"
+            previous = summary.get(min_key)
+            previous_value = previous.get(key) if isinstance(previous, dict) else None
+            if previous_value is None or float(record[key]) <= float(previous_value):
+                summary[min_key] = record
+        self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def append(self, global_step, logs):
+        if not self.formats:
+            return
+        record = self._record(global_step, logs)
+        if "jsonl" in self.formats:
+            self._append_jsonl(record)
+        if "csv" in self.formats:
+            self._append_csv(record)
+        self._write_summary(record)
+
+
+def charbonnier_loss(x, y, eps=1e-3):
+    return torch.sqrt((x - y) ** 2 + eps ** 2).mean()
+
+
+def warmup_weight(global_step, start, end, max_weight):
+    max_weight = float(max_weight)
+    if max_weight <= 0:
+        return 0.0
+    start = int(start)
+    end = int(end)
+    if global_step < start:
+        return 0.0
+    if end <= start:
+        return max_weight
+    if global_step >= end:
+        return max_weight
+    return max_weight * float(global_step - start) / float(end - start)
+
+
+def should_compute_every(global_step, every):
+    every = int(every)
+    if every <= 1:
+        return True
+    return int(global_step) % every == 0
+
+
+def _interpolate_image(tensor, size=None, scale_factor=None, mode="area"):
+    kwargs = {"mode": mode}
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        kwargs["align_corners"] = False
+    return F.interpolate(tensor, size=size, scale_factor=scale_factor, **kwargs)
+
+
+def _get_lpips_loss_model(device):
+    global _LPIPS_LOSS_MODEL
+    if _LPIPS_LOSS_MODEL is None:
+        try:
+            import lpips
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "LPIPS loss requested but lpips package is not installed. "
+                "Set loss.lpips_weight=0 or install lpips."
+            ) from exc
+        model = lpips.LPIPS(net="alex")
+        model.requires_grad_(False)
+        model.eval()
+        _LPIPS_LOSS_MODEL = model
+    return _LPIPS_LOSS_MODEL.to(device)
+
+
+def _resize_hq_for_loss(hq, sr_pred):
+    hq = hq.to(device=sr_pred.device)
+    if hq.shape[-2:] == sr_pred.shape[-2:]:
+        return hq
+    if not getattr(_resize_hq_for_loss, "_warned", False):
+        logger.warning(
+            "HQ tensor size %s does not match decoded SR size %s; resizing HQ for image-space loss.",
+            tuple(hq.shape[-2:]),
+            tuple(sr_pred.shape[-2:]),
+        )
+        setattr(_resize_hq_for_loss, "_warned", True)
+    return _interpolate_image(hq.float(), size=sr_pred.shape[-2:], mode="bilinear")
+
+
+def _downsample_reference(batch, lq_up, sr_down, scale, down_mode):
+    lq = batch.get("lq") if isinstance(batch, dict) else None
+    if torch.is_tensor(lq) and lq.ndim == 4:
+        lr_ref = lq.to(device=sr_down.device, dtype=torch.float32)
+        if lr_ref.shape[-2:] != sr_down.shape[-2:]:
+            lr_ref = _interpolate_image(lr_ref, size=sr_down.shape[-2:], mode=down_mode)
+        return lr_ref
+    return _interpolate_image(
+        lq_up.to(device=sr_down.device, dtype=torch.float32),
+        scale_factor=1.0 / max(int(scale), 1),
+        mode=down_mode,
+    )
+
+
+def compute_stage0b_supervised_losses(
+    artist,
+    config,
+    global_step,
+    loss_fm,
+    z_t,
+    v_pred,
+    sigma,
+    z_hr,
+    hq,
+    lq_up,
+    batch=None,
+):
+    zero = loss_fm.new_zeros(())
+    latent_weight = float(cfg(config, "loss.latent_weight", 0.0))
+    charb_weight = float(cfg(config, "loss.charb_weight", 0.0))
+    down_weight = float(cfg(config, "loss.down_weight", 0.0))
+    lpips_max_weight = float(cfg(config, "loss.lpips_weight", 0.0))
+    image_loss_every = int(cfg(config, "loss.image_loss_every", 1))
+    lpips_every = int(cfg(config, "loss.lpips_every", 1))
+    lpips_weight_now = warmup_weight(
+        global_step,
+        start=int(cfg(config, "loss.lpips_warmup_start", 2000)),
+        end=int(cfg(config, "loss.lpips_warmup_end", 6000)),
+        max_weight=lpips_max_weight,
+    )
+    if not should_compute_every(global_step, lpips_every):
+        lpips_weight_now = 0.0
+
+    sigma_view = sigma.reshape(-1, *([1] * (z_t.ndim - 1))).to(device=z_t.device, dtype=z_t.dtype)
+    z0_pred = z_t - sigma_view * v_pred
+
+    loss_latent = zero
+    if latent_weight > 0:
+        loss_latent = charbonnier_loss(z0_pred.float(), z_hr.float())
+
+    image_loss_due = should_compute_every(global_step, image_loss_every)
+    needs_image_loss = image_loss_due and (charb_weight > 0 or down_weight > 0)
+    needs_lpips = lpips_weight_now > 0
+    sr_pred = None
+    loss_charb = zero
+    loss_down = zero
+    loss_lpips = zero
+    if needs_image_loss or needs_lpips:
+        sr_pred = artist.decode_latents_for_loss(z0_pred)
+        hq_for_loss = _resize_hq_for_loss(hq, sr_pred)
+        if image_loss_due and charb_weight > 0:
+            loss_charb = charbonnier_loss(sr_pred.float(), hq_for_loss.float())
+        if image_loss_due and down_weight > 0:
+            scale = int(cfg(config, "data.scale", 4))
+            down_mode = str(cfg(config, "loss.down_mode", "area"))
+            sr_down = _interpolate_image(sr_pred.float(), scale_factor=1.0 / max(scale, 1), mode=down_mode)
+            lr_ref = _downsample_reference(batch or {}, lq_up, sr_down, scale, down_mode)
+            loss_down = charbonnier_loss(sr_down, lr_ref)
+        if needs_lpips:
+            lpips_resize = cfg(config, "loss.lpips_resize", 256)
+            if lpips_resize is not None and int(lpips_resize) > 0:
+                lpips_size = int(lpips_resize)
+                sr_lpips = _interpolate_image(sr_pred.float(), size=(lpips_size, lpips_size), mode="bilinear")
+                hq_lpips = _interpolate_image(hq_for_loss.float(), size=(lpips_size, lpips_size), mode="bilinear")
+            else:
+                sr_lpips = sr_pred.float()
+                hq_lpips = hq_for_loss.float()
+            lpips_model = _get_lpips_loss_model(sr_lpips.device)
+            loss_lpips = lpips_model(sr_lpips, hq_lpips).mean()
+
+    return {
+        "z0_pred": z0_pred,
+        "loss_latent": loss_latent.to(device=loss_fm.device),
+        "loss_charb": loss_charb.to(device=loss_fm.device),
+        "loss_down": loss_down.to(device=loss_fm.device),
+        "loss_lpips": loss_lpips.to(device=loss_fm.device),
+        "loss_lpips_weight": float(lpips_weight_now),
+    }
 
 
 def normalize_report_to(report_to):
@@ -780,12 +1038,24 @@ def main(config_path, dry_run=False):
         disable=not accelerator.is_local_main_process,
     )
     fm_weight = float(cfg(config, "loss.fm_weight", 1.0))
+    latent_weight = float(cfg(config, "loss.latent_weight", 0.0))
+    charb_weight = float(cfg(config, "loss.charb_weight", 0.0))
+    down_weight = float(cfg(config, "loss.down_weight", 0.0))
     router_div_weight = float(cfg(config, "loss.router_div_weight", 0.0))
     router_entropy_weight = float(cfg(config, "loss.router_entropy_weight", 0.0))
     router_balance_weight = float(cfg(config, "loss.router_balance_weight", 0.0))
     checkpoint_dir = output_dir / "checkpoints"
     save_every = int(cfg(config, "training.save_every", 5000))
     log_every = int(cfg(config, "training.log_every", 100))
+    loss_record_every = int(cfg(config, "training.loss_record_every", 1))
+    loss_record_formats = normalize_loss_record_formats(
+        cfg(config, "training.loss_record_formats", ["jsonl", "csv"])
+    )
+    loss_recorder = (
+        LossHistoryRecorder(logging_dir, formats=loss_record_formats)
+        if accelerator.is_main_process and loss_record_every > 0 and loss_record_formats
+        else None
+    )
     sigma_sampling = cfg(config, "flow_matching.sigma_sampling", "uniform")
     lr_cond_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
 
@@ -840,7 +1110,31 @@ def main(config_path, dry_run=False):
                     if v_pred.shape != v_target.shape:
                         raise RuntimeError(f"v_pred shape {tuple(v_pred.shape)} != target {tuple(v_target.shape)}")
                     loss_fm = torch.nn.functional.mse_loss(v_pred.float(), v_target.float())
-                    loss = fm_weight * loss_fm
+                    supervised_losses = compute_stage0b_supervised_losses(
+                        artist=unwrapped_artist,
+                        config=config,
+                        global_step=global_step,
+                        loss_fm=loss_fm,
+                        z_t=z_t,
+                        v_pred=v_pred,
+                        sigma=sigma,
+                        z_hr=z_hr,
+                        hq=hq,
+                        lq_up=lq_up,
+                        batch=batch,
+                    )
+                    loss_latent = supervised_losses["loss_latent"]
+                    loss_charb = supervised_losses["loss_charb"]
+                    loss_lpips = supervised_losses["loss_lpips"]
+                    loss_lpips_weight = supervised_losses["loss_lpips_weight"]
+                    loss_down = supervised_losses["loss_down"]
+                    loss = (
+                        fm_weight * loss_fm
+                        + latent_weight * loss_latent
+                        + charb_weight * loss_charb
+                        + loss_lpips_weight * loss_lpips
+                        + down_weight * loss_down
+                    )
                     moe_aux = (
                         unwrapped_artist.moe_auxiliary_losses()
                         if hasattr(unwrapped_artist, "moe_auxiliary_losses")
@@ -866,28 +1160,37 @@ def main(config_path, dry_run=False):
             if accelerator.sync_gradients:
                 global_step += 1
                 progress_bar.update(1)
-                if accelerator.is_main_process and global_step % log_every == 0:
-                    logs = {
-                        "loss": loss.detach().item(),
-                        "loss_fm": loss_fm.detach().item(),
-                        "lr": lr_scheduler.get_last_lr()[0],
-                    }
-                    if loss_div is not None:
-                        logs["loss_div"] = loss_div.detach().item()
-                    if loss_entropy is not None:
-                        logs["loss_entropy"] = loss_entropy.detach().item()
-                    if loss_balance is not None:
-                        logs["loss_balance"] = loss_balance.detach().item()
-                    if moe_schedule.get("enabled"):
-                        logs["router/temperature"] = moe_schedule.get("temperature", 0.0)
-                        moe_logs = (
-                            unwrapped_artist.moe_log_stats()
-                            if hasattr(unwrapped_artist, "moe_log_stats")
-                            else {}
-                        )
-                        logs.update(moe_logs)
-                    progress_bar.set_postfix(**logs)
-                    accelerator.log(logs, step=global_step)
+                step_logs = {
+                    "loss": loss.detach().item(),
+                    "loss_total": loss.detach().item(),
+                    "loss_fm": loss_fm.detach().item(),
+                    "loss_latent": loss_latent.detach().item(),
+                    "loss_charb": loss_charb.detach().item(),
+                    "loss_lpips": loss_lpips.detach().item(),
+                    "loss_lpips_weight": float(loss_lpips_weight),
+                    "loss_down": loss_down.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+                if loss_div is not None:
+                    step_logs["loss_div"] = loss_div.detach().item()
+                if loss_entropy is not None:
+                    step_logs["loss_entropy"] = loss_entropy.detach().item()
+                if loss_balance is not None:
+                    step_logs["loss_balance"] = loss_balance.detach().item()
+                if moe_schedule.get("enabled"):
+                    step_logs["router/temperature"] = moe_schedule.get("temperature", 0.0)
+                    moe_logs = (
+                        unwrapped_artist.moe_log_stats()
+                        if hasattr(unwrapped_artist, "moe_log_stats")
+                        else {}
+                    )
+                    step_logs.update(moe_logs)
+                if accelerator.is_main_process:
+                    if loss_recorder is not None and global_step % loss_record_every == 0:
+                        loss_recorder.append(global_step, step_logs)
+                    if log_every > 0 and global_step % log_every == 0:
+                        progress_bar.set_postfix(**step_logs)
+                        accelerator.log(step_logs, step=global_step)
                 if save_every > 0 and global_step % save_every == 0:
                     save_rg_checkpoint(
                         accelerator,

@@ -562,6 +562,13 @@ class Flux2KleinSRArtist(nn.Module):
         latents = _unpatchify_latents(latents, self.vae_latent_channels)
         return self.vae.decode(latents.to(device=vae_device, dtype=vae_dtype), return_dict=False)[0]
 
+    def decode_latents_for_loss(self, latents):
+        vae_device = _module_device(self.vae)
+        vae_dtype = _module_dtype(self.vae, self.vae_dtype)
+        latents = self._denormalize_latents(latents)
+        latents = _unpatchify_latents(latents, self.vae_latent_channels)
+        return self.vae.decode(latents.to(device=vae_device, dtype=vae_dtype), return_dict=False)[0]
+
     @torch.no_grad()
     def encode_prompts(self, prompts, device=None, dtype=None):
         if self.text_pipeline is None:

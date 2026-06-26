@@ -1,6 +1,8 @@
 import json
 import ast
 import copy
+import csv
+import datetime
 import inspect
 import tempfile
 import unittest
@@ -601,6 +603,228 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertGreaterEqual(train_source.count(expected), 2)
         self.assertIn(expected, inference_source)
         self.assertIn(expected, init_source)
+
+    def test_flux2_stage0b_adds_trainable_decode_without_changing_inference_decode(self):
+        artist_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        tree = ast.parse(artist_source)
+        flux_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Flux2KleinSRArtist"
+        )
+        decode_for_loss = next(
+            (node for node in flux_class.body if isinstance(node, ast.FunctionDef) and node.name == "decode_latents_for_loss"),
+            None,
+        )
+        self.assertIsNotNone(decode_for_loss)
+        decorator_names = [
+            getattr(decorator, "attr", getattr(decorator, "id", ""))
+            for decorator in decode_for_loss.decorator_list
+        ]
+        self.assertNotIn("no_grad", decorator_names)
+        self.assertIn("self._denormalize_latents(latents)", artist_source)
+        self.assertIn("_unpatchify_latents(latents, self.vae_latent_channels)", artist_source)
+        self.assertIn("@torch.no_grad()\n    def decode_latents(self, latents):", artist_source)
+
+    def test_stage0b_training_loss_helpers_and_inference_stays_clean(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        inference_source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("def charbonnier_loss(", train_source)
+        self.assertIn("def warmup_weight(", train_source)
+        self.assertIn("def should_compute_every(", train_source)
+        self.assertIn("def compute_stage0b_supervised_losses(", train_source)
+        self.assertIn('cfg(config, "loss.charb_weight", 0.0)', train_source)
+        self.assertIn('cfg(config, "loss.down_weight", 0.0)', train_source)
+        self.assertIn('cfg(config, "loss.lpips_weight", 0.0)', train_source)
+        self.assertIn("z0_pred = z_t - sigma_view * v_pred", train_source)
+        self.assertIn("decode_latents_for_loss(z0_pred)", train_source)
+        self.assertIn("loss_lpips_weight", train_source)
+        self.assertIn("loss_total", train_source)
+        self.assertNotIn("decode_latents_for_loss", inference_source)
+        self.assertNotIn("compute_stage0b_supervised_losses", inference_source)
+
+    def test_loss_history_recorder_writes_jsonl_csv_and_summary(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"normalize_loss_record_formats", "LossHistoryRecorder"}
+        nodes = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                and node.name in wanted
+            )
+        ]
+        self.assertEqual({node.name for node in nodes}, wanted)
+
+        namespace = {
+            "csv": csv,
+            "datetime": datetime,
+            "json": json,
+            "Path": Path,
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "train_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = namespace["LossHistoryRecorder"](tmp, formats=["jsonl", "csv"])
+            recorder.append(
+                1,
+                {
+                    "loss_total": 1.5,
+                    "loss_fm": 1.2,
+                    "loss_charb": 0.3,
+                    "router/entropy": 0.8,
+                },
+            )
+            recorder.append(
+                2,
+                {
+                    "loss_total": 1.0,
+                    "loss_fm": 0.9,
+                    "loss_charb": 0.2,
+                    "router/entropy": 0.7,
+                },
+            )
+
+            root = Path(tmp)
+            jsonl_rows = [
+                json.loads(line)
+                for line in (root / "loss_history.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([row["global_step"] for row in jsonl_rows], [1, 2])
+            self.assertEqual(jsonl_rows[0]["loss_total"], 1.5)
+            self.assertIn("time", jsonl_rows[0])
+
+            with (root / "loss_history.csv").open("r", encoding="utf-8", newline="") as handle:
+                csv_rows = list(csv.DictReader(handle))
+            self.assertEqual([row["global_step"] for row in csv_rows], ["1", "2"])
+            self.assertEqual(csv_rows[1]["loss_fm"], "0.9")
+
+            summary = json.loads((root / "loss_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["last_step"], 2)
+            self.assertEqual(summary["last"]["loss_total"], 1.0)
+            self.assertEqual(summary["min_loss_total"]["global_step"], 2)
+            self.assertEqual(summary["min_loss_fm"]["global_step"], 2)
+
+    def test_training_loop_records_loss_history_on_optimizer_steps(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("loss_history.jsonl", train_source)
+        self.assertIn("loss_history.csv", train_source)
+        self.assertIn("loss_summary.json", train_source)
+        self.assertIn('cfg(config, "training.loss_record_every", 1)', train_source)
+        self.assertIn('cfg(config, "training.loss_record_formats", ["jsonl", "csv"])', train_source)
+        self.assertIn("loss_recorder.append(global_step, step_logs)", train_source)
+        self.assertIn("step_logs = {", train_source)
+        self.assertIn('"loss_total": loss.detach().item()', train_source)
+        self.assertIn('"loss_lpips_weight": float(loss_lpips_weight)', train_source)
+
+    @unittest.skipIf(torch is None, "torch is not installed in this environment")
+    def test_stage0b_loss_helpers_values_and_backward(self):
+        from train_rg_flux_sr import charbonnier_loss, should_compute_every, warmup_weight
+
+        x = torch.tensor([0.0, 1.0], requires_grad=True)
+        y = torch.tensor([0.0, 0.0])
+        loss = charbonnier_loss(x, y, eps=1e-3)
+        self.assertGreater(float(loss.item()), 0.5)
+        loss.backward()
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+
+        self.assertEqual(warmup_weight(10, 20, 40, 0.25), 0.0)
+        self.assertAlmostEqual(warmup_weight(30, 20, 40, 0.25), 0.125)
+        self.assertEqual(warmup_weight(50, 20, 40, 0.25), 0.25)
+        self.assertEqual(warmup_weight(10, 20, 20, 0.25), 0.0)
+        self.assertEqual(warmup_weight(20, 20, 20, 0.25), 0.25)
+        self.assertTrue(should_compute_every(7, 1))
+        self.assertTrue(should_compute_every(8, 4))
+        self.assertFalse(should_compute_every(9, 4))
+
+    @unittest.skipIf(torch is None, "torch is not installed in this environment")
+    def test_stage0b_zero_weights_skip_decode_and_charb_backward_uses_decode(self):
+        from train_rg_flux_sr import compute_stage0b_supervised_losses
+
+        class DummyArtist:
+            def __init__(self):
+                self.decode_calls = 0
+
+            def decode_latents_for_loss(self, latents):
+                self.decode_calls += 1
+                return latents
+
+        z_t = torch.randn(1, 3, 4, 4)
+        v_pred = torch.randn(1, 3, 4, 4, requires_grad=True)
+        z_hr = torch.randn(1, 3, 4, 4)
+        sigma = torch.full((1,), 0.5)
+        hq = torch.randn(1, 3, 4, 4)
+        lq_up = torch.randn(1, 3, 4, 4)
+        loss_fm = torch.nn.functional.mse_loss(v_pred.float(), torch.zeros_like(v_pred).float())
+
+        zero_artist = DummyArtist()
+        zero_losses = compute_stage0b_supervised_losses(
+            artist=zero_artist,
+            config={"loss": {}},
+            global_step=1,
+            loss_fm=loss_fm,
+            z_t=z_t,
+            v_pred=v_pred,
+            sigma=sigma,
+            z_hr=z_hr,
+            hq=hq,
+            lq_up=lq_up,
+            batch={},
+        )
+        self.assertEqual(zero_artist.decode_calls, 0)
+        self.assertEqual(float(zero_losses["loss_latent"].item()), 0.0)
+        self.assertEqual(float(zero_losses["loss_charb"].item()), 0.0)
+        self.assertEqual(float(zero_losses["loss_down"].item()), 0.0)
+        self.assertEqual(float(zero_losses["loss_lpips"].item()), 0.0)
+
+        charb_artist = DummyArtist()
+        charb_losses = compute_stage0b_supervised_losses(
+            artist=charb_artist,
+            config={"loss": {"charb_weight": 1.0}},
+            global_step=1,
+            loss_fm=loss_fm,
+            z_t=z_t,
+            v_pred=v_pred,
+            sigma=sigma,
+            z_hr=z_hr,
+            hq=hq,
+            lq_up=lq_up,
+            batch={},
+        )
+        self.assertEqual(charb_artist.decode_calls, 1)
+        charb_losses["loss_charb"].backward()
+        self.assertIsNotNone(v_pred.grad)
+
+    def test_stage0b_configs_cover_single_and_moe_backends(self):
+        single_path = Path("configs/train_rg_flux2_klein_sr_stage0b_512.yaml")
+        moe_path = Path("configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml")
+        self.assertTrue(single_path.exists())
+        self.assertTrue(moe_path.exists())
+
+        single_config = yaml.safe_load(single_path.read_text(encoding="utf-8"))
+        moe_config = yaml.safe_load(moe_path.read_text(encoding="utf-8"))
+        for config in (single_config, moe_config):
+            self.assertEqual(config["model"]["flux_backend"], "flux2_klein")
+            self.assertEqual(config["condition"]["lr_cond_mode"], "flux2_image_concat")
+            self.assertEqual(config["loss"]["fm_weight"], 1.0)
+            self.assertEqual(config["loss"]["latent_weight"], 0.10)
+            self.assertEqual(config["loss"]["charb_weight"], 1.0)
+            self.assertEqual(config["loss"]["down_weight"], 0.50)
+            self.assertEqual(config["loss"]["down_mode"], "area")
+            self.assertEqual(config["loss"]["lpips_weight"], 0.25)
+            self.assertEqual(config["loss"]["lpips_warmup_start"], 2000)
+            self.assertEqual(config["loss"]["lpips_warmup_end"], 6000)
+            self.assertEqual(config["loss"]["lpips_resize"], 256)
+            self.assertEqual(config["loss"]["image_loss_every"], 1)
+            self.assertEqual(config["loss"]["lpips_every"], 1)
+            self.assertEqual(config["loss"]["router_div_weight"], 0.0)
+            self.assertEqual(config["loss"]["router_entropy_weight"], 0.0)
+            self.assertEqual(config["loss"]["router_balance_weight"], 0.0)
+        self.assertNotEqual(single_config["model"].get("lora_backend"), "moe")
+        self.assertEqual(moe_config["model"]["lora_backend"], "moe")
+        self.assertIn("lora_moe", moe_config["model"])
 
     def test_flux2_lora_moe_backend_is_optional_and_checkpoint_is_separate(self):
         source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
