@@ -72,15 +72,110 @@ def parse_dataset_dirs(dataset_dirs):
     return datasets
 
 
-def resolve_inference_datasets(args):
+def resolve_inference_datasets(args, output_dir=None):
+    output_dir = Path(output_dir if output_dir is not None else args.output_dir)
     if args.dataset_dirs:
         datasets = []
         for dataset_name, input_path in parse_dataset_dirs(args.dataset_dirs):
-            datasets.append((dataset_name, input_path, Path(args.output_dir) / dataset_name))
+            datasets.append((dataset_name, input_path, output_dir / dataset_name))
         return datasets
     if args.input:
-        return [("default", Path(args.input), Path(args.output_dir))]
+        return [("default", Path(args.input), output_dir)]
     raise ValueError("Either --input or --dataset_dirs is required.")
+
+
+def format_checkpoint_step(checkpoint_step):
+    value = str(checkpoint_step or "").strip()
+    if not value:
+        raise ValueError("--checkpoint_step is required when --run_dir is used.")
+    if value.lower() == "latest":
+        return "latest"
+    if value.startswith("checkpoint-"):
+        value = value[len("checkpoint-") :]
+    try:
+        step = int(value)
+    except ValueError as exc:
+        raise ValueError(f"--checkpoint_step must be an integer step, checkpoint-XXXXXXXX, or latest: {checkpoint_step}") from exc
+    if step < 0:
+        raise ValueError(f"--checkpoint_step must be non-negative: {checkpoint_step}")
+    return f"checkpoint-{step:08d}"
+
+
+def find_latest_run_checkpoint(run_dir):
+    checkpoint_root = Path(run_dir) / "checkpoints"
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Run checkpoint directory does not exist: {checkpoint_root}")
+    candidates = sorted(path for path in checkpoint_root.glob("checkpoint-*") if path.is_dir())
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint-* directories found under: {checkpoint_root}")
+    return candidates[-1]
+
+
+def infer_checkpoint_step(checkpoint_path):
+    path = Path(checkpoint_path)
+    for item in [path, *path.parents]:
+        if item.name.startswith("checkpoint-"):
+            return item.name
+    return None
+
+
+def resolve_inference_run(args):
+    if args.run_dir:
+        if args.checkpoint or args.output_dir:
+            raise ValueError("--run_dir cannot be combined with --checkpoint or --output_dir. Use --output_root.")
+        if not args.output_root:
+            raise ValueError("--output_root is required when --run_dir is used.")
+        checkpoint_step = format_checkpoint_step(args.checkpoint_step)
+        run_dir = Path(args.run_dir)
+        checkpoint_dir = (
+            find_latest_run_checkpoint(run_dir)
+            if checkpoint_step == "latest"
+            else run_dir / "checkpoints" / checkpoint_step
+        )
+        checkpoint = checkpoint_dir / "rg_flux_adapters"
+        output_dir = Path(args.output_root) / run_dir.name / checkpoint_dir.name
+        return {
+            "run_dir": run_dir,
+            "checkpoint": checkpoint,
+            "checkpoint_step": checkpoint_dir.name,
+            "output_dir": output_dir,
+        }
+
+    if args.checkpoint_step or args.output_root:
+        raise ValueError("--checkpoint_step and --output_root require --run_dir.")
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --run_dir is used.")
+    if not args.output_dir:
+        raise ValueError("--output_dir is required unless --run_dir is used.")
+    checkpoint = Path(args.checkpoint)
+    return {
+        "run_dir": None,
+        "checkpoint": checkpoint,
+        "checkpoint_step": infer_checkpoint_step(checkpoint),
+        "output_dir": Path(args.output_dir),
+    }
+
+
+def write_inference_manifest(manifest_path, run_dir, checkpoint_step, checkpoint_path, output_dir, datasets):
+    manifest_path = Path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_dir": str(run_dir) if run_dir is not None else None,
+        "checkpoint_step": checkpoint_step,
+        "checkpoint_path": str(checkpoint_path),
+        "output_dir": str(output_dir),
+        "datasets": [
+            {
+                "name": dataset_name,
+                "input_path": str(input_path),
+                "output_dir": str(dataset_output_dir),
+            }
+            for dataset_name, input_path, dataset_output_dir in datasets
+        ],
+    }
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    return payload
 
 
 def load_jsonl_conditions(jsonl_path):
@@ -269,7 +364,8 @@ def run_inference_dataset(
 
 
 def main(args):
-    config = load_config(args.checkpoint, args.config)
+    resolved_run = resolve_inference_run(args)
+    config = load_config(resolved_run["checkpoint"], args.config)
     config.setdefault("condition", {})
     config.setdefault("text_encoding", {})
     config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
@@ -292,7 +388,7 @@ def main(args):
     np.random.seed(args.seed)
 
     artist = build_rg_flux_artist(config).to(device=device)
-    artist.load_trainable(args.checkpoint, is_trainable=False)
+    artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)
     artist.eval()
     text_embedding_cache = get_text_embedding_cache(
         config,
@@ -302,7 +398,8 @@ def main(args):
         artist.set_moe_training_schedule(global_step=1, max_steps=1)
 
     condition_index = load_jsonl_conditions(args.jsonl_path)
-    for dataset_name, input_path, output_dir in resolve_inference_datasets(args):
+    datasets = resolve_inference_datasets(args, output_dir=resolved_run["output_dir"])
+    for dataset_name, input_path, output_dir in datasets:
         run_inference_dataset(
             dataset_name=dataset_name,
             input_path=input_path,
@@ -316,6 +413,14 @@ def main(args):
             dtype=dtype,
             lr_cond_mode=lr_cond_mode,
         )
+    write_inference_manifest(
+        manifest_path=resolved_run["output_dir"] / "inference_manifest.json",
+        run_dir=resolved_run["run_dir"],
+        checkpoint_step=resolved_run["checkpoint_step"],
+        checkpoint_path=resolved_run["checkpoint"],
+        output_dir=resolved_run["output_dir"],
+        datasets=datasets,
+    )
 
 
 def build_arg_parser():
@@ -328,8 +433,19 @@ def build_arg_parser():
         default=None,
         help="Multiple datasets as name=folder_path entries. Outputs are written to output_dir/name.",
     )
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--checkpoint", required=True, help="RG-FLUX-SR-MS adapter checkpoint directory.")
+    parser.add_argument("--output_dir", default=None, help="Legacy direct output directory. Required with --checkpoint.")
+    parser.add_argument("--checkpoint", default=None, help="Legacy RG-FLUX-SR-MS adapter checkpoint directory.")
+    parser.add_argument("--run_dir", default=None, help="Experiment run directory containing checkpoints/ and args.json.")
+    parser.add_argument(
+        "--checkpoint_step",
+        default=None,
+        help="Checkpoint step used with --run_dir, e.g. 32000, checkpoint-00032000, or latest.",
+    )
+    parser.add_argument(
+        "--output_root",
+        default=None,
+        help="Output root used with --run_dir. Results are written to output_root/run_name/checkpoint-XXXXXXXX.",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--jsonl_path", default=None)
     parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)

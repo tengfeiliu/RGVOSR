@@ -93,6 +93,7 @@ class LossHistoryRecorder:
         self.jsonl_path = self.logging_dir / "loss_history.jsonl"
         self.csv_path = self.logging_dir / "loss_history.csv"
         self.summary_path = self.logging_dir / "loss_summary.json"
+        self.plot_path = self.logging_dir / "loss_curves.png"
         self.csv_fieldnames = None
         if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
             with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -157,6 +158,166 @@ class LossHistoryRecorder:
             if previous_value is None or float(record[key]) <= float(previous_value):
                 summary[min_key] = record
         self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def _as_float(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if value != value or value in {float("inf"), float("-inf")}:
+            return None
+        return value
+
+    def _load_records_for_plot(self):
+        records = []
+        if self.jsonl_path.exists():
+            for line in self.jsonl_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                records.append(record)
+        elif self.csv_path.exists():
+            with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
+                records.extend(csv.DictReader(handle))
+        return records
+
+    @staticmethod
+    def _loss_keys_for_plot(records):
+        preferred = [
+            "loss_total",
+            "loss_fm",
+            "loss_latent",
+            "loss_charb",
+            "loss_lpips",
+            "loss_down",
+            "loss_div",
+            "loss_entropy",
+            "loss_balance",
+        ]
+        keys = []
+        all_keys = []
+        for record in records:
+            all_keys.extend(record.keys())
+        for key in preferred:
+            if key in all_keys and key not in keys:
+                keys.append(key)
+        for key in all_keys:
+            if key.startswith("loss_") and key != "loss_lpips_weight" and key not in keys:
+                keys.append(key)
+        if "loss_total" not in keys and "loss" in all_keys:
+            keys.insert(0, "loss")
+        return keys
+
+    def _plot_snapshot_path(self, step):
+        return self.logging_dir / f"loss_curves_step-{int(step):08d}.png"
+
+    def write_plot(self, step=None):
+        from PIL import Image, ImageDraw, ImageFont
+
+        records = self._load_records_for_plot()
+        width, height = 1200, 720
+        left, top, right, bottom = 90, 55, 930, 625
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default()
+        title = "RG-FLUX-SR training loss curves"
+        draw.text((left, 20), title, fill=(0, 0, 0), font=font)
+        draw.text((width - 245, 20), "loss vs. step", fill=(80, 80, 80), font=font)
+
+        series = {}
+        steps = []
+        for record in records:
+            step_value = self._as_float(record.get("global_step"))
+            if step_value is None:
+                continue
+            steps.append(step_value)
+        keys = self._loss_keys_for_plot(records)
+        for key in keys:
+            values = []
+            for record in records:
+                step_value = self._as_float(record.get("global_step"))
+                loss_value = self._as_float(record.get(key))
+                if step_value is not None and loss_value is not None:
+                    values.append((step_value, loss_value))
+            if values:
+                series[key] = values
+
+        draw.rectangle((left, top, right, bottom), outline=(30, 30, 30), width=1)
+        if not steps or not series:
+            draw.text((left + 20, top + 20), "No numeric loss records yet.", fill=(90, 90, 90), font=font)
+        else:
+            x_min, x_max = min(steps), max(steps)
+            all_values = [value for values in series.values() for _, value in values]
+            y_min, y_max = min(all_values), max(all_values)
+            if y_min >= 0:
+                y_min = 0.0
+            if x_min == x_max:
+                x_max = x_min + 1.0
+            if y_min == y_max:
+                pad = abs(y_min) * 0.1 if y_min else 1.0
+                y_min -= pad
+                y_max += pad
+
+            def x_pos(value):
+                return left + (float(value) - x_min) / (x_max - x_min) * (right - left)
+
+            def y_pos(value):
+                return bottom - (float(value) - y_min) / (y_max - y_min) * (bottom - top)
+
+            for i in range(6):
+                ratio = i / 5.0
+                y = top + ratio * (bottom - top)
+                value = y_max - ratio * (y_max - y_min)
+                draw.line((left, y, right, y), fill=(230, 230, 230), width=1)
+                draw.text((10, y - 6), f"{value:.4g}", fill=(70, 70, 70), font=font)
+            for i in range(6):
+                ratio = i / 5.0
+                x = left + ratio * (right - left)
+                value = x_min + ratio * (x_max - x_min)
+                draw.line((x, top, x, bottom), fill=(242, 242, 242), width=1)
+                draw.text((x - 16, bottom + 12), f"{int(round(value))}", fill=(70, 70, 70), font=font)
+
+            palette = [
+                (31, 119, 180),
+                (255, 127, 14),
+                (44, 160, 44),
+                (214, 39, 40),
+                (148, 103, 189),
+                (140, 86, 75),
+                (227, 119, 194),
+                (127, 127, 127),
+                (188, 189, 34),
+                (23, 190, 207),
+            ]
+            legend_x, legend_y = right + 25, top
+            for index, (key, values) in enumerate(series.items()):
+                color = palette[index % len(palette)]
+                points = [(x_pos(step_value), y_pos(loss_value)) for step_value, loss_value in values]
+                if len(points) == 1:
+                    x, y = points[0]
+                    draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
+                else:
+                    draw.line(points, fill=color, width=2)
+                draw.rectangle(
+                    (legend_x, legend_y + index * 22 + 3, legend_x + 12, legend_y + index * 22 + 15),
+                    fill=color,
+                )
+                draw.text((legend_x + 18, legend_y + index * 22), key, fill=(0, 0, 0), font=font)
+
+            draw.text(((left + right) // 2 - 20, height - 45), "step", fill=(0, 0, 0), font=font)
+            draw.text((12, top - 25), "loss", fill=(0, 0, 0), font=font)
+
+        image.save(self.plot_path)
+        if step is not None:
+            image.save(self._plot_snapshot_path(step))
+        return self.plot_path
 
     def append(self, global_step, logs):
         if not self.formats:
@@ -667,6 +828,34 @@ def make_experiment_name(config):
     return f"rg_flux_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
 
 
+def format_run_id(now=None):
+    now = now or datetime.datetime.now()
+    return now.strftime("%y%m%d%H")
+
+
+def resolve_experiment_name(config, output_root=None, now=None):
+    explicit_name = cfg(config, "training.exp_name", None)
+    if explicit_name:
+        return str(explicit_name), None
+
+    base_name = make_experiment_name(config)
+    if not cfg_bool(config, "training.add_datetime_suffix", True):
+        return base_name, None
+
+    run_id = str(cfg(config, "training.run_id", None) or format_run_id(now))
+    exp_name = f"{base_name}_{run_id}"
+    if output_root is None:
+        return exp_name, run_id
+
+    output_root = Path(output_root)
+    candidate = exp_name
+    retry_index = 2
+    while (output_root / candidate).exists():
+        candidate = f"{exp_name}_r{retry_index:02d}"
+        retry_index += 1
+    return candidate, run_id
+
+
 def load_evaluation_records(jsonl_path, num_samples):
     jsonl_path = Path(jsonl_path)
     if not jsonl_path.exists():
@@ -864,9 +1053,14 @@ def main(config_path, dry_run=False):
     config.setdefault("evaluation", {})
     config.setdefault("text_encoding", {})
 
-    report_to = normalize_report_to(cfg(config, "training.report_to", None))
-    exp_name = cfg(config, "training.exp_name", None) or make_experiment_name(config)
     output_root = Path(cfg(config, "training.output_dir", "exp_rg_flux_sr"))
+    report_to = normalize_report_to(cfg(config, "training.report_to", None))
+    exp_name, resolved_run_id = resolve_experiment_name(config, output_root=output_root)
+    config["training"]["resolved_exp_name"] = exp_name
+    if resolved_run_id is None:
+        config["training"].pop("resolved_run_id", None)
+    else:
+        config["training"]["resolved_run_id"] = resolved_run_id
     output_dir = output_root / exp_name
     logging_dir = output_dir / cfg(config, "training.logging_dir", "logs")
     per_device_batch = int(cfg(config, "data.batch_size", 1))
@@ -1090,6 +1284,7 @@ def main(config_path, dry_run=False):
     save_every = int(cfg(config, "training.save_every", 5000))
     log_every = int(cfg(config, "training.log_every", 100))
     loss_record_every = int(cfg(config, "training.loss_record_every", 1))
+    loss_plot_every = int(cfg(config, "training.loss_plot_every", save_every))
     loss_record_formats = normalize_loss_record_formats(
         cfg(config, "training.loss_record_formats", ["jsonl", "csv"])
     )
@@ -1242,6 +1437,13 @@ def main(config_path, dry_run=False):
                         checkpoint_dir / f"checkpoint-{global_step:08d}",
                         global_step,
                     )
+                if (
+                    accelerator.is_main_process
+                    and loss_recorder is not None
+                    and loss_plot_every > 0
+                    and global_step % loss_plot_every == 0
+                ):
+                    loss_recorder.write_plot(step=global_step)
                 eval_summary = run_rg_flux_evaluation(
                     accelerator,
                     artist,
@@ -1265,6 +1467,8 @@ def main(config_path, dry_run=False):
         checkpoint_dir / f"checkpoint-{global_step:08d}",
         global_step,
     )
+    if accelerator.is_main_process and loss_recorder is not None:
+        loss_recorder.write_plot(step=global_step)
     accelerator.wait_for_everyone()
     accelerator.end_training()
 

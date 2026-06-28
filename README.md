@@ -472,6 +472,130 @@ python inference_rg_flux_sr.py \
 
 通常无需显式传入 `--lr_cond_mode`，因为配置文件已经设置为 `flux2_image_concat`；这里保留该参数是为了强调推理条件模式必须与训练一致。当前配置的 `use_prompt=false`、`use_suggestions=false` 会被独立推理 CLI 的默认值覆盖，因此必须显式传入两个 `--no-*` 参数。
 
+#### FLUX.2-klein 多数据集批量推理
+
+`inference_rg_flux_sr.py` 也支持一次加载模型后连续推理多个 LR 文件夹。多数据集模式使用 `--dataset_dirs name=folder_path ...`，并且 `--output_dir` 表示总输出根目录；脚本会自动在下面创建每个数据集自己的子目录。
+
+```bash
+python inference_rg_flux_sr.py \
+  --dataset_dirs \
+    realLQ250=/data/datasets/omgsr_eval/RealLQ250/lq \
+    realLR200=/data/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --run_dir exp_rg_flux_sr/rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_smoke256_v0621_26062810 \
+  --checkpoint_step 32000 \
+  --output_root eval/inference/rg_flux2_cached_fixed_prompt \
+  --config configs/train_rg_flux2_klein_sr_smoke_256.yaml \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16
+```
+
+输出目录会是：
+
+```text
+eval/inference/rg_flux2_cached_fixed_prompt/
+`-- rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_smoke256_v0621_26062810/
+    `-- checkpoint-00032000/
+        |-- realLQ250/
+        |   |-- *.png
+        |   `-- inference_failures.jsonl
+        |-- realLR200/
+        |   |-- *.png
+        |   `-- inference_failures.jsonl
+        `-- inference_manifest.json
+```
+
+推荐使用 `--run_dir + --checkpoint_step + --output_root`，这样只需要在一个地方修改 checkpoint step。脚本会自动推导 `checkpoint-00032000/rg_flux_adapters` 和输出目录，并写出 `inference_manifest.json`。后续指标评估可以直接读取该 manifest：
+
+```bash
+python eval_rg_flux_sr_metrics.py \
+  --inference_manifest eval/inference/rg_flux2_cached_fixed_prompt/rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_smoke256_v0621_26062810/checkpoint-00032000/inference_manifest.json \
+  --device cuda \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa
+```
+
+旧的 `--checkpoint ... --output_dir ...` 方式仍然兼容。使用旧方式时，不要把 `--output_dir` 写成 `.../RealLQ250` 这类单个数据集目录；多数据集模式会自动追加 `dataset_name`，否则路径会变成 `.../RealLQ250/realLQ250` 和 `.../RealLQ250/realLR200`。
+
+### 一键训练-推理-评估 Pipeline
+
+如果希望从训练到多个 checkpoint 推理、再到多个数据集评估都无需手动串命令，可以使用：
+
+```bash
+python tools/run_rg_flux_pipeline.py \
+  --train_config configs/train_rg_flux2_klein_sr_stage0b_512.yaml \
+  --accelerate_config configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 1 \
+  --checkpoint_steps 20000 40000 \
+  --dataset_dirs \
+    realLQ250=/data/datasets/omgsr_eval/RealLQ250/lq \
+    realLR200=/data/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --inference_output_root eval/inference/rg_flux2_cached_fixed_prompt \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda
+```
+
+脚本会先复制训练 YAML 到本次 run 目录下的 `pipeline_runtime_config.yaml`，并写入固定的 `training.exp_name`，所以原始配置文件不会被修改。训练完成后，它会依次处理 `checkpoint-00020000`、`checkpoint-00040000`，每个节点都会先对所有 `--dataset_dirs` 推理，再用对应的 `inference_manifest.json` 自动评估。
+
+输出结构类似：
+
+```text
+eval/inference/rg_flux2_cached_fixed_prompt/
+`-- <run_name>/
+    |-- checkpoint-00020000/
+    |   |-- realLQ250/
+    |   |-- realLR200/
+    |   |-- inference_manifest.json
+    |   `-- metrics/
+    `-- checkpoint-00040000/
+        |-- realLQ250/
+        |-- realLR200/
+        |-- inference_manifest.json
+        `-- metrics/
+```
+
+每次 pipeline 还会写出：
+
+```text
+exp_rg_flux_sr/<run_name>/pipeline_manifest.json
+```
+
+其中记录 runtime config、checkpoint path、每个推理 manifest、metrics 输出目录和子命令返回状态。
+
+如果训练已经完成，只想对已有 run 补跑多个 checkpoint 的推理和评估：
+
+```bash
+python tools/run_rg_flux_pipeline.py \
+  --skip_train \
+  --run_dir exp_rg_flux_sr/<existing_run> \
+  --checkpoint_steps 20000 40000 latest \
+  --dataset_dirs \
+    realLQ250=/data/datasets/omgsr_eval/RealLQ250/lq \
+    realLR200=/data/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --inference_output_root eval/inference/rg_flux2_cached_fixed_prompt \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda
+```
+
+`latest` 会解析为 `<run_dir>/checkpoints/` 下最新的 `checkpoint-*` 目录。若指定 checkpoint 或 `rg_flux_adapters` 不存在，脚本会直接报错，避免静默跳过导致后续评估混乱。v1 版本默认等训练完全结束后再推理和评估，不会在训练中并发抢 GPU 显存。
+
 ### FLUX.2-klein LoRA-MoE Checkpoint 推理
 
 MoE 推理仍然使用同一个 `inference_rg_flux_sr.py`。只要 `--config` 指向 MoE 配置，`--checkpoint` 指向包含 `flux2_klein_lora_moe_state.pt` 的 `rg_flux_adapters` 目录，脚本会自动启用 Top-2 routing。
@@ -606,6 +730,50 @@ eval/<exp_name>/step-XXXXXXXX/
 - `10`：更快，质量可能不稳定。
 - `25`：默认推荐值。
 - `50`：更慢，质量收益不一定线性。
+
+### `training.add_datetime_suffix` / `training.run_id`
+
+默认情况下，如果没有显式设置 `training.exp_name`，训练实验目录会自动在原有名字后追加小时级 run id，例如 `_26062810`，避免同一个 `suffix` 重复启动时覆盖旧实验：
+
+```yaml
+training:
+  add_datetime_suffix: true
+  run_id: null
+```
+
+如果希望手动固定 run id，可以设置：
+
+```yaml
+training:
+  run_id: 26062810
+```
+
+如果目标实验目录已经存在，脚本会自动追加 `_r02`、`_r03`。如果需要严格恢复某个旧实验目录，请显式设置完整的 `training.exp_name`。
+
+### Loss 数值记录与曲线图
+
+训练主进程会在日志目录里记录 loss 数值：
+
+```text
+exp_rg_flux_sr/<run_name>/logs/
+|-- loss_history.jsonl
+|-- loss_history.csv
+|-- loss_summary.json
+`-- loss_curves.png
+```
+
+`loss_curves.png` 会把 `loss_total`、`loss_fm`、`loss_latent`、`loss_charb`、`loss_lpips`、`loss_down` 以及可用的 MoE router loss 画在同一张图上，横坐标为 step，纵坐标为 loss。默认绘图频率跟随 `training.save_every`，也就是每次保存 checkpoint 时更新一次；同时会保留对应 step 的快照：
+
+```text
+loss_curves_step-00032000.png
+```
+
+如需单独调整绘图频率，可以设置：
+
+```yaml
+training:
+  loss_plot_every: 5000
+```
 
 ### `resume_ckpt`
 

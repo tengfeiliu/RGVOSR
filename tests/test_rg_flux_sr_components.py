@@ -282,6 +282,56 @@ class RGFluxSRComponentTests(unittest.TestCase):
             self.assertEqual(namespace["resolve_resume_checkpoint"](output_dir, None, auto_resume=True), latest)
             self.assertEqual(namespace["resolve_resume_checkpoint"](output_dir, str(manual), auto_resume=False), manual)
 
+    def test_experiment_name_adds_datetime_run_id_and_avoids_collisions(self):
+        source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"cfg", "cfg_bool", "make_experiment_name", "format_run_id", "resolve_experiment_name"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"datetime": datetime, "Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "train_rg_flux_sr.py", "exec"), namespace)
+        config = {
+            "model": {"flux_backend": "flux2_klein"},
+            "condition": {"lr_cond_mode": "flux2_image_concat"},
+            "data": {"crop_size": 512},
+            "training": {"stage": "0B", "suffix": "_stage0b512"},
+        }
+        now = datetime.datetime(2026, 6, 28, 10, 30)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            exp_name, run_id = namespace["resolve_experiment_name"](config, output_root=output_root, now=now)
+            self.assertTrue(exp_name.endswith("_26062810"))
+            self.assertEqual(run_id, "26062810")
+            (output_root / exp_name).mkdir()
+
+            collided_name, collided_run_id = namespace["resolve_experiment_name"](
+                config,
+                output_root=output_root,
+                now=now,
+            )
+            self.assertTrue(collided_name.endswith("_26062810_r02"))
+            self.assertEqual(collided_run_id, "26062810")
+
+        explicit = copy.deepcopy(config)
+        explicit["training"]["exp_name"] = "manual_experiment"
+        self.assertEqual(namespace["resolve_experiment_name"](explicit, now=now), ("manual_experiment", None))
+
+        fixed = copy.deepcopy(config)
+        fixed["training"]["run_id"] = 26070109
+        self.assertTrue(namespace["resolve_experiment_name"](fixed, now=now)[0].endswith("_26070109"))
+
+        disabled = copy.deepcopy(config)
+        disabled["training"]["add_datetime_suffix"] = False
+        disabled_name, disabled_run_id = namespace["resolve_experiment_name"](disabled, now=now)
+        self.assertFalse(disabled_name.endswith("_26062810"))
+        self.assertIsNone(disabled_run_id)
+
     def test_cfg_bool_parses_string_false_for_auto_resume(self):
         source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -650,15 +700,102 @@ class RGFluxSRComponentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             namespace["parse_dataset_dirs"](["missing_equals"])
 
+    def test_inference_run_dir_resolves_checkpoint_step_and_manifest(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {
+            "find_latest_run_checkpoint",
+            "format_checkpoint_step",
+            "infer_checkpoint_step",
+            "resolve_inference_run",
+            "write_inference_manifest",
+        }
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"json": json, "Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "exp" / "rg_flux2_klein_26062810"
+            ckpt_10000 = run_dir / "checkpoints" / "checkpoint-00010000" / "rg_flux_adapters"
+            ckpt_32000 = run_dir / "checkpoints" / "checkpoint-00032000" / "rg_flux_adapters"
+            ckpt_10000.mkdir(parents=True)
+            ckpt_32000.mkdir(parents=True)
+
+            args = argparse.Namespace(
+                run_dir=str(run_dir),
+                checkpoint_step="32000",
+                output_root=str(root / "eval" / "inference"),
+                checkpoint=None,
+                output_dir=None,
+            )
+            resolved = namespace["resolve_inference_run"](args)
+            self.assertEqual(resolved["checkpoint"], ckpt_32000)
+            self.assertEqual(resolved["checkpoint_step"], "checkpoint-00032000")
+            self.assertEqual(
+                resolved["output_dir"],
+                root / "eval" / "inference" / run_dir.name / "checkpoint-00032000",
+            )
+
+            latest_args = argparse.Namespace(
+                run_dir=str(run_dir),
+                checkpoint_step="latest",
+                output_root=str(root / "eval" / "inference"),
+                checkpoint=None,
+                output_dir=None,
+            )
+            latest = namespace["resolve_inference_run"](latest_args)
+            self.assertEqual(latest["checkpoint"], ckpt_32000)
+            self.assertEqual(latest["checkpoint_step"], "checkpoint-00032000")
+
+            legacy_args = argparse.Namespace(
+                run_dir=None,
+                checkpoint=str(ckpt_32000),
+                output_dir=str(root / "legacy_output"),
+                checkpoint_step=None,
+                output_root=None,
+            )
+            legacy = namespace["resolve_inference_run"](legacy_args)
+            self.assertEqual(legacy["checkpoint"], ckpt_32000)
+            self.assertEqual(legacy["checkpoint_step"], "checkpoint-00032000")
+            self.assertEqual(legacy["output_dir"], root / "legacy_output")
+
+            manifest_path = resolved["output_dir"] / "inference_manifest.json"
+            namespace["write_inference_manifest"](
+                manifest_path=manifest_path,
+                run_dir=run_dir,
+                checkpoint_step=resolved["checkpoint_step"],
+                checkpoint_path=resolved["checkpoint"],
+                output_dir=resolved["output_dir"],
+                datasets=[
+                    ("realLQ250", Path("/data/RealLQ250/lq"), resolved["output_dir"] / "realLQ250"),
+                    ("realLR200", Path("/data/RealLR200/lq"), resolved["output_dir"] / "realLR200"),
+                ],
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run_dir"], str(run_dir))
+            self.assertEqual(payload["checkpoint_step"], "checkpoint-00032000")
+            self.assertEqual(payload["checkpoint_path"], str(ckpt_32000))
+            self.assertEqual(payload["output_dir"], str(resolved["output_dir"]))
+            self.assertEqual(payload["datasets"][1]["name"], "realLR200")
+            self.assertEqual(payload["datasets"][1]["output_dir"], str(resolved["output_dir"] / "realLR200"))
+
     def test_inference_loads_model_once_and_writes_per_dataset_failures(self):
         source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
 
         self.assertEqual(source.count("build_rg_flux_artist(config).to(device=device)"), 1)
-        self.assertEqual(source.count("artist.load_trainable(args.checkpoint, is_trainable=False)"), 1)
+        self.assertEqual(source.count('artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)'), 1)
         self.assertIn("def run_inference_dataset(", source)
         self.assertIn('desc=f"RG-FLUX-SR inference [{dataset_name}]"', source)
         self.assertIn('failure_log_path = output_dir / "inference_failures.jsonl"', source)
-        self.assertIn("Path(args.output_dir) / dataset_name", source)
+        self.assertIn("output_dir / dataset_name", source)
+        self.assertIn("write_inference_manifest(", source)
         helper_start = source.index("def run_inference_dataset(")
         helper_end = source.index("\ndef main(args):", helper_start)
         helper_source = source[helper_start:helper_end]
@@ -821,15 +958,24 @@ class RGFluxSRComponentTests(unittest.TestCase):
             self.assertEqual(summary["min_loss_total"]["global_step"], 2)
             self.assertEqual(summary["min_loss_fm"]["global_step"], 2)
 
+            plot_path = recorder.write_plot(step=2)
+            self.assertEqual(plot_path, root / "loss_curves.png")
+            self.assertTrue(plot_path.exists())
+            self.assertEqual(plot_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertTrue((root / "loss_curves_step-00000002.png").exists())
+
     def test_training_loop_records_loss_history_on_optimizer_steps(self):
         train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
 
         self.assertIn("loss_history.jsonl", train_source)
         self.assertIn("loss_history.csv", train_source)
         self.assertIn("loss_summary.json", train_source)
+        self.assertIn("loss_curves.png", train_source)
         self.assertIn('cfg(config, "training.loss_record_every", 1)', train_source)
+        self.assertIn('cfg(config, "training.loss_plot_every", save_every)', train_source)
         self.assertIn('cfg(config, "training.loss_record_formats", ["jsonl", "csv"])', train_source)
         self.assertIn("loss_recorder.append(global_step, step_logs)", train_source)
+        self.assertIn("loss_recorder.write_plot(step=global_step)", train_source)
         self.assertIn("step_logs = {", train_source)
         self.assertIn('"loss_total": loss.detach().item()', train_source)
         self.assertIn('"loss_lpips_weight": float(loss_lpips_weight)', train_source)
