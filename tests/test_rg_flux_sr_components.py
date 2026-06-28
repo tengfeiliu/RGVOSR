@@ -1,4 +1,5 @@
 import json
+import argparse
 import ast
 import copy
 import csv
@@ -549,6 +550,121 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(failures[1]["lq_path"], "lq.png")
         self.assertEqual(failures[1]["hq_path"], "hq.png")
 
+    def test_inference_parser_supports_single_input_and_dataset_dirs(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"build_arg_parser"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"argparse": argparse}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+        parser = namespace["build_arg_parser"]()
+
+        single = parser.parse_args([
+            "--input",
+            "/data/RealLQ250/lq",
+            "--output_dir",
+            "eval/inference/RealLQ250",
+            "--checkpoint",
+            "ckpt",
+        ])
+        self.assertEqual(single.input, "/data/RealLQ250/lq")
+        self.assertIsNone(single.dataset_dirs)
+
+        multi = parser.parse_args([
+            "--dataset_dirs",
+            "realLQ250=/data/RealLQ250/lq",
+            "realLR200=/data/RealLR200/lq",
+            "--output_dir",
+            "eval/inference",
+            "--checkpoint",
+            "ckpt",
+        ])
+        self.assertIsNone(multi.input)
+        self.assertEqual(
+            multi.dataset_dirs,
+            ["realLQ250=/data/RealLQ250/lq", "realLR200=/data/RealLR200/lq"],
+        )
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "--input",
+                "/data/RealLQ250/lq",
+                "--dataset_dirs",
+                "realLR200=/data/RealLR200/lq",
+                "--output_dir",
+                "eval/inference",
+                "--checkpoint",
+                "ckpt",
+            ])
+
+    def test_inference_dataset_dir_helpers_resolve_output_subdirs(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {"parse_dataset_dirs", "resolve_inference_datasets"}
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        parsed = namespace["parse_dataset_dirs"]([
+            "realLQ250=/data/RealLQ250/lq",
+            "realLR200=/data/RealLR200/lq",
+        ])
+        self.assertEqual(parsed, [
+            ("realLQ250", Path("/data/RealLQ250/lq")),
+            ("realLR200", Path("/data/RealLR200/lq")),
+        ])
+
+        args = argparse.Namespace(
+            input=None,
+            dataset_dirs=["realLQ250=/data/RealLQ250/lq", "realLR200=/data/RealLR200/lq"],
+            output_dir="eval/inference",
+        )
+        datasets = namespace["resolve_inference_datasets"](args)
+        self.assertEqual(datasets, [
+            ("realLQ250", Path("/data/RealLQ250/lq"), Path("eval/inference/realLQ250")),
+            ("realLR200", Path("/data/RealLR200/lq"), Path("eval/inference/realLR200")),
+        ])
+
+        single_args = argparse.Namespace(
+            input="/data/RealLQ250/lq",
+            dataset_dirs=None,
+            output_dir="eval/inference/RealLQ250",
+        )
+        self.assertEqual(
+            namespace["resolve_inference_datasets"](single_args),
+            [("default", Path("/data/RealLQ250/lq"), Path("eval/inference/RealLQ250"))],
+        )
+
+        with self.assertRaises(ValueError):
+            namespace["parse_dataset_dirs"](["missing_equals"])
+
+    def test_inference_loads_model_once_and_writes_per_dataset_failures(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertEqual(source.count("build_rg_flux_artist(config).to(device=device)"), 1)
+        self.assertEqual(source.count("artist.load_trainable(args.checkpoint, is_trainable=False)"), 1)
+        self.assertIn("def run_inference_dataset(", source)
+        self.assertIn('desc=f"RG-FLUX-SR inference [{dataset_name}]"', source)
+        self.assertIn('failure_log_path = output_dir / "inference_failures.jsonl"', source)
+        self.assertIn("Path(args.output_dir) / dataset_name", source)
+        helper_start = source.index("def run_inference_dataset(")
+        helper_end = source.index("\ndef main(args):", helper_start)
+        helper_source = source[helper_start:helper_end]
+        self.assertNotIn("build_rg_flux_artist", helper_source)
+        self.assertNotIn("load_trainable", helper_source)
+
     def test_flux2_klein_smoke_config_is_isolated(self):
         main_config = yaml.safe_load(Path("configs/train_rg_flux_sr_ms.yaml").read_text(encoding="utf-8"))
         config_path = Path("configs/train_rg_flux2_klein_sr_smoke_256.yaml")
@@ -636,7 +752,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn('cfg(config, "loss.down_weight", 0.0)', train_source)
         self.assertIn('cfg(config, "loss.lpips_weight", 0.0)', train_source)
         self.assertIn("z0_pred = z_t - sigma_view * v_pred", train_source)
-        self.assertIn("decode_latents_for_loss(z0_pred)", train_source)
+        self.assertIn("decode_latents_for_loss(z0_for_image)", train_source)
         self.assertIn("loss_lpips_weight", train_source)
         self.assertIn("loss_total", train_source)
         self.assertNotIn("decode_latents_for_loss", inference_source)
@@ -717,6 +833,20 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("step_logs = {", train_source)
         self.assertIn('"loss_total": loss.detach().item()', train_source)
         self.assertIn('"loss_lpips_weight": float(loss_lpips_weight)', train_source)
+
+    def test_stage0b_image_loss_can_crop_decode_to_reduce_memory(self):
+        train_source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")
+        single_config = yaml.safe_load(Path("configs/train_rg_flux2_klein_sr_stage0b_512.yaml").read_text(encoding="utf-8"))
+        moe_config = yaml.safe_load(Path("configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml").read_text(encoding="utf-8"))
+
+        self.assertIn("def crop_image_loss_inputs(", train_source)
+        self.assertIn('cfg(config, "loss.image_loss_crop_size", 0)', train_source)
+        self.assertIn("z0_for_image, hq_for_image, lq_up_for_image", train_source)
+        self.assertIn("return z0_crop, hq_crop, lq_up_crop, True", train_source)
+        self.assertIn("lr_ref_batch = {} if crop_lq_ref else (batch or {})", train_source)
+        for config in (single_config, moe_config):
+            self.assertEqual(config["model"]["vae_dtype"], "bf16")
+            self.assertEqual(config["loss"]["image_loss_crop_size"], 256)
 
     @unittest.skipIf(torch is None, "torch is not installed in this environment")
     def test_stage0b_loss_helpers_values_and_backward(self):
@@ -817,6 +947,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
             self.assertEqual(config["loss"]["lpips_warmup_start"], 2000)
             self.assertEqual(config["loss"]["lpips_warmup_end"], 6000)
             self.assertEqual(config["loss"]["lpips_resize"], 256)
+            self.assertEqual(config["loss"]["image_loss_crop_size"], 256)
             self.assertEqual(config["loss"]["image_loss_every"], 1)
             self.assertEqual(config["loss"]["lpips_every"], 1)
             self.assertEqual(config["loss"]["router_div_weight"], 0.0)
@@ -870,6 +1001,14 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn('hasattr(expected_param, "ds_id")', source)
         self.assertIn("with _maybe_gathered_parameters(load_parameters):", source)
         self.assertIn("module.load_state_dict(state, strict=False)", source)
+
+    def test_adapter_checkpoint_loader_requires_existing_checkpoint_dir(self):
+        for source_path in ("models/flux_sr_artist.py", "models/flux2_klein_sr_artist.py"):
+            source = Path(source_path).read_text(encoding="utf-8")
+
+            self.assertIn("if not checkpoint_dir.exists():", source)
+            self.assertIn("raise FileNotFoundError", source)
+            self.assertIn("Adapter checkpoint directory does not exist", source)
 
     def test_flux1_and_flux2_checkpoint_saves_gather_zero3_trainable_parameters(self):
         flux1_source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")

@@ -834,6 +834,10 @@ class Flux2KleinSRArtist(nn.Module):
         checkpoint_dir = Path(checkpoint_dir)
         if (checkpoint_dir / "rg_flux_adapters").exists():
             checkpoint_dir = checkpoint_dir / "rg_flux_adapters"
+        if not checkpoint_dir.exists():
+            raise FileNotFoundError(f"Adapter checkpoint directory does not exist: {checkpoint_dir}")
+        if not checkpoint_dir.is_dir():
+            raise NotADirectoryError(f"Adapter checkpoint path is not a directory: {checkpoint_dir}")
         meta_path = checkpoint_dir / "rg_flux_checkpoint_meta.json"
         if meta_path.exists():
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))

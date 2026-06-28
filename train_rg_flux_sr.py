@@ -247,6 +247,41 @@ def _downsample_reference(batch, lq_up, sr_down, scale, down_mode):
     )
 
 
+def crop_image_loss_inputs(z0_pred, hq, lq_up, config):
+    crop_size = int(cfg(config, "loss.image_loss_crop_size", 0) or 0)
+    if crop_size <= 0:
+        return z0_pred, hq, lq_up, False
+    image_height, image_width = hq.shape[-2:]
+    if crop_size >= min(image_height, image_width):
+        return z0_pred, hq, lq_up, False
+
+    packed_height, packed_width = z0_pred.shape[-2:]
+    token_scale_h = max(image_height // max(packed_height, 1), 1)
+    token_scale_w = max(image_width // max(packed_width, 1), 1)
+    token_crop_h = max(1, min(packed_height, crop_size // token_scale_h))
+    token_crop_w = max(1, min(packed_width, crop_size // token_scale_w))
+    max_top = packed_height - token_crop_h
+    max_left = packed_width - token_crop_w
+    if max_top <= 0 and max_left <= 0:
+        return z0_pred, hq, lq_up, False
+
+    if z0_pred.device.type == "cuda":
+        top = int(torch.randint(max_top + 1, (1,), device=z0_pred.device).item()) if max_top > 0 else 0
+        left = int(torch.randint(max_left + 1, (1,), device=z0_pred.device).item()) if max_left > 0 else 0
+    else:
+        top = int(torch.randint(max_top + 1, (1,)).item()) if max_top > 0 else 0
+        left = int(torch.randint(max_left + 1, (1,)).item()) if max_left > 0 else 0
+
+    image_top = top * token_scale_h
+    image_left = left * token_scale_w
+    image_crop_h = token_crop_h * token_scale_h
+    image_crop_w = token_crop_w * token_scale_w
+    z0_crop = z0_pred[..., top : top + token_crop_h, left : left + token_crop_w]
+    hq_crop = hq[..., image_top : image_top + image_crop_h, image_left : image_left + image_crop_w]
+    lq_up_crop = lq_up[..., image_top : image_top + image_crop_h, image_left : image_left + image_crop_w]
+    return z0_crop, hq_crop, lq_up_crop, True
+
+
 def compute_stage0b_supervised_losses(
     artist,
     config,
@@ -291,15 +326,22 @@ def compute_stage0b_supervised_losses(
     loss_down = zero
     loss_lpips = zero
     if needs_image_loss or needs_lpips:
-        sr_pred = artist.decode_latents_for_loss(z0_pred)
-        hq_for_loss = _resize_hq_for_loss(hq, sr_pred)
+        z0_for_image, hq_for_image, lq_up_for_image, crop_lq_ref = crop_image_loss_inputs(
+            z0_pred,
+            hq,
+            lq_up,
+            config,
+        )
+        sr_pred = artist.decode_latents_for_loss(z0_for_image)
+        hq_for_loss = _resize_hq_for_loss(hq_for_image, sr_pred)
         if image_loss_due and charb_weight > 0:
             loss_charb = charbonnier_loss(sr_pred.float(), hq_for_loss.float())
         if image_loss_due and down_weight > 0:
             scale = int(cfg(config, "data.scale", 4))
             down_mode = str(cfg(config, "loss.down_mode", "area"))
             sr_down = _interpolate_image(sr_pred.float(), scale_factor=1.0 / max(scale, 1), mode=down_mode)
-            lr_ref = _downsample_reference(batch or {}, lq_up, sr_down, scale, down_mode)
+            lr_ref_batch = {} if crop_lq_ref else (batch or {})
+            lr_ref = _downsample_reference(lr_ref_batch, lq_up_for_image, sr_down, scale, down_mode)
             loss_down = charbonnier_loss(sr_down, lr_ref)
         if needs_lpips:
             lpips_resize = cfg(config, "loss.lpips_resize", 256)

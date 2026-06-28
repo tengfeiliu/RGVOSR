@@ -58,6 +58,31 @@ def list_images(input_path):
     return []
 
 
+def parse_dataset_dirs(dataset_dirs):
+    datasets = []
+    for item in dataset_dirs or []:
+        if "=" not in item:
+            raise ValueError(f"--dataset_dirs entries must use name=folder_path format, got: {item}")
+        dataset_name, input_path = item.split("=", 1)
+        dataset_name = dataset_name.strip()
+        input_path = input_path.strip()
+        if not dataset_name or not input_path:
+            raise ValueError(f"--dataset_dirs entries must use name=folder_path format, got: {item}")
+        datasets.append((dataset_name, Path(input_path)))
+    return datasets
+
+
+def resolve_inference_datasets(args):
+    if args.dataset_dirs:
+        datasets = []
+        for dataset_name, input_path in parse_dataset_dirs(args.dataset_dirs):
+            datasets.append((dataset_name, input_path, Path(args.output_dir) / dataset_name))
+        return datasets
+    if args.input:
+        return [("default", Path(args.input), Path(args.output_dir))]
+    raise ValueError("Either --input or --dataset_dirs is required.")
+
+
 def load_jsonl_conditions(jsonl_path):
     if not jsonl_path:
         return {}
@@ -138,50 +163,29 @@ def prepare_lq_up(image_path, upscale, align=16, min_size=None):
     return image, original_size, tensor
 
 
-def main(args):
-    config = load_config(args.checkpoint, args.config)
-    config.setdefault("condition", {})
-    config.setdefault("text_encoding", {})
-    config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
-    config["condition"]["use_prompt"] = args.use_prompt
-    config["condition"]["use_degradation_vector"] = args.use_degradation_vector
-    config["condition"]["use_suggestions"] = args.use_suggestions
-    lr_cond_mode = config["condition"]["lr_cond_mode"]
-    if args.text_encoding_mode is not None:
-        config["text_encoding"]["mode"] = args.text_encoding_mode
-    if args.text_embedding_cache is not None:
-        config["text_encoding"]["cache_dir"] = args.text_embedding_cache
-
-    dtype = {
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-    }[args.dtype]
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    artist = build_rg_flux_artist(config).to(device=device)
-    artist.load_trainable(args.checkpoint, is_trainable=False)
-    artist.eval()
-    text_embedding_cache = get_text_embedding_cache(
-        config,
-        dtype=cfg(config, "text_encoding.dtype", args.dtype),
-    )
-    if hasattr(artist, "set_moe_training_schedule"):
-        artist.set_moe_training_schedule(global_step=1, max_steps=1)
-
-    condition_index = load_jsonl_conditions(args.jsonl_path)
-    image_paths = list_images(args.input)
+def run_inference_dataset(
+    dataset_name,
+    input_path,
+    output_dir,
+    artist,
+    config,
+    args,
+    condition_index,
+    text_embedding_cache,
+    device,
+    dtype,
+    lr_cond_mode,
+):
+    image_paths = list_images(input_path)
     if not image_paths:
-        raise FileNotFoundError(f"No input images found: {args.input}")
+        raise FileNotFoundError(f"No input images found for dataset '{dataset_name}': {input_path}")
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     failure_log_path = output_dir / "inference_failures.jsonl"
     to_pil = transforms.ToPILImage()
 
-    for image_path in tqdm(image_paths, desc="RG-FLUX-SR inference"):
+    for image_path in tqdm(image_paths, desc=f"RG-FLUX-SR inference [{dataset_name}]"):
         condition = None
         if args.jsonl_path:
             condition = condition_for_image(condition_index, image_path)
@@ -264,9 +268,66 @@ def main(args):
         out_image.save(output_dir / f"{image_path.stem}.png")
 
 
-if __name__ == "__main__":
+def main(args):
+    config = load_config(args.checkpoint, args.config)
+    config.setdefault("condition", {})
+    config.setdefault("text_encoding", {})
+    config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
+    config["condition"]["use_prompt"] = args.use_prompt
+    config["condition"]["use_degradation_vector"] = args.use_degradation_vector
+    config["condition"]["use_suggestions"] = args.use_suggestions
+    lr_cond_mode = config["condition"]["lr_cond_mode"]
+    if args.text_encoding_mode is not None:
+        config["text_encoding"]["mode"] = args.text_encoding_mode
+    if args.text_embedding_cache is not None:
+        config["text_encoding"]["cache_dir"] = args.text_embedding_cache
+
+    dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[args.dtype]
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    artist = build_rg_flux_artist(config).to(device=device)
+    artist.load_trainable(args.checkpoint, is_trainable=False)
+    artist.eval()
+    text_embedding_cache = get_text_embedding_cache(
+        config,
+        dtype=cfg(config, "text_encoding.dtype", args.dtype),
+    )
+    if hasattr(artist, "set_moe_training_schedule"):
+        artist.set_moe_training_schedule(global_step=1, max_steps=1)
+
+    condition_index = load_jsonl_conditions(args.jsonl_path)
+    for dataset_name, input_path, output_dir in resolve_inference_datasets(args):
+        run_inference_dataset(
+            dataset_name=dataset_name,
+            input_path=input_path,
+            output_dir=output_dir,
+            artist=artist,
+            config=config,
+            args=args,
+            condition_index=condition_index,
+            text_embedding_cache=text_embedding_cache,
+            device=device,
+            dtype=dtype,
+            lr_cond_mode=lr_cond_mode,
+        )
+
+
+def build_arg_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Input LQ image, folder, or txt list.")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--input", default=None, help="Input LQ image, folder, or txt list.")
+    input_group.add_argument(
+        "--dataset_dirs",
+        nargs="+",
+        default=None,
+        help="Multiple datasets as name=folder_path entries. Outputs are written to output_dir/name.",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--checkpoint", required=True, help="RG-FLUX-SR-MS adapter checkpoint directory.")
     parser.add_argument("--config", default=None)
@@ -288,4 +349,8 @@ if __name__ == "__main__":
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--min_size", type=int, default=None)
     parser.add_argument("--restore_input_size", action="store_true")
-    main(parser.parse_args())
+    return parser
+
+
+if __name__ == "__main__":
+    main(build_arg_parser().parse_args())

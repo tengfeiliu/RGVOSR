@@ -53,8 +53,8 @@ training:
   lr_lora: 5.0e-5
   weight_decay: 0.01
   grad_accum_steps: 1
-  save_every: 2000
-  log_every: 2000
+  save_every: 1000
+  log_every: 1000
   loss_record_every: 1
   loss_record_formats: [jsonl, csv]
   output_dir: exp_rg_flux_sr

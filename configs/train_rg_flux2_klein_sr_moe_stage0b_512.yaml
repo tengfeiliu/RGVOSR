@@ -113,6 +113,7 @@ loss:
   lpips_warmup_start: 2000
   lpips_warmup_end: 6000
   lpips_resize: 256
+  image_loss_crop_size: 256
   image_loss_every: 1
   lpips_every: 1
   router_div_weight: 0.0
