@@ -47,6 +47,32 @@ def load_config(checkpoint, explicit_config=None):
     return load_yaml("configs/train_rg_flux_sr_ms.yaml")
 
 
+TORCH_DTYPE_BY_NAME = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def resolve_inference_dtype(config, args_dtype):
+    requested_dtype = str(args_dtype or "bf16").strip().lower()
+    model_dtype = cfg(config, "model.dtype", None)
+    effective_dtype = str(model_dtype or requested_dtype).strip().lower()
+    if effective_dtype not in TORCH_DTYPE_BY_NAME:
+        raise ValueError(f"Unsupported inference dtype: {effective_dtype}")
+    if model_dtype is not None and requested_dtype != effective_dtype:
+        print(
+            f"Warning: --dtype {requested_dtype} differs from config model.dtype {effective_dtype}; "
+            f"using model dtype {effective_dtype} for FLUX inference.",
+            flush=True,
+        )
+    config.setdefault("model", {})["dtype"] = effective_dtype
+    return TORCH_DTYPE_BY_NAME[effective_dtype], effective_dtype
+
+
 def list_images(input_path):
     path = Path(input_path)
     if path.is_file():
@@ -378,21 +404,19 @@ def main(args):
     if args.text_embedding_cache is not None:
         config["text_encoding"]["cache_dir"] = args.text_embedding_cache
 
-    dtype = {
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-    }[args.dtype]
+    dtype, dtype_name = resolve_inference_dtype(config, args.dtype)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     artist = build_rg_flux_artist(config).to(device=device)
     artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)
+    if hasattr(artist, "align_inference_dtype"):
+        artist.align_inference_dtype(dtype=dtype)
     artist.eval()
     text_embedding_cache = get_text_embedding_cache(
         config,
-        dtype=cfg(config, "text_encoding.dtype", args.dtype),
+        dtype=cfg(config, "text_encoding.dtype", dtype_name),
     )
     if hasattr(artist, "set_moe_training_schedule"):
         artist.set_moe_training_schedule(global_step=1, max_steps=1)

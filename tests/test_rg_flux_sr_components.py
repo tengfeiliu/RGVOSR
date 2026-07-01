@@ -832,6 +832,34 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("_gathered_named_parameter_state", source)
         self.assertIn("_load_state_dict_with_shape_check", source)
 
+    def test_flux2_inference_aligns_dtype_after_loading_trainable_adapters(self):
+        artist_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
+        inference_source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn("def align_inference_dtype(", artist_source)
+        self.assertIn("self.transformer.to(dtype=dtype)", artist_source)
+        self.assertIn("self.moe_router.to(device=device, dtype=torch.float32)", artist_source)
+        self.assertIn("def resolve_inference_dtype(", inference_source)
+        self.assertIn('cfg(config, "model.dtype", None)', inference_source)
+        self.assertIn("Warning: --dtype", inference_source)
+        self.assertIn('artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)', inference_source)
+        self.assertIn("artist.align_inference_dtype(dtype=dtype)", inference_source)
+
+    @unittest.skipIf(torch is None, "torch is not installed in this environment")
+    def test_moe_lora_layer_accepts_bf16_after_dtype_alignment(self):
+        from models.lora_moe import SharedRoutedMoELoRALinear
+
+        base = torch.nn.Linear(4, 4).to(dtype=torch.bfloat16)
+        layer = SharedRoutedMoELoRALinear(base, rank=2, alpha=2, num_routed_experts=2)
+        self.assertEqual(layer.shared_lora_A.dtype, torch.float32)
+
+        layer.to(dtype=torch.bfloat16)
+        x = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+        y = layer(x)
+
+        self.assertEqual(layer.shared_lora_A.dtype, torch.bfloat16)
+        self.assertEqual(y.dtype, torch.bfloat16)
+
     def test_flux2_native_image_concat_uses_pretrained_condition_layout(self):
         artist_source = Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8")
         encoder_source = Path("models/lr_condition_encoder.py").read_text(encoding="utf-8")

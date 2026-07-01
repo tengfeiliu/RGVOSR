@@ -267,6 +267,79 @@ loss:
 
 训练日志会额外记录 `loss_div`、`loss_entropy`、`loss_balance`、`router/temperature`、`router/entropy` 和每个 expert 的 usage/top1 占比。
 
+#### LoRA-MoE 一键 Stage1→训练→推理→评估
+
+如果 Stage0 Single-LoRA 已经训练完成，可以用 `tools/run_rg_flux_moe_pipeline.py` 一次完成 Stage1 MoE 初始化、Stage2/3 MoE 训练、多个 checkpoint 的多数据集推理和评估：
+
+```bash
+python tools/run_rg_flux_moe_pipeline.py \
+  --moe_config configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml \
+  --single_lora_run_dir exp_rg_flux_sr/<single_lora_run> \
+  --single_lora_checkpoint_step 32000 \
+  --accelerate_config configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 1 \
+  --checkpoint_steps 20000 40000 latest \
+  --dataset_dirs \
+    realLQ250=/data/datasets/omgsr_eval/RealLQ250/lq \
+    realLR200=/data/datasets/omgsr_eval/RealLR200 \
+  --inference_output_root eval/inference/rg_flux2_moe_cached_fixed_prompt \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda
+```
+
+也可以直接指定 Stage0 adapter：
+
+```bash
+python tools/run_rg_flux_moe_pipeline.py \
+  --moe_config configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml \
+  --single_lora_checkpoint exp_rg_flux_sr/<single_lora_run>/checkpoints/checkpoint-00032000/rg_flux_adapters \
+  --checkpoint_steps 20000 40000 \
+  --dataset_dirs realLQ250=/path/lq realLR200=/path/lq \
+  --inference_output_root eval/inference/rg_flux2_moe_cached_fixed_prompt
+```
+
+脚本会在 MoE run 目录下生成：
+
+```text
+exp_rg_flux_sr/<moe_run>/
+|-- pipeline_runtime_config.yaml
+|-- stage1_init/
+|   `-- rg_flux_adapters/
+|-- checkpoints/
+|-- moe_pipeline_manifest.json
+`-- logs/
+```
+
+`pipeline_runtime_config.yaml` 会自动设置 `training.resume_ckpt` 指向 `stage1_init/rg_flux_adapters`，并设置 `training.resume_training_state: false`，因此 Stage2/3 训练会从 Stage1 初始化的 MoE adapter 加载模型权重，但 optimizer/scheduler 从头开始。
+
+已有 MoE run 只补跑推理和评估时：
+
+```bash
+python tools/run_rg_flux_moe_pipeline.py \
+  --skip_stage1 \
+  --skip_train \
+  --moe_run_dir exp_rg_flux_sr/<moe_run> \
+  --checkpoint_steps 20000 40000 latest \
+  --dataset_dirs realLQ250=/path/lq realLR200=/path/lq \
+  --inference_output_root eval/inference/rg_flux2_moe_cached_fixed_prompt \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda
+```
+
 ### 8 卡 512 Dry-Run
 
 这个命令用正式 512 配置先跑 1 个 step，适合在正式训练前检查 8 卡 ZeRO-3、模型路径、数据路径和显存是否正常。
@@ -471,6 +544,12 @@ python inference_rg_flux_sr.py \
 ```
 
 通常无需显式传入 `--lr_cond_mode`，因为配置文件已经设置为 `flux2_image_concat`；这里保留该参数是为了强调推理条件模式必须与训练一致。当前配置的 `use_prompt=false`、`use_suggestions=false` 会被独立推理 CLI 的默认值覆盖，因此必须显式传入两个 `--no-*` 参数。
+
+#### FLUX.2-klein 推理 dtype 说明
+
+FLUX.2-klein 推理阶段以 YAML 中的 `model.dtype` 作为 FLUX transformer / LoRA adapter 的主 dtype。`--dtype` 仍保留作为 CLI 参数，但如果它和 `model.dtype` 不一致，脚本会打印 warning，并使用 `model.dtype`，避免输入 hidden states、base transformer 权重、MoE LoRA 权重出现 `fp32` / `bf16` 混用导致的 linear dtype mismatch。
+
+当前推荐保持配置中的 `model.dtype: bf16`，推理命令也使用 `--dtype bf16`。MoE router 的统计和 gating 可以保留 `fp32`，但进入 transformer 与 LoRA linear 的张量和 adapter 参数会在 checkpoint 加载后对齐到推理主 dtype。
 
 #### FLUX.2-klein 多数据集批量推理
 

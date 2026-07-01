@@ -184,6 +184,19 @@ class Flux2KleinSRArtist(nn.Module):
                 torch.cuda.empty_cache()
         return module
 
+    def align_inference_dtype(self, dtype=None):
+        dtype = _dtype_from_config(dtype) if isinstance(dtype, str) else (dtype or self.weight_dtype)
+        device = _module_device(self.transformer) if self.transformer is not None else torch.device("cpu")
+        if self.transformer is not None:
+            self.transformer.to(dtype=dtype)
+            device = _module_device(self.transformer)
+        for module in (self.degradation_encoder, self.lr_condition_encoder, self.visual_condition_adapter):
+            if module is not None:
+                module.to(device=device, dtype=dtype)
+        if self.moe_router is not None:
+            self.moe_router.to(device=device, dtype=torch.float32)
+        return self
+
     def _load_flux2_modules(self):
         try:
             from diffusers import AutoencoderKLFlux2, Flux2Transformer2DModel
