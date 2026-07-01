@@ -97,7 +97,7 @@ loss:
   charb_weight: 1.0
   down_weight: 0.50
   down_mode: area
-  lpips_weight: 0.25
+  lpips_weight: 0
   lpips_warmup_start: 2000
   lpips_warmup_end: 6000
   lpips_resize: 256

@@ -76,7 +76,7 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_smoke256_v0621"
+  suffix: "_flux2_klein_smoke512_wo_loss"
 
 flow_matching:
   sigma_sampling: uniform
