@@ -169,7 +169,12 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
 
     def test_builds_stage1_train_inference_and_eval_commands(self):
         from tools.run_rg_flux_moe_pipeline import build_stage1_command
-        from tools.run_rg_flux_pipeline import build_eval_command, build_inference_command, build_train_command
+        from tools.run_rg_flux_pipeline import (
+            build_eval_command,
+            build_inference_command,
+            build_train_command,
+            checkpoint_artifact_paths,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -234,6 +239,27 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertIn(str(inference_manifest), eval_cmd)
             self.assertEqual(metrics_dir, inference_manifest.parent / "metrics")
 
+            class RunContainedArgs(Args):
+                inference_output_root = None
+
+            contained_cmd, contained_manifest = build_inference_command(
+                RunContainedArgs,
+                run_dir,
+                checkpoint_dir,
+                runtime_config,
+            )
+            artifact_paths = checkpoint_artifact_paths(run_dir, "checkpoint-00020000")
+            self.assertIn("--output_dir", contained_cmd)
+            self.assertIn(str(artifact_paths["inference_dir"]), contained_cmd)
+            self.assertEqual(contained_manifest, artifact_paths["inference_manifest"])
+            contained_eval_cmd, contained_metrics_dir = build_eval_command(
+                RunContainedArgs,
+                contained_manifest,
+                artifact_paths["metrics_dir"],
+            )
+            self.assertIn(str(artifact_paths["metrics_dir"]), contained_eval_cmd)
+            self.assertEqual(contained_metrics_dir, artifact_paths["metrics_dir"])
+
     def test_moe_pipeline_manifest_records_stages(self):
         from tools.run_rg_flux_moe_pipeline import write_moe_pipeline_manifest
 
@@ -256,6 +282,9 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertEqual(payload["stage1_returncode"], 0)
             self.assertEqual(payload["train_returncode"], 0)
             self.assertEqual(payload["records"][0]["checkpoint_step"], "checkpoint-00020000")
+            summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["pipeline_type"], "moe_lora")
+            self.assertEqual(summary["stage1_output"], str(run_dir / "stage1_init" / "rg_flux_adapters"))
 
 
 if __name__ == "__main__":

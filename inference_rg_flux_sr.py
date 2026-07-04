@@ -145,12 +145,23 @@ def infer_checkpoint_step(checkpoint_path):
     return None
 
 
+def default_run_inference_dir(run_dir, checkpoint_name):
+    return Path(run_dir) / "inference" / checkpoint_name
+
+
+def validate_checkpoint_adapter(checkpoint):
+    checkpoint = Path(checkpoint)
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint adapter directory does not exist: {checkpoint}")
+    return checkpoint
+
+
 def resolve_inference_run(args):
     if args.run_dir:
-        if args.checkpoint or args.output_dir:
-            raise ValueError("--run_dir cannot be combined with --checkpoint or --output_dir. Use --output_root.")
-        if not args.output_root:
-            raise ValueError("--output_root is required when --run_dir is used.")
+        if args.checkpoint:
+            raise ValueError("--run_dir cannot be combined with --checkpoint.")
+        if args.output_root and args.output_dir:
+            raise ValueError("--output_root cannot be combined with --output_dir when --run_dir is used.")
         checkpoint_step = format_checkpoint_step(args.checkpoint_step)
         run_dir = Path(args.run_dir)
         checkpoint_dir = (
@@ -158,8 +169,13 @@ def resolve_inference_run(args):
             if checkpoint_step == "latest"
             else run_dir / "checkpoints" / checkpoint_step
         )
-        checkpoint = checkpoint_dir / "rg_flux_adapters"
-        output_dir = Path(args.output_root) / run_dir.name / checkpoint_dir.name
+        checkpoint = validate_checkpoint_adapter(checkpoint_dir / "rg_flux_adapters")
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+        elif args.output_root:
+            output_dir = Path(args.output_root) / run_dir.name / checkpoint_dir.name
+        else:
+            output_dir = default_run_inference_dir(run_dir, checkpoint_dir.name)
         return {
             "run_dir": run_dir,
             "checkpoint": checkpoint,
@@ -173,7 +189,7 @@ def resolve_inference_run(args):
         raise ValueError("--checkpoint is required unless --run_dir is used.")
     if not args.output_dir:
         raise ValueError("--output_dir is required unless --run_dir is used.")
-    checkpoint = Path(args.checkpoint)
+    checkpoint = validate_checkpoint_adapter(args.checkpoint)
     return {
         "run_dir": None,
         "checkpoint": checkpoint,
@@ -468,7 +484,11 @@ def build_arg_parser():
     parser.add_argument(
         "--output_root",
         default=None,
-        help="Output root used with --run_dir. Results are written to output_root/run_name/checkpoint-XXXXXXXX.",
+        help=(
+            "Optional output root used with --run_dir. Results are written to "
+            "output_root/run_name/checkpoint-XXXXXXXX. If omitted, outputs default to "
+            "run_dir/inference/checkpoint-XXXXXXXX."
+        ),
     )
     parser.add_argument("--config", default=None)
     parser.add_argument("--jsonl_path", default=None)

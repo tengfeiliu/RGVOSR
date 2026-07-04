@@ -704,10 +704,12 @@ class RGFluxSRComponentTests(unittest.TestCase):
         source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         helper_names = {
+            "default_run_inference_dir",
             "find_latest_run_checkpoint",
             "format_checkpoint_step",
             "infer_checkpoint_step",
             "resolve_inference_run",
+            "validate_checkpoint_adapter",
             "write_inference_manifest",
         }
         helpers = [
@@ -753,6 +755,51 @@ class RGFluxSRComponentTests(unittest.TestCase):
             latest = namespace["resolve_inference_run"](latest_args)
             self.assertEqual(latest["checkpoint"], ckpt_32000)
             self.assertEqual(latest["checkpoint_step"], "checkpoint-00032000")
+
+            default_args = argparse.Namespace(
+                run_dir=str(run_dir),
+                checkpoint_step="32000",
+                output_root=None,
+                checkpoint=None,
+                output_dir=None,
+            )
+            default_resolved = namespace["resolve_inference_run"](default_args)
+            self.assertEqual(
+                default_resolved["output_dir"],
+                run_dir / "inference" / "checkpoint-00032000",
+            )
+
+            exact_output_args = argparse.Namespace(
+                run_dir=str(run_dir),
+                checkpoint_step="32000",
+                output_root=None,
+                checkpoint=None,
+                output_dir=str(root / "custom_output"),
+            )
+            exact_output = namespace["resolve_inference_run"](exact_output_args)
+            self.assertEqual(exact_output["output_dir"], root / "custom_output")
+
+            with self.assertRaises(ValueError):
+                namespace["resolve_inference_run"](
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        checkpoint_step="32000",
+                        output_root=str(root / "out"),
+                        checkpoint=None,
+                        output_dir=str(root / "custom_output"),
+                    )
+                )
+
+            with self.assertRaises(FileNotFoundError):
+                namespace["resolve_inference_run"](
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        checkpoint_step="99999",
+                        output_root=None,
+                        checkpoint=None,
+                        output_dir=None,
+                    )
+                )
 
             legacy_args = argparse.Namespace(
                 run_dir=None,

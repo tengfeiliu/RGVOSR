@@ -73,9 +73,12 @@ class RGFluxPipelineCliTests(unittest.TestCase):
     def test_builds_train_inference_and_eval_commands_for_each_step(self):
         from tools.run_rg_flux_pipeline import (
             build_eval_command,
+            build_bad_case_command,
             build_inference_command,
             build_train_command,
+            checkpoint_artifact_paths,
             resolve_checkpoint_dir,
+            write_run_summary,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,6 +137,65 @@ class RGFluxPipelineCliTests(unittest.TestCase):
             self.assertIn("--metrics", eval_cmd)
             self.assertIn("clipiqa", eval_cmd)
             self.assertEqual(metrics_dir, inference_manifest.parent / "metrics")
+            self.assertIn("--output_dir", eval_cmd)
+            self.assertIn(str(metrics_dir), eval_cmd)
+
+            class RunContainedArgs(Args):
+                inference_output_root = None
+                bad_case_metrics = ["clipiqa", "maniqa"]
+                bad_case_mode = "joint_mean"
+                bad_case_worst_k = 25
+
+            contained_cmd, contained_manifest = build_inference_command(
+                RunContainedArgs,
+                run_dir,
+                checkpoint_dir,
+                runtime_config,
+            )
+            artifact_paths = checkpoint_artifact_paths(run_dir, "checkpoint-00020000")
+            self.assertIn("--output_dir", contained_cmd)
+            self.assertIn(str(artifact_paths["inference_dir"]), contained_cmd)
+            self.assertNotIn("--output_root", contained_cmd)
+            self.assertEqual(contained_manifest, artifact_paths["inference_manifest"])
+
+            contained_eval_cmd, contained_metrics_dir = build_eval_command(
+                RunContainedArgs,
+                contained_manifest,
+                artifact_paths["metrics_dir"],
+            )
+            self.assertEqual(contained_metrics_dir, artifact_paths["metrics_dir"])
+            self.assertIn(str(artifact_paths["metrics_dir"]), contained_eval_cmd)
+
+            bad_case_cmd = build_bad_case_command(
+                RunContainedArgs,
+                contained_metrics_dir,
+                artifact_paths["bad_cases_dir"],
+            )
+            self.assertIn("tools/analyze_rg_flux_bad_cases.py", bad_case_cmd)
+            self.assertIn("--lq_dirs", bad_case_cmd)
+            self.assertIn("realLQ250=/data/RealLQ250/lq", bad_case_cmd)
+            self.assertIn(str(artifact_paths["bad_cases_dir"]), bad_case_cmd)
+
+            summary_path = write_run_summary(
+                run_dir,
+                runtime_config,
+                [
+                    {
+                        "checkpoint_step": "checkpoint-00020000",
+                        "checkpoint_path": str(artifact_paths["checkpoint_path"]),
+                        "inference_manifest": str(artifact_paths["inference_manifest"]),
+                        "inference_output_dir": str(artifact_paths["inference_dir"]),
+                        "metrics_output_dir": str(artifact_paths["metrics_dir"]),
+                        "bad_cases_output_dir": str(artifact_paths["bad_cases_dir"]),
+                    }
+                ],
+                pipeline_manifest_path=run_dir / "pipeline_manifest.json",
+            )
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                summary["checkpoints"]["checkpoint-00020000"]["metrics_output_dir"],
+                str(artifact_paths["metrics_dir"]),
+            )
 
     def test_latest_and_missing_checkpoint_validation(self):
         from tools.run_rg_flux_pipeline import resolve_checkpoint_dir

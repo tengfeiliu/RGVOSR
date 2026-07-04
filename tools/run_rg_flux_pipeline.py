@@ -94,6 +94,8 @@ def create_runtime_config(train_config_path, now=None):
     run_dir = output_root / exp_name
     runtime_path = run_dir / "pipeline_runtime_config.yaml"
     write_yaml(runtime_path, runtime_config)
+    write_yaml(run_dir / "configs" / "source_config.yaml", source_config)
+    write_yaml(run_dir / "configs" / "runtime_config.yaml", runtime_config)
     return runtime_config, run_dir, runtime_path
 
 
@@ -152,6 +154,59 @@ def resolve_checkpoint_dir(run_dir, step):
     return checkpoint_dir
 
 
+def planned_checkpoint_dir(run_dir, step):
+    formatted = format_checkpoint_step(step)
+    if formatted == "latest":
+        try:
+            return find_latest_checkpoint_dir(run_dir)
+        except FileNotFoundError:
+            return Path(run_dir) / "checkpoints" / "latest"
+    return Path(run_dir) / "checkpoints" / formatted
+
+
+def checkpoint_artifact_paths(run_dir, checkpoint_name):
+    run_dir = Path(run_dir)
+    checkpoint_name = Path(checkpoint_name).name
+    return {
+        "checkpoint_step": checkpoint_name,
+        "checkpoint_path": run_dir / "checkpoints" / checkpoint_name / "rg_flux_adapters",
+        "inference_dir": run_dir / "inference" / checkpoint_name,
+        "inference_manifest": run_dir / "inference" / checkpoint_name / "inference_manifest.json",
+        "metrics_dir": run_dir / "metrics" / checkpoint_name,
+        "bad_cases_dir": run_dir / "bad_cases" / checkpoint_name,
+    }
+
+
+def write_run_summary(run_dir, runtime_config_path, records, pipeline_manifest_path=None, pipeline_type="single_lora", extra=None):
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints = {}
+    for record in records or []:
+        step = record.get("checkpoint_step")
+        if not step:
+            continue
+        checkpoints[step] = {
+            "checkpoint_path": record.get("checkpoint_path"),
+            "inference_manifest": record.get("inference_manifest"),
+            "inference_output_dir": record.get("inference_output_dir"),
+            "metrics_output_dir": record.get("metrics_output_dir"),
+            "bad_cases_output_dir": record.get("bad_cases_output_dir"),
+        }
+    payload = {
+        "pipeline_type": pipeline_type,
+        "run_dir": str(run_dir),
+        "runtime_config_path": str(runtime_config_path) if runtime_config_path else None,
+        "pipeline_manifest": str(pipeline_manifest_path) if pipeline_manifest_path else None,
+        "checkpoints": checkpoints,
+    }
+    if extra:
+        payload.update(extra)
+    summary_path = run_dir / "run_summary.json"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    return summary_path
+
+
 def _append_optional(cmd, flag, value):
     if value is not None:
         cmd.extend([flag, str(value)])
@@ -176,8 +231,7 @@ def build_train_command(args, runtime_config_path):
 
 def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
     checkpoint_dir = Path(checkpoint_dir)
-    output_root = Path(args.inference_output_root)
-    manifest_path = output_root / Path(run_dir).name / checkpoint_dir.name / "inference_manifest.json"
+    artifact_paths = checkpoint_artifact_paths(run_dir, checkpoint_dir.name)
     cmd = [
         sys.executable,
         "inference_rg_flux_sr.py",
@@ -187,9 +241,14 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
         str(run_dir),
         "--checkpoint_step",
         checkpoint_dir.name,
-        "--output_root",
-        str(output_root),
     ]
+    if args.inference_output_root:
+        output_root = Path(args.inference_output_root)
+        manifest_path = output_root / Path(run_dir).name / checkpoint_dir.name / "inference_manifest.json"
+        cmd.extend(["--output_root", str(output_root)])
+    else:
+        manifest_path = artifact_paths["inference_manifest"]
+        cmd.extend(["--output_dir", str(artifact_paths["inference_dir"])])
     _append_optional(cmd, "--config", config_path)
     _append_optional(cmd, "--text_encoding_mode", args.text_encoding_mode)
     _append_optional(cmd, "--text_embedding_cache", args.text_embedding_cache)
@@ -208,20 +267,47 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
     return cmd, manifest_path
 
 
-def build_eval_command(args, inference_manifest):
+def build_eval_command(args, inference_manifest, metrics_dir=None):
     inference_manifest = Path(inference_manifest)
-    metrics_dir = inference_manifest.parent / "metrics"
+    metrics_dir = Path(metrics_dir) if metrics_dir is not None else inference_manifest.parent / "metrics"
     cmd = [
         sys.executable,
         "eval_rg_flux_sr_metrics.py",
         "--inference_manifest",
         str(inference_manifest),
+        "--output_dir",
+        str(metrics_dir),
         "--device",
         str(args.metric_device),
     ]
     if args.metrics:
         cmd.extend(["--metrics", *list(args.metrics)])
     return cmd, metrics_dir
+
+
+def build_bad_case_command(args, metrics_dir, bad_cases_dir):
+    metrics = list(args.bad_case_metrics or [])
+    if not metrics:
+        raise ValueError("--bad_case_metrics must include at least one metric when --run_bad_cases is enabled.")
+    cmd = [
+        sys.executable,
+        "tools/analyze_rg_flux_bad_cases.py",
+        "--metrics_csv",
+        str(Path(metrics_dir) / "per_image_scores.csv"),
+        "--summary_json",
+        str(Path(metrics_dir) / "summary_scores.json"),
+        "--metrics",
+        *metrics,
+        "--mode",
+        str(args.bad_case_mode),
+        "--worst_k",
+        str(args.bad_case_worst_k),
+        "--lq_dirs",
+        *list(args.dataset_dirs),
+        "--output_dir",
+        str(bad_cases_dir),
+    ]
+    return cmd
 
 
 def find_run_config_path(run_dir):
@@ -287,6 +373,14 @@ def write_pipeline_manifest(run_dir, runtime_config_path, checkpoint_steps, reco
     }
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+    write_run_summary(
+        run_dir=run_dir,
+        runtime_config_path=runtime_config_path,
+        records=records,
+        pipeline_manifest_path=manifest_path,
+        pipeline_type="single_lora",
+        extra={"train_returncode": train_returncode},
+    )
     return manifest_path
 
 
@@ -299,7 +393,14 @@ def build_arg_parser():
     parser.add_argument("--run_dir", default=None, help="Existing run directory, required with --skip_train.")
     parser.add_argument("--checkpoint_steps", nargs="+", required=True, help="Checkpoint steps, e.g. 20000 40000 latest.")
     parser.add_argument("--dataset_dirs", nargs="+", required=True, help="Shared inference/eval datasets as name=folder.")
-    parser.add_argument("--inference_output_root", required=True, help="Root for inference outputs.")
+    parser.add_argument(
+        "--inference_output_root",
+        default=None,
+        help=(
+            "Optional root for legacy inference outputs. If omitted, outputs are written under "
+            "run_dir/inference/checkpoint-XXXXXXXX."
+        ),
+    )
     parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)
     parser.add_argument("--text_embedding_cache", default=None)
     parser.add_argument("--jsonl_path", default=None)
@@ -315,6 +416,10 @@ def build_arg_parser():
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--metric_device", default="cpu")
+    parser.add_argument("--run_bad_cases", action="store_true", help="Run bad case analysis after metrics.")
+    parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa", "musiq"])
+    parser.add_argument("--bad_case_mode", choices=["separate", "joint_mean"], default="separate")
+    parser.add_argument("--bad_case_worst_k", type=int, default=50)
     parser.add_argument("--dry_run_train", action="store_true", help="Pass --dry_run to train_rg_flux_sr.py.")
     parser.add_argument("--dry_run_pipeline", action="store_true", help="Print/write command plan without running commands.")
     return parser
@@ -355,18 +460,26 @@ def main(argv=None):
     apply_config_prompt_defaults(args, runtime_config)
 
     for step in args.checkpoint_steps:
-        checkpoint_dir = resolve_checkpoint_dir(run_dir, step)
+        checkpoint_dir = planned_checkpoint_dir(run_dir, step) if args.dry_run_pipeline else resolve_checkpoint_dir(run_dir, step)
         inference_cmd, inference_manifest = build_inference_command(args, run_dir, checkpoint_dir, runtime_config_path)
-        eval_cmd, metrics_dir = build_eval_command(args, inference_manifest)
+        artifact_paths = checkpoint_artifact_paths(run_dir, checkpoint_dir.name)
+        metrics_target = None if args.inference_output_root else artifact_paths["metrics_dir"]
+        eval_cmd, metrics_dir = build_eval_command(args, inference_manifest, metrics_target)
+        bad_cases_dir = artifact_paths["bad_cases_dir"]
+        bad_case_cmd = build_bad_case_command(args, metrics_dir, bad_cases_dir) if args.run_bad_cases else None
         record = {
             "checkpoint_step": checkpoint_dir.name,
             "checkpoint_path": str(checkpoint_dir / "rg_flux_adapters"),
             "inference_manifest": str(inference_manifest),
+            "inference_output_dir": str(Path(inference_manifest).parent),
             "metrics_output_dir": str(metrics_dir),
+            "bad_cases_output_dir": str(bad_cases_dir),
             "inference_command": inference_cmd,
             "eval_command": eval_cmd,
+            "bad_case_command": bad_case_cmd,
             "inference_returncode": None,
             "eval_returncode": None,
+            "bad_case_returncode": None,
         }
         if not args.dry_run_pipeline:
             record["inference_returncode"] = run_command(inference_cmd)
@@ -379,6 +492,12 @@ def main(argv=None):
                 records.append(record)
                 write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
                 raise SystemExit(record["eval_returncode"])
+            if args.run_bad_cases:
+                record["bad_case_returncode"] = run_command(bad_case_cmd)
+                if record["bad_case_returncode"] != 0:
+                    records.append(record)
+                    write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
+                    raise SystemExit(record["bad_case_returncode"])
         records.append(record)
 
     manifest_path = write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)

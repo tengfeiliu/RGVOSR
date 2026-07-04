@@ -1,5 +1,140 @@
 # RG-FLUX-SR / VOSR Command Reference
 
+## Run-contained Pipeline 常用命令
+
+推荐新实验不传 `--inference_output_root`，这样训练、推理、评估和 bad case 会统一保存在同一个 run 目录下：
+
+```text
+exp_rg_flux_sr/<run_name>/
+|-- checkpoints/
+|-- inference/checkpoint-00020000/
+|-- metrics/checkpoint-00020000/
+|-- bad_cases/checkpoint-00020000/
+|-- pipeline_manifest.json
+`-- run_summary.json
+```
+
+如果仍想使用旧的外部推理目录，可以显式传入 `--inference_output_root eval/inference/<name>`。
+
+### Single-LoRA：从训练到 bad case 一键完成
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_pipeline.py \
+  --train_config configs/train_rg_flux2_klein_sr_stage0b_512.yaml \
+  --accelerate_config configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 1 \
+  --checkpoint_steps 20000 30000 40000 \
+  --dataset_dirs \
+    RealLQ250=/root/autodl-tmp/datasets/omgsr_eval/RealLQ250/lq \
+    RealLR200=/root/autodl-tmp/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda \
+  --run_bad_cases \
+  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_mode separate \
+  --bad_case_worst_k 50
+```
+
+### 已训练好的 Single-LoRA：从推理到 bad case
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_pipeline.py \
+  --skip_train \
+  --run_dir exp_rg_flux_sr/<single_lora_run_name> \
+  --checkpoint_steps 20000 30000 40000 \
+  --dataset_dirs \
+    RealLQ250=/root/autodl-tmp/datasets/omgsr_eval/RealLQ250/lq \
+    RealLR200=/root/autodl-tmp/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda \
+  --run_bad_cases \
+  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_mode separate \
+  --bad_case_worst_k 50
+```
+
+如果旧 run 目录下没有 `pipeline_runtime_config.yaml`，补跑时额外传入：
+
+```bash
+--train_config configs/train_rg_flux2_klein_sr_stage0b_512.yaml
+```
+
+### MoE-LoRA：Stage1 初始化、MoE 训练到 bad case 一键完成
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_moe_pipeline.py \
+  --moe_config configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml \
+  --single_lora_run_dir exp_rg_flux_sr/<single_lora_run_name> \
+  --single_lora_checkpoint_step 32000 \
+  --accelerate_config configs/accelerate/zero3_bf16_cpu_offload.yaml \
+  --num_processes 1 \
+  --checkpoint_steps 20000 30000 40000 \
+  --dataset_dirs \
+    RealLQ250=/root/autodl-tmp/datasets/omgsr_eval/RealLQ250/lq \
+    RealLR200=/root/autodl-tmp/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --prototype_num_samples 128 \
+  --init_device cuda \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda \
+  --run_bad_cases \
+  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_mode separate \
+  --bad_case_worst_k 50
+```
+
+### 已训练好的 MoE-LoRA：从推理到 bad case
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_moe_pipeline.py \
+  --skip_stage1 \
+  --skip_train \
+  --moe_run_dir exp_rg_flux_sr/<moe_run_name> \
+  --checkpoint_steps 20000 30000 40000 latest \
+  --dataset_dirs \
+    RealLQ250=/root/autodl-tmp/datasets/omgsr_eval/RealLQ250/lq \
+    RealLR200=/root/autodl-tmp/datasets/omgsr_eval/RealLR200-20260418T151906Z-3-001/RealLR200 \
+  --text_encoding_mode cached \
+  --text_embedding_cache datasets/text_embed_cache/flux2_klein_fixed_sr_prompt \
+  --no-use_prompt \
+  --no-use_suggestions \
+  --num_inference_steps 25 \
+  --upscale 4 \
+  --dtype bf16 \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metric_device cuda \
+  --run_bad_cases \
+  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_mode separate \
+  --bad_case_worst_k 50
+```
+
+`--bad_case_mode separate` 会分别输出 `clipiqa/maniqa/musiq` 三组 bad cases；如果想看多指标联合排序，可以改成：
+
+```bash
+--bad_case_mode joint_mean
+```
+
 这个 README 主要作为本地和服务器上的运行命令手册。当前重点是 `train_rg_flux_sr.py`、`inference_rg_flux_sr.py` 和 `eval_rg_flux_sr_metrics.py` 这条 RG-FLUX-SR 训练、推理、评测链路。
 
 ## 项目简介

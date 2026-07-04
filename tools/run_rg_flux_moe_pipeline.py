@@ -10,18 +10,20 @@ if str(REPO_ROOT) not in sys.path:
 from tools.run_rg_flux_pipeline import (
     DEFAULT_METRICS,
     apply_config_prompt_defaults,
+    build_bad_case_command,
     build_eval_command,
     build_inference_command,
     build_train_command,
     cfg,
-    find_latest_checkpoint_dir,
-    format_checkpoint_step,
+    checkpoint_artifact_paths,
     load_yaml,
     parse_dataset_dirs,
+    planned_checkpoint_dir as planned_single_checkpoint_dir,
     resolve_checkpoint_dir,
     resolve_experiment_name,
     resolve_skip_train_config_path,
     run_command,
+    write_run_summary,
     write_yaml,
 )
 
@@ -92,6 +94,8 @@ def create_moe_runtime_config(moe_config_path, args, now=None):
     runtime_config["training"]["resume_ckpt"] = str(stage1_output)
     runtime_config["training"]["resume_training_state"] = False
     write_yaml(runtime_path, runtime_config)
+    write_yaml(run_dir / "configs" / "source_config.yaml", load_yaml(moe_config_path))
+    write_yaml(run_dir / "configs" / "runtime_config.yaml", runtime_config)
     return runtime_config, run_dir, runtime_path, stage1_output
 
 
@@ -127,13 +131,7 @@ def validate_stage1_output(stage1_output):
 
 
 def planned_checkpoint_dir(run_dir, checkpoint_step):
-    formatted = format_checkpoint_step(checkpoint_step)
-    if formatted == "latest":
-        try:
-            return find_latest_checkpoint_dir(run_dir)
-        except FileNotFoundError:
-            return Path(run_dir) / "checkpoints" / "latest"
-    return Path(run_dir) / "checkpoints" / formatted
+    return planned_single_checkpoint_dir(run_dir, checkpoint_step)
 
 
 def write_moe_pipeline_manifest(
@@ -165,6 +163,19 @@ def write_moe_pipeline_manifest(
     }
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+    write_run_summary(
+        run_dir=run_dir,
+        runtime_config_path=runtime_config_path,
+        records=records,
+        pipeline_manifest_path=manifest_path,
+        pipeline_type="moe_lora",
+        extra={
+            "single_lora_checkpoint": payload["single_lora_checkpoint"],
+            "stage1_output": payload["stage1_output"],
+            "stage1_returncode": stage1_returncode,
+            "train_returncode": train_returncode,
+        },
+    )
     return manifest_path
 
 
@@ -181,7 +192,14 @@ def build_arg_parser():
     parser.add_argument("--num_processes", type=int, default=None, help="Optional accelerate --num_processes.")
     parser.add_argument("--checkpoint_steps", nargs="+", required=True, help="MoE checkpoint steps, e.g. 20000 40000 latest.")
     parser.add_argument("--dataset_dirs", nargs="+", required=True, help="Shared inference/eval datasets as name=folder.")
-    parser.add_argument("--inference_output_root", required=True, help="Root for inference outputs.")
+    parser.add_argument(
+        "--inference_output_root",
+        default=None,
+        help=(
+            "Optional root for legacy inference outputs. If omitted, outputs are written under "
+            "moe_run_dir/inference/checkpoint-XXXXXXXX."
+        ),
+    )
     parser.add_argument("--prototype_num_samples", type=int, default=128)
     parser.add_argument("--perturb_scale", type=float, default=0.01)
     parser.add_argument("--init_device", default="cuda")
@@ -200,6 +218,10 @@ def build_arg_parser():
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--metric_device", default="cpu")
+    parser.add_argument("--run_bad_cases", action="store_true", help="Run bad case analysis after metrics.")
+    parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa", "musiq"])
+    parser.add_argument("--bad_case_mode", choices=["separate", "joint_mean"], default="separate")
+    parser.add_argument("--bad_case_worst_k", type=int, default=50)
     parser.add_argument("--dry_run_train", action="store_true", help="Pass --dry_run to train_rg_flux_sr.py.")
     parser.add_argument("--dry_run_pipeline", action="store_true", help="Write command plan without running child commands.")
     return parser
@@ -229,16 +251,24 @@ def _run_inference_and_eval_for_steps(args, run_dir, runtime_config_path, checkp
             else planned_checkpoint_dir(run_dir, step)
         )
         inference_cmd, inference_manifest = build_inference_command(args, run_dir, checkpoint_dir, runtime_config_path)
-        eval_cmd, metrics_dir = build_eval_command(args, inference_manifest)
+        artifact_paths = checkpoint_artifact_paths(run_dir, checkpoint_dir.name)
+        metrics_target = None if args.inference_output_root else artifact_paths["metrics_dir"]
+        eval_cmd, metrics_dir = build_eval_command(args, inference_manifest, metrics_target)
+        bad_cases_dir = artifact_paths["bad_cases_dir"]
+        bad_case_cmd = build_bad_case_command(args, metrics_dir, bad_cases_dir) if args.run_bad_cases else None
         record = {
             "checkpoint_step": checkpoint_dir.name,
             "checkpoint_path": str(checkpoint_dir / "rg_flux_adapters"),
             "inference_manifest": str(inference_manifest),
+            "inference_output_dir": str(Path(inference_manifest).parent),
             "metrics_output_dir": str(metrics_dir),
+            "bad_cases_output_dir": str(bad_cases_dir),
             "inference_command": inference_cmd,
             "eval_command": eval_cmd,
+            "bad_case_command": bad_case_cmd,
             "inference_returncode": None,
             "eval_returncode": None,
+            "bad_case_returncode": None,
         }
         if not args.dry_run_pipeline:
             record["inference_returncode"] = run_command(inference_cmd)
@@ -249,6 +279,11 @@ def _run_inference_and_eval_for_steps(args, run_dir, runtime_config_path, checkp
             if record["eval_returncode"] != 0:
                 records.append(record)
                 raise SystemExit(record["eval_returncode"])
+            if args.run_bad_cases:
+                record["bad_case_returncode"] = run_command(bad_case_cmd)
+                if record["bad_case_returncode"] != 0:
+                    records.append(record)
+                    raise SystemExit(record["bad_case_returncode"])
         records.append(record)
 
 
