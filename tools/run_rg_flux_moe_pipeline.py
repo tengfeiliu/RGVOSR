@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.run_rg_flux_pipeline import (
     DEFAULT_METRICS,
+    PROMPT_VARIANTS,
     apply_config_prompt_defaults,
     build_bad_case_command,
     build_eval_command,
@@ -62,6 +63,11 @@ def _sync_text_and_condition_overrides(config, args):
     if args.text_embedding_cache is not None:
         config.setdefault("text_encoding", {})["cache_dir"] = args.text_embedding_cache
     condition = config.setdefault("condition", {})
+    prompt_variant = getattr(args, "prompt_variant", None)
+    if prompt_variant is not None:
+        condition["prompt_variant"] = prompt_variant
+        condition["use_prompt"] = prompt_variant != "fixed"
+        condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
     if args.use_prompt is not None:
         condition["use_prompt"] = bool(args.use_prompt)
     if args.use_suggestions is not None:
@@ -215,6 +221,7 @@ def build_arg_parser():
     parser.add_argument("--restore_input_size", action="store_true")
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--prompt_variant", choices=PROMPT_VARIANTS, default=None)
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--metric_device", default="cpu")

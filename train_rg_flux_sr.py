@@ -967,6 +967,7 @@ def run_rg_flux_evaluation(
                     profile,
                     use_prompt=bool(cfg(config, "condition.use_prompt", True)),
                     use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
+                    prompt_variant=cfg(config, "condition.prompt_variant", None),
                 )
                 lq_up = prepare_eval_lq_up(
                     record["lq_path"],
@@ -1169,6 +1170,7 @@ def main(config_path, dry_run=False):
         mode="train",
         use_prompt=bool(cfg(config, "condition.use_prompt", True)),
         use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
+        prompt_variant=cfg(config, "condition.prompt_variant", None),
         use_degradation_vector=bool(cfg(config, "condition.use_degradation_vector", True)),
         vae_align=int(cfg(config, "data.vae_align", 16)),
     )

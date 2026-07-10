@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from models.rg_flux_artist_factory import build_rg_flux_artist
-from models.prompt_builder import build_sr_prompt
+from models.prompt_builder import PROMPT_VARIANTS, build_sr_prompt
 from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
 from rg_flux_fm import sample_multistep_fm
 
@@ -353,6 +353,7 @@ def run_inference_dataset(
             profile,
             use_prompt=args.use_prompt,
             use_suggestions=args.use_suggestions,
+            prompt_variant=args.prompt_variant,
         )
         lq_up_pil, original_size, lq_up = prepare_lq_up(
             image_path,
@@ -414,6 +415,10 @@ def main(args):
     config["condition"]["use_prompt"] = args.use_prompt
     config["condition"]["use_degradation_vector"] = args.use_degradation_vector
     config["condition"]["use_suggestions"] = args.use_suggestions
+    if args.prompt_variant is None:
+        args.prompt_variant = cfg(config, "condition.prompt_variant", None)
+    else:
+        config["condition"]["prompt_variant"] = args.prompt_variant
     lr_cond_mode = config["condition"]["lr_cond_mode"]
     if args.text_encoding_mode is not None:
         config["text_encoding"]["mode"] = args.text_encoding_mode
@@ -502,6 +507,7 @@ def build_arg_parser():
     )
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prompt_variant", choices=PROMPT_VARIANTS, default=None)
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)

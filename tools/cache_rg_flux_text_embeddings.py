@@ -51,7 +51,7 @@ def iter_jsonl_records(jsonl_path, limit=None):
                 break
 
 
-def prompt_from_record(record, use_prompt=True, use_suggestions=True):
+def prompt_from_record(record, use_prompt=True, use_suggestions=True, prompt_variant=None):
     unipercept_raw = record.get("unipercept_raw")
     unipercept_raw = unipercept_raw if isinstance(unipercept_raw, dict) else {}
     profile = unipercept_raw.get("profile")
@@ -61,6 +61,7 @@ def prompt_from_record(record, use_prompt=True, use_suggestions=True):
         profile,
         use_prompt=use_prompt,
         use_suggestions=use_suggestions,
+        prompt_variant=prompt_variant,
     )
 
 
@@ -101,6 +102,7 @@ def main(args):
     dtype = torch_dtype(args.dtype)
     use_prompt = bool(runtime_config.get("condition", {}).get("use_prompt", True))
     use_suggestions = bool(runtime_config.get("condition", {}).get("use_suggestions", True))
+    prompt_variant = runtime_config.get("condition", {}).get("prompt_variant")
 
     generated = 0
     skipped = 0
@@ -116,7 +118,12 @@ def main(args):
             continue
         image_key = normalize_image_key(lq_path)
         try:
-            prompt = prompt_from_record(record, use_prompt=use_prompt, use_suggestions=use_suggestions)
+            prompt = prompt_from_record(
+                record,
+                use_prompt=use_prompt,
+                use_suggestions=use_suggestions,
+                prompt_variant=prompt_variant,
+            )
             existing = cache.find_record(prompt, image_key=image_key, allow_prompt_reuse=True)
             if args.skip_existing and existing is not None:
                 if normalize_image_key(existing.get("image_key")) == image_key:

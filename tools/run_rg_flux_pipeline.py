@@ -10,6 +10,7 @@ import yaml
 
 
 DEFAULT_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"]
+PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
 
 
 def cfg(config, path, default=None):
@@ -55,9 +56,11 @@ def make_experiment_name(config):
     stage = cfg(config, "training.stage", "A")
     crop = cfg(config, "data.crop_size", 512)
     backend = str(cfg(config, "model.flux_backend", "flux1") or "flux1").lower()
+    prompt_variant = cfg(config, "condition.prompt_variant", None)
+    prompt_suffix = f"_prompt_{prompt_variant}" if prompt_variant else ""
     if backend in {"flux2_klein", "flux2-klein", "flux_2_klein"}:
-        return f"rg_flux2_klein_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
-    return f"rg_flux_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}"
+        return f"rg_flux2_klein_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}{prompt_suffix}"
+    return f"rg_flux_sr_ms_stage{stage}_{lr_mode}_size{crop}{suffix}{prompt_suffix}"
 
 
 def resolve_experiment_name(config, output_root, now=None):
@@ -78,9 +81,25 @@ def resolve_experiment_name(config, output_root, now=None):
     return candidate, run_id
 
 
-def create_runtime_config(train_config_path, now=None):
+def apply_prompt_variant(config, prompt_variant):
+    if prompt_variant is None:
+        return config
+    prompt_variant = str(prompt_variant).strip().lower().replace("-", "_")
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(
+            f"Unsupported prompt_variant '{prompt_variant}'. Expected one of: {', '.join(PROMPT_VARIANTS)}"
+        )
+    condition = config.setdefault("condition", {})
+    condition["prompt_variant"] = prompt_variant
+    condition["use_prompt"] = prompt_variant != "fixed"
+    condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
+    return config
+
+
+def create_runtime_config(train_config_path, now=None, prompt_variant=None):
     source_config = load_yaml(train_config_path)
     runtime_config = copy.deepcopy(source_config)
+    apply_prompt_variant(runtime_config, prompt_variant)
     runtime_config.setdefault("training", {})
     output_root = Path(cfg(runtime_config, "training.output_dir", "exp_rg_flux_sr"))
     exp_name, run_id = resolve_experiment_name(runtime_config, output_root=output_root, now=now)
@@ -259,6 +278,7 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
     _append_optional(cmd, "--device", args.device)
     _append_optional(cmd, "--lr_cond_mode", args.lr_cond_mode)
     _append_optional(cmd, "--min_size", args.min_size)
+    _append_optional(cmd, "--prompt_variant", getattr(args, "prompt_variant", None))
     _append_optional_bool(cmd, "--use_prompt", "--no-use_prompt", args.use_prompt)
     _append_optional_bool(cmd, "--use_suggestions", "--no-use_suggestions", args.use_suggestions)
     _append_optional_bool(cmd, "--use_degradation_vector", "--no-use_degradation_vector", args.use_degradation_vector)
@@ -347,6 +367,8 @@ def apply_config_prompt_defaults(args, config):
     if not isinstance(config, dict):
         return
     condition = config.get("condition", {}) if isinstance(config.get("condition"), dict) else {}
+    if getattr(args, "prompt_variant", None) is None and "prompt_variant" in condition:
+        args.prompt_variant = condition["prompt_variant"]
     if args.use_prompt is None and "use_prompt" in condition:
         args.use_prompt = bool(condition["use_prompt"])
     if args.use_suggestions is None and "use_suggestions" in condition:
@@ -413,6 +435,12 @@ def build_arg_parser():
     parser.add_argument("--restore_input_size", action="store_true")
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--prompt_variant",
+        choices=PROMPT_VARIANTS,
+        default=None,
+        help="Prompt ablation variant. Explicit variants override the legacy prompt booleans.",
+    )
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--metric_device", default="cpu")
@@ -447,7 +475,10 @@ def main(argv=None):
         runtime_config_path = resolve_skip_train_config_path(run_dir, args.train_config)
         runtime_config = load_yaml(runtime_config_path) if runtime_config_path.suffix != ".json" else json.loads(runtime_config_path.read_text(encoding="utf-8"))
     else:
-        runtime_config, run_dir, runtime_config_path = create_runtime_config(args.train_config)
+        runtime_config, run_dir, runtime_config_path = create_runtime_config(
+            args.train_config,
+            prompt_variant=args.prompt_variant,
+        )
         train_cmd = build_train_command(args, runtime_config_path)
         if args.dry_run_pipeline:
             train_returncode = None

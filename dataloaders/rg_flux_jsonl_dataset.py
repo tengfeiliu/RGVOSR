@@ -24,6 +24,7 @@ class RGFluxSRJsonlDataset(Dataset):
         mode="train",
         use_prompt=True,
         use_suggestions=True,
+        prompt_variant=None,
         use_degradation_vector=True,
         vae_align=16,
         max_retry=100,
@@ -35,6 +36,7 @@ class RGFluxSRJsonlDataset(Dataset):
         self.mode = mode
         self.use_prompt = bool(use_prompt)
         self.use_suggestions = bool(use_suggestions)
+        self.prompt_variant = prompt_variant
         self.use_degradation_vector = bool(use_degradation_vector)
         self.vae_align = int(vae_align)
         self.max_retry = int(max_retry)
@@ -165,6 +167,7 @@ class RGFluxSRJsonlDataset(Dataset):
                         profile,
                         use_prompt=self.use_prompt,
                         use_suggestions=self.use_suggestions,
+                        prompt_variant=self.prompt_variant,
                     ),
                     "degradation_vector": self._degradation_vector(result),
                     "score": torch.tensor(float(result.get("score", 0.0) or 0.0), dtype=torch.float32),

@@ -70,6 +70,9 @@ def compute_encoder_signature(config, dtype=None):
         "dtype": normalize_dtype_name(dtype or cfg(config, "text_encoding.dtype", cfg(config, "model.dtype", "bf16"))),
         "prompt_builder": PROMPT_BUILDER_SIGNATURE,
     }
+    prompt_variant = cfg(config, "condition.prompt_variant", None)
+    if prompt_variant is not None:
+        payload["prompt_variant"] = str(prompt_variant)
     return stable_json_hash(payload)
 
 
@@ -314,6 +317,7 @@ class TextEmbeddingCache:
             "max_prompt_sequence_length": int(cfg(self.config, "model.max_prompt_sequence_length", 128) or 0),
             "use_prompt": bool(cfg(self.config, "condition.use_prompt", True)),
             "use_suggestions": bool(cfg(self.config, "condition.use_suggestions", True)),
+            "prompt_variant": cfg(self.config, "condition.prompt_variant", None),
             "dtype": self.dtype_name,
         }
         return self.append_manifest_record(record)

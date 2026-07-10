@@ -71,6 +71,7 @@ def initialize_prototypes(artist, config, device, dtype, num_samples, text_embed
         mode="eval",
         use_prompt=bool(config.get("condition", {}).get("use_prompt", True)),
         use_suggestions=bool(config.get("condition", {}).get("use_suggestions", True)),
+        prompt_variant=config.get("condition", {}).get("prompt_variant"),
         use_degradation_vector=bool(config.get("condition", {}).get("use_degradation_vector", True)),
         vae_align=int(config.get("data", {}).get("vae_align", 16)),
     )
