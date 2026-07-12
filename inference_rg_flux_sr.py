@@ -248,16 +248,65 @@ def load_jsonl_conditions(jsonl_path):
                 "result": result,
                 "record": record,
             }
-            for key in ("lq_path", "hq_path"):
+            dataset_name = record.get("dataset_name") or record.get("dataset")
+            for key in ("lq_path", "hq_path", "image_path", "path"):
                 value = record.get(key)
                 if value:
-                    index[str(Path(value))] = condition
-                    index[Path(value).name] = condition
+                    for alias in path_lookup_aliases(value, dataset_name=dataset_name):
+                        index[alias] = condition
     return index
 
 
-def condition_for_image(condition_index, image_path):
-    return condition_index.get(str(image_path)) or condition_index.get(image_path.name)
+def _normalize_lookup_path(value):
+    return str(value).replace("\\", "/")
+
+
+def path_lookup_aliases(value, dataset_name=None):
+    path = Path(value)
+    normalized = _normalize_lookup_path(value)
+    parts = [part for part in normalized.split("/") if part]
+    aliases = []
+
+    def add(alias):
+        if alias and alias not in aliases:
+            aliases.append(alias)
+
+    add(normalized)
+    if dataset_name:
+        add(f"{dataset_name}/{path.name}")
+        add(f"{dataset_name}/lq/{path.name}")
+    for start in range(len(parts)):
+        add("/".join(parts[start:]))
+    add(path.name)
+    return aliases
+
+
+def extend_lookup_aliases(target, aliases):
+    for alias in aliases:
+        if alias not in target:
+            target.append(alias)
+
+
+def image_lookup_aliases(image_path, dataset_name=None, input_root=None):
+    aliases = []
+    extend_lookup_aliases(aliases, path_lookup_aliases(image_path, dataset_name=dataset_name))
+    image_path = Path(image_path)
+    if input_root is not None:
+        try:
+            rel_path = image_path.relative_to(Path(input_root))
+        except ValueError:
+            rel_path = None
+        if rel_path is not None:
+            extend_lookup_aliases(aliases, path_lookup_aliases(rel_path, dataset_name=dataset_name))
+    return aliases
+
+
+def condition_for_image(condition_index, image_path, dataset_name=None, input_root=None):
+    for alias in image_lookup_aliases(image_path, dataset_name=dataset_name, input_root=input_root):
+        condition = condition_index.get(alias)
+        if condition is not None:
+            return condition
+    return None
 
 
 def append_inference_failure(log_path, image_path, reason, condition=None):
@@ -325,7 +374,12 @@ def run_inference_dataset(
     for image_path in tqdm(image_paths, desc=f"RG-FLUX-SR inference [{dataset_name}]"):
         condition = None
         if args.jsonl_path:
-            condition = condition_for_image(condition_index, image_path)
+            condition = condition_for_image(
+                condition_index,
+                image_path,
+                dataset_name=dataset_name,
+                input_root=input_path,
+            )
             if condition is None:
                 append_inference_failure(
                     failure_log_path,

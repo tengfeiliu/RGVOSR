@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VARIANTS = ("suggestion", "iqa", "iqa_suggestion")
+DEFAULT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
 
 
 def normalize_variant(variant):
@@ -33,7 +33,7 @@ def build_variant_command(variant, pipeline_args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run suggestion, IQA, and IQA+suggestion RG-FLUX-SR ablations sequentially."
+        description="Run fixed, suggestion, IQA, and IQA+suggestion RG-FLUX-SR ablations sequentially."
     )
     parser.add_argument("--variants", nargs="+", choices=DEFAULT_VARIANTS, default=list(DEFAULT_VARIANTS))
     parser.add_argument(

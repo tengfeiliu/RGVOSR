@@ -485,7 +485,14 @@ class RGFluxSRComponentTests(unittest.TestCase):
     def test_inference_jsonl_conditions_load_cleaned_profile_and_result(self):
         source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        helper_names = {"load_jsonl_conditions", "condition_for_image"}
+        helper_names = {
+            "_normalize_lookup_path",
+            "path_lookup_aliases",
+            "extend_lookup_aliases",
+            "image_lookup_aliases",
+            "load_jsonl_conditions",
+            "condition_for_image",
+        }
         helpers = [
             node
             for node in tree.body
@@ -524,10 +531,74 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(by_full_path["result"]["degradation_vector"]["blur"], 0.7)
         self.assertEqual(by_basename["profile"]["suggestion"], "cleaned suggestion")
 
+    def test_inference_jsonl_conditions_match_suffix_and_dataset_aliases(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper_names = {
+            "_normalize_lookup_path",
+            "path_lookup_aliases",
+            "extend_lookup_aliases",
+            "image_lookup_aliases",
+            "load_jsonl_conditions",
+            "condition_for_image",
+        }
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helpers}, helper_names)
+
+        namespace = {"json": json, "Path": Path}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jsonl_path = root / "valid.cleaned.jsonl"
+            profile_a = {"iqa": {"overall_quality": "real lq"}, "suggestion": "a"}
+            profile_b = {"iqa": {"overall_quality": "real lr"}, "suggestion": "b"}
+            records = [
+                {
+                    "dataset_name": "RealLQ250",
+                    "lq_path": "/old/root/datasets/RealLQ250/lq/001.png",
+                    "hq_path": "/old/root/datasets/RealLQ250/lq/001.png",
+                    "unipercept_raw": {"profile": profile_a},
+                },
+                {
+                    "dataset_name": "RealLR200",
+                    "lq_path": "RealLR200/001.png",
+                    "hq_path": "RealLR200/001.png",
+                    "unipercept_raw": {"profile": profile_b},
+                },
+            ]
+            jsonl_path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+            index = namespace["load_jsonl_conditions"](jsonl_path)
+            suffix_match = namespace["condition_for_image"](
+                index,
+                Path("/root/autodl-tmp/datasets/omgsr_eval/RealLQ250/lq/001.png"),
+                dataset_name="RealLQ250",
+            )
+            dataset_match = namespace["condition_for_image"](
+                index,
+                Path("/root/autodl-tmp/datasets/omgsr_eval/RealLR200-xxx/RealLR200/001.png"),
+                dataset_name="RealLR200",
+            )
+
+        self.assertEqual(suffix_match["profile"]["iqa"]["overall_quality"], "real lq")
+        self.assertEqual(dataset_match["profile"]["iqa"]["overall_quality"], "real lr")
+
     def test_inference_jsonl_conditions_keep_records_without_profile_for_failure_logging(self):
         source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        helper_names = {"load_jsonl_conditions", "condition_for_image"}
+        helper_names = {
+            "_normalize_lookup_path",
+            "path_lookup_aliases",
+            "extend_lookup_aliases",
+            "image_lookup_aliases",
+            "load_jsonl_conditions",
+            "condition_for_image",
+        }
         helpers = [
             node
             for node in tree.body

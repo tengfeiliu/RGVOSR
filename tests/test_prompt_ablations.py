@@ -59,11 +59,26 @@ class PromptAblationTests(unittest.TestCase):
 
 
 class PromptAblationPipelineTests(unittest.TestCase):
+    def test_ablation_suite_defaults_include_fixed_prompt_baseline(self):
+        from tools.run_rg_flux_prompt_ablations import DEFAULT_VARIANTS, parse_args
+
+        self.assertEqual(DEFAULT_VARIANTS, ("fixed", "suggestion", "iqa", "iqa_suggestion"))
+
+        args = parse_args([
+            "--",
+            "--train_config",
+            "configs/ablation.yaml",
+            "--checkpoint_steps",
+            "20000",
+        ])
+
+        self.assertEqual(args.variants, ["fixed", "suggestion", "iqa", "iqa_suggestion"])
+
     def test_ablation_suite_builds_one_pipeline_command_per_variant(self):
         from tools.run_rg_flux_prompt_ablations import build_variant_command
 
         command = build_variant_command(
-            "iqa",
+            "fixed",
             [
                 "--train_config",
                 "configs/ablation.yaml",
@@ -76,8 +91,43 @@ class PromptAblationPipelineTests(unittest.TestCase):
 
         self.assertIn("tools/run_rg_flux_pipeline.py", command)
         self.assertIn("--prompt_variant", command)
-        self.assertEqual(command[command.index("--prompt_variant") + 1], "iqa")
+        self.assertEqual(command[command.index("--prompt_variant") + 1], "fixed")
         self.assertIn("configs/ablation.yaml", command)
+
+    def test_fixed_prompt_runtime_config_disables_dynamic_prompt_flags(self):
+        from tools.run_rg_flux_pipeline import create_runtime_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "train.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"flux_backend": "flux2_klein"},
+                        "text_encoding": {"mode": "online"},
+                        "data": {"crop_size": 512},
+                        "condition": {
+                            "lr_cond_mode": "flux2_image_concat",
+                            "use_prompt": True,
+                            "use_suggestions": True,
+                        },
+                        "training": {
+                            "stage": "0B",
+                            "output_dir": str(root / "exp"),
+                            "add_datetime_suffix": False,
+                            "suffix": "_ablation",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config, run_dir, _ = create_runtime_config(config_path, prompt_variant="fixed")
+
+        self.assertEqual(runtime_config["condition"]["prompt_variant"], "fixed")
+        self.assertFalse(runtime_config["condition"]["use_prompt"])
+        self.assertFalse(runtime_config["condition"]["use_suggestions"])
+        self.assertIn("prompt_fixed", run_dir.name)
 
     def test_runtime_config_and_inference_command_share_prompt_variant(self):
         from tools.run_rg_flux_pipeline import (
