@@ -1522,6 +1522,115 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("valid cleaned quality", sample["prompt"])
         self.assertNotIn("old invalid reasoning", sample["prompt"])
 
+    def test_prompt_curriculum_switches_on_optimizer_step_boundary(self):
+        try:
+            from train_rg_flux_sr import resolve_batch_prompts, resolve_prompt_schedule
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"training dependencies are not installed: {exc}")
+
+        config = {
+            "condition": {
+                "prompt_schedule": {
+                    "enabled": True,
+                    "switch_step": 10000,
+                    "before_variant": "fixed",
+                    "after_variant": "suggestion",
+                }
+            }
+        }
+        profile = {
+            "iqa": {"overall_quality": "Moderate blur."},
+            "suggestion": "Moderately restore stable edges.",
+        }
+        batch = {"prompt": ["legacy prompt"], "profile": [profile]}
+        schedule = resolve_prompt_schedule(config)
+
+        before_prompts, before_variant = resolve_batch_prompts(
+            batch,
+            config,
+            global_step=9999,
+            prompt_schedule=schedule,
+        )
+        after_prompts, after_variant = resolve_batch_prompts(
+            batch,
+            config,
+            global_step=10000,
+            prompt_schedule=schedule,
+        )
+
+        self.assertEqual(before_variant, "fixed")
+        self.assertNotIn("Moderately restore stable edges.", before_prompts[0])
+        self.assertEqual(after_variant, "suggestion")
+        self.assertIn("Moderately restore stable edges.", after_prompts[0])
+
+    def test_jsonl_dataset_full_frame_branch_preserves_composition_and_aligns_to_32(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        try:
+            from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"dataset dependencies are not installed: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hq_path = root / "hq_wide.png"
+            lq_path = root / "lq_wide.png"
+            Image.new("RGB", (1000, 700), color=(128, 96, 64)).save(hq_path)
+            Image.new("RGB", (250, 175), color=(64, 96, 128)).save(lq_path)
+            jsonl_path = root / "valid.jsonl"
+            record = {
+                "hq_path": str(hq_path),
+                "lq_path": str(lq_path),
+                "unipercept_raw": {
+                    "profile": {
+                        "iqa": {"overall_quality": "Moderate blur."},
+                        "suggestion": "Restore stable edges.",
+                    }
+                },
+                "result": {"score": 1, "degradation_vector": {}},
+            }
+            jsonl_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            dataset = RGFluxSRJsonlDataset(
+                jsonl_path=str(jsonl_path),
+                crop_size=512,
+                scale=4,
+                mode="train",
+                return_profile=True,
+                mixed_crop_enabled=True,
+                full_frame_ratio=1.0,
+                full_frame_max_long_side=768,
+                full_frame_align=32,
+                full_frame_pad_mode="reflect",
+            )
+            sample = dataset[0]
+
+        self.assertEqual(sample["spatial_mode"], "full_frame")
+        self.assertEqual(tuple(sample["hq"].shape), (3, 544, 768))
+        self.assertEqual(sample["lq_up"].shape, sample["hq"].shape)
+        self.assertEqual(sample["lq"].shape, sample["hq"].shape)
+        self.assertEqual(sample["profile"]["suggestion"], "Restore stable edges.")
+        self.assertEqual(sample["hq"].shape[-2] % 32, 0)
+        self.assertEqual(sample["hq"].shape[-1] % 32, 0)
+
+    def test_curriculum_mixed_crop_config_is_opt_in_and_memory_bounded(self):
+        old_config = yaml.safe_load(
+            Path("configs/train_rg_flux2_klein_sr_stage0b_512.yaml").read_text(encoding="utf-8")
+        )
+        new_config = yaml.safe_load(
+            Path(
+                "configs/train_rg_flux2_klein_sr_stage0b_512_prompt_curriculum_mixedcrop.yaml"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertNotIn("mixed_crop", old_config["data"])
+        self.assertNotIn("prompt_schedule", old_config["condition"])
+        self.assertEqual(new_config["condition"]["prompt_schedule"]["switch_step"], 10000)
+        self.assertEqual(new_config["condition"]["prompt_schedule"]["before_variant"], "fixed")
+        self.assertEqual(new_config["data"]["mixed_crop"]["full_frame_ratio"], 0.25)
+        self.assertEqual(new_config["data"]["mixed_crop"]["full_frame_max_long_side"], 768)
+        self.assertEqual(new_config["loss"]["image_loss_crop_size"], 512)
+
     def test_degradation_vector_encoder_outputs_context_tokens(self):
         if torch is None:
             self.skipTest("torch is not installed in this environment")

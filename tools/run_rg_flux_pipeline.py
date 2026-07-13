@@ -93,6 +93,9 @@ def apply_prompt_variant(config, prompt_variant):
     condition["prompt_variant"] = prompt_variant
     condition["use_prompt"] = prompt_variant != "fixed"
     condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
+    prompt_schedule = condition.get("prompt_schedule")
+    if isinstance(prompt_schedule, dict) and cfg_bool(config, "condition.prompt_schedule.enabled", False):
+        prompt_schedule["after_variant"] = prompt_variant
     return config
 
 

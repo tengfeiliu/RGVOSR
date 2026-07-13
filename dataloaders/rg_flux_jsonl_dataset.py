@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import random
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as tv_functional
 
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from models.prompt_builder import build_sr_prompt
@@ -28,6 +30,13 @@ class RGFluxSRJsonlDataset(Dataset):
         use_degradation_vector=True,
         vae_align=16,
         max_retry=100,
+        return_profile=False,
+        mixed_crop_enabled=False,
+        full_frame_ratio=0.0,
+        full_frame_max_long_side=768,
+        full_frame_align=32,
+        full_frame_pad_mode="reflect",
+        full_frame_upscale_small=False,
     ):
         super().__init__()
         self.jsonl_path = Path(jsonl_path)
@@ -40,12 +49,29 @@ class RGFluxSRJsonlDataset(Dataset):
         self.use_degradation_vector = bool(use_degradation_vector)
         self.vae_align = int(vae_align)
         self.max_retry = int(max_retry)
+        self.return_profile = bool(return_profile)
+        self.mixed_crop_enabled = bool(mixed_crop_enabled)
+        self.full_frame_ratio = float(full_frame_ratio)
+        self.full_frame_max_long_side = int(full_frame_max_long_side)
+        self.full_frame_align = int(full_frame_align)
+        self.full_frame_pad_mode = str(full_frame_pad_mode).strip().lower()
+        self.full_frame_upscale_small = bool(full_frame_upscale_small)
         self.to_tensor = transforms.ToTensor()
 
         if self.vae_align > 1:
             self.crop_size = self.crop_size - (self.crop_size % self.vae_align)
         if self.crop_size <= 0:
             raise ValueError("crop_size must be positive after VAE alignment")
+        if not 0.0 <= self.full_frame_ratio <= 1.0:
+            raise ValueError("full_frame_ratio must be between 0 and 1")
+        if self.full_frame_max_long_side <= 0:
+            raise ValueError("full_frame_max_long_side must be positive")
+        if self.full_frame_align <= 0:
+            raise ValueError("full_frame_align must be positive")
+        if self.full_frame_pad_mode not in {"constant", "edge", "reflect", "symmetric"}:
+            raise ValueError(
+                "full_frame_pad_mode must be one of: constant, edge, reflect, symmetric"
+            )
         if not self.jsonl_path.exists():
             raise FileNotFoundError(f"JSONL file not found: {self.jsonl_path}")
 
@@ -140,6 +166,88 @@ class RGFluxSRJsonlDataset(Dataset):
         lq_up = lq_crop.resize((self.crop_size, self.crop_size), Image.Resampling.BICUBIC)
         return hq_crop, lq_crop, lq_up
 
+    def _align_up(self, value):
+        return int(math.ceil(max(int(value), 1) / self.full_frame_align) * self.full_frame_align)
+
+    def _pad_to_size(self, image, width, height):
+        pad_w = max(int(width) - image.width, 0)
+        pad_h = max(int(height) - image.height, 0)
+        if pad_w == 0 and pad_h == 0:
+            return image
+        padding = [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2]
+        padding_mode = self.full_frame_pad_mode
+        if padding_mode == "reflect" and (
+            padding[0] >= image.width
+            or padding[2] >= image.width
+            or padding[1] >= image.height
+            or padding[3] >= image.height
+        ):
+            padding_mode = "edge"
+        return tv_functional.pad(
+            image,
+            padding,
+            fill=0,
+            padding_mode=padding_mode,
+        )
+
+    def _full_frame_pair(self, hq, lq):
+        source_width, source_height = hq.size
+        source_long_side = max(source_width, source_height)
+        should_resize = source_long_side > self.full_frame_max_long_side
+        should_resize = should_resize or (
+            self.full_frame_upscale_small and source_long_side < self.full_frame_max_long_side
+        )
+        resize_scale = (
+            self.full_frame_max_long_side / max(source_long_side, 1)
+            if should_resize
+            else 1.0
+        )
+        content_width = max(1, int(round(source_width * resize_scale)))
+        content_height = max(1, int(round(source_height * resize_scale)))
+
+        if (content_width, content_height) != hq.size:
+            hq_content = hq.resize((content_width, content_height), Image.Resampling.BICUBIC)
+        else:
+            hq_content = hq
+
+        ratio_x = source_width / max(lq.width, 1)
+        ratio_y = source_height / max(lq.height, 1)
+        lq_content_width = max(1, int(round(content_width / max(ratio_x, 1e-8))))
+        lq_content_height = max(1, int(round(content_height / max(ratio_y, 1e-8))))
+        if (lq_content_width, lq_content_height) != lq.size:
+            lq_content = lq.resize(
+                (lq_content_width, lq_content_height),
+                Image.Resampling.BICUBIC,
+            )
+        else:
+            lq_content = lq
+        lq_up_content = lq_content.resize(
+            (content_width, content_height),
+            Image.Resampling.BICUBIC,
+        )
+
+        aligned_width = self._align_up(content_width)
+        aligned_height = self._align_up(content_height)
+        hq_frame = self._pad_to_size(hq_content, aligned_width, aligned_height)
+        lq_up = self._pad_to_size(lq_up_content, aligned_width, aligned_height)
+
+        # The raw LQ tensor is used only as a downsample-consistency reference in
+        # the current training path. Returning the aligned LQ-up image keeps that
+        # reference spatially consistent with the padded full-frame target.
+        lq_frame = lq_up.copy()
+        return hq_frame, lq_frame, lq_up
+
+    def _sample_pair(self, hq, lq):
+        use_full_frame = (
+            self.mode == "train"
+            and self.mixed_crop_enabled
+            and self.full_frame_ratio > 0.0
+            and random.random() < self.full_frame_ratio
+        )
+        if use_full_frame:
+            return (*self._full_frame_pair(hq, lq), "full_frame")
+        return (*self._crop_pair(hq, lq), "local_crop")
+
     def _normalize_m11(self, image):
         return self.to_tensor(image).mul(2.0).sub(1.0)
 
@@ -156,10 +264,10 @@ class RGFluxSRJsonlDataset(Dataset):
             try:
                 hq = self._load_rgb(record["hq_path"])
                 lq = self._load_rgb(record["lq_path"])
-                hq_crop, lq_crop, lq_up = self._crop_pair(hq, lq)
+                hq_crop, lq_crop, lq_up, spatial_mode = self._sample_pair(hq, lq)
                 profile = record["profile"]
                 result = record["result"]
-                return {
+                sample = {
                     "hq": self._normalize_m11(hq_crop),
                     "lq": self._normalize_m11(lq_crop),
                     "lq_up": self._normalize_m11(lq_up),
@@ -174,7 +282,11 @@ class RGFluxSRJsonlDataset(Dataset):
                     "suggestions": list(result.get("suggestions") or []),
                     "hq_path": record["hq_path"],
                     "lq_path": record["lq_path"],
+                    "spatial_mode": spatial_mode,
                 }
+                if self.return_profile:
+                    sample["profile"] = profile
+                return sample
             except Exception as exc:
                 if retry == 0:
                     logger.warning("Failed to load RG-FLUX-SR sample %s: %s", record, exc)
@@ -192,4 +304,7 @@ def rg_flux_collate_fn(batch):
     collated["suggestions"] = [item["suggestions"] for item in batch]
     collated["hq_path"] = [item["hq_path"] for item in batch]
     collated["lq_path"] = [item["lq_path"] for item in batch]
+    collated["spatial_mode"] = [item.get("spatial_mode", "local_crop") for item in batch]
+    if all("profile" in item for item in batch):
+        collated["profile"] = [item["profile"] for item in batch]
     return collated

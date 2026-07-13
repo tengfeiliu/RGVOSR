@@ -31,7 +31,7 @@ from dataloaders.degradation_meta import DEGRADATION_KEYS
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
 from metrics.rg_sr_metrics import DEFAULT_OMGSR_METRICS, evaluate_dataset_dirs
 from models.rg_flux_artist_factory import build_rg_flux_artist
-from models.prompt_builder import build_sr_prompt
+from models.prompt_builder import build_sr_prompt, normalize_prompt_variant
 from models.text_embedding_cache import (
     get_text_embedding_cache,
     normalize_text_encoding_mode,
@@ -67,6 +67,83 @@ def cfg_bool(config, path, default=False):
         if value in {"0", "false", "no", "n", "off", "none", "null", ""}:
             return False
     return bool(value)
+
+
+def resolve_prompt_schedule(config):
+    enabled = cfg_bool(config, "condition.prompt_schedule.enabled", False)
+    switch_step = int(cfg(config, "condition.prompt_schedule.switch_step", 0) or 0)
+    if switch_step < 0:
+        raise ValueError("condition.prompt_schedule.switch_step must be non-negative")
+
+    before_variant = normalize_prompt_variant(
+        cfg(config, "condition.prompt_schedule.before_variant", "fixed")
+    )
+    after_value = cfg(
+        config,
+        "condition.prompt_schedule.after_variant",
+        cfg(config, "condition.prompt_variant", "fixed"),
+    )
+    after_variant = normalize_prompt_variant(after_value or "fixed")
+    return {
+        "enabled": enabled,
+        "switch_step": switch_step,
+        "before_variant": before_variant or "fixed",
+        "after_variant": after_variant or "fixed",
+    }
+
+
+def prompt_variant_for_step(prompt_schedule, global_step):
+    if not prompt_schedule.get("enabled", False):
+        return None
+    if int(global_step) < int(prompt_schedule["switch_step"]):
+        return prompt_schedule["before_variant"]
+    return prompt_schedule["after_variant"]
+
+
+def resolve_batch_prompts(batch, config, global_step, prompt_schedule=None):
+    prompt_schedule = prompt_schedule or resolve_prompt_schedule(config)
+    active_variant = prompt_variant_for_step(prompt_schedule, global_step)
+    if active_variant is None:
+        return list(batch["prompt"]), None
+
+    profiles = batch.get("profile")
+    if not isinstance(profiles, list) or len(profiles) != len(batch["prompt"]):
+        raise RuntimeError(
+            "Prompt curriculum requires one cleaned profile per batch sample. "
+            "Enable return_profile on RGFluxSRJsonlDataset."
+        )
+    prompts = [
+        build_sr_prompt(profile, prompt_variant=active_variant)
+        for profile in profiles
+    ]
+    return prompts, active_variant
+
+
+def resolve_mixed_crop_config(config):
+    enabled = cfg_bool(config, "data.mixed_crop.enabled", False)
+    ratio = float(cfg(config, "data.mixed_crop.full_frame_ratio", 0.0) or 0.0)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("data.mixed_crop.full_frame_ratio must be between 0 and 1")
+    max_long_side = int(cfg(config, "data.mixed_crop.full_frame_max_long_side", 768) or 0)
+    align = int(cfg(config, "data.mixed_crop.full_frame_align", 32) or 0)
+    if max_long_side <= 0:
+        raise ValueError("data.mixed_crop.full_frame_max_long_side must be positive")
+    if align <= 0:
+        raise ValueError("data.mixed_crop.full_frame_align must be positive")
+    return {
+        "enabled": enabled,
+        "full_frame_ratio": ratio,
+        "full_frame_max_long_side": max_long_side,
+        "full_frame_align": align,
+        "full_frame_pad_mode": str(
+            cfg(config, "data.mixed_crop.full_frame_pad_mode", "reflect") or "reflect"
+        ).strip().lower(),
+        "full_frame_upscale_small": cfg_bool(
+            config,
+            "data.mixed_crop.upscale_small_images",
+            False,
+        ),
+    }
 
 
 def normalize_loss_record_formats(formats):
@@ -1053,6 +1130,8 @@ def main(config_path, dry_run=False):
     config.setdefault("condition", {})
     config.setdefault("evaluation", {})
     config.setdefault("text_encoding", {})
+    prompt_schedule = resolve_prompt_schedule(config)
+    mixed_crop = resolve_mixed_crop_config(config)
 
     output_root = Path(cfg(config, "training.output_dir", "exp_rg_flux_sr"))
     report_to = normalize_report_to(cfg(config, "training.report_to", None))
@@ -1065,6 +1144,11 @@ def main(config_path, dry_run=False):
     output_dir = output_root / exp_name
     logging_dir = output_dir / cfg(config, "training.logging_dir", "logs")
     per_device_batch = int(cfg(config, "data.batch_size", 1))
+    if mixed_crop["enabled"] and mixed_crop["full_frame_ratio"] > 0.0 and per_device_batch != 1:
+        raise ValueError(
+            "Mixed local/full-frame training currently requires data.batch_size: 1 "
+            "because full-frame samples have variable aligned resolutions."
+        )
     grad_accum = int(cfg(config, "training.grad_accum_steps", 1))
     gradient_accumulation_plugin, supports_sync_each_batch = create_gradient_accumulation_plugin(grad_accum)
 
@@ -1095,6 +1179,21 @@ def main(config_path, dry_run=False):
         local_logger.info("  text_encoding.cache_dir = %s", cfg(config, "text_encoding.cache_dir", None))
         local_logger.info("  vae_device = %s", cfg(config, "model.vae_device", "cpu"))
         local_logger.info("  max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
+        local_logger.info(
+            "  prompt_schedule = enabled:%s switch_step:%s before:%s after:%s",
+            prompt_schedule["enabled"],
+            prompt_schedule["switch_step"],
+            prompt_schedule["before_variant"],
+            prompt_schedule["after_variant"],
+        )
+        local_logger.info(
+            "  mixed_crop = enabled:%s local_ratio:%.3f full_frame_ratio:%.3f max_long_side:%s align:%s",
+            mixed_crop["enabled"],
+            1.0 - mixed_crop["full_frame_ratio"],
+            mixed_crop["full_frame_ratio"],
+            mixed_crop["full_frame_max_long_side"],
+            mixed_crop["full_frame_align"],
+        )
         crop_size = int(cfg(config, "data.crop_size", 512))
         vae_scale_factor = 8
         latent_size = crop_size // vae_scale_factor
@@ -1173,6 +1272,13 @@ def main(config_path, dry_run=False):
         prompt_variant=cfg(config, "condition.prompt_variant", None),
         use_degradation_vector=bool(cfg(config, "condition.use_degradation_vector", True)),
         vae_align=int(cfg(config, "data.vae_align", 16)),
+        return_profile=prompt_schedule["enabled"],
+        mixed_crop_enabled=mixed_crop["enabled"],
+        full_frame_ratio=mixed_crop["full_frame_ratio"],
+        full_frame_max_long_side=mixed_crop["full_frame_max_long_side"],
+        full_frame_align=mixed_crop["full_frame_align"],
+        full_frame_pad_mode=mixed_crop["full_frame_pad_mode"],
+        full_frame_upscale_small=mixed_crop["full_frame_upscale_small"],
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -1297,6 +1403,8 @@ def main(config_path, dry_run=False):
     )
     sigma_sampling = cfg(config, "flow_matching.sigma_sampling", "uniform")
     lr_cond_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
+    text_encoding_mode = normalize_text_encoding_mode(config)
+    fixed_prompt_embedding_cache = {}
 
     while global_step < max_steps:
         for batch in dataloader:
@@ -1305,7 +1413,12 @@ def main(config_path, dry_run=False):
             hq = batch["hq"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             lq_up = batch["lq_up"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             degradation_vector = batch["degradation_vector"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-            prompts = batch["prompt"]
+            prompts, active_prompt_variant = resolve_batch_prompts(
+                batch,
+                config,
+                global_step,
+                prompt_schedule=prompt_schedule,
+            )
 
             unwrapped_artist = accelerator.unwrap_model(artist)
             moe_schedule = (
@@ -1319,15 +1432,32 @@ def main(config_path, dry_run=False):
                     lq_up,
                     sample=lr_cond_mode != "flux2_image_concat",
                 ).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-                prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
-                    artist=unwrapped_artist,
-                    prompts=prompts,
-                    image_keys=batch["lq_path"],
-                    config=config,
-                    device=accelerator.device,
-                    dtype=weight_dtype,
-                    cache=text_embedding_cache,
+                fixed_cache_key = None
+                if active_prompt_variant == "fixed" and text_encoding_mode == "online":
+                    fixed_cache_key = (len(prompts), tuple(prompts))
+                cached_fixed_state = (
+                    fixed_prompt_embedding_cache.get(fixed_cache_key)
+                    if fixed_cache_key is not None
+                    else None
                 )
+                if cached_fixed_state is None:
+                    prompt_embeds, pooled_prompt_embeds, text_ids = resolve_prompt_embeddings(
+                        artist=unwrapped_artist,
+                        prompts=prompts,
+                        image_keys=batch["lq_path"],
+                        config=config,
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                        cache=text_embedding_cache,
+                    )
+                    if fixed_cache_key is not None:
+                        fixed_prompt_embedding_cache[fixed_cache_key] = (
+                            prompt_embeds.detach(),
+                            pooled_prompt_embeds.detach(),
+                            text_ids.detach(),
+                        )
+                else:
+                    prompt_embeds, pooled_prompt_embeds, text_ids = cached_fixed_state
                 dino_tokens = unwrapped_artist.extract_visual_tokens(lq_up)
                 sigma = sample_sigma(z_hr.shape[0], z_hr.device, sampling=sigma_sampling).to(dtype=weight_dtype)
                 eps = torch.randn_like(z_hr)
@@ -1410,6 +1540,17 @@ def main(config_path, dry_run=False):
                     "loss_down": loss_down.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
+                if active_prompt_variant is not None:
+                    step_logs["prompt/variant_id"] = float(
+                        {"fixed": 0, "suggestion": 1, "iqa": 2, "iqa_suggestion": 3}[
+                            active_prompt_variant
+                        ]
+                    )
+                spatial_modes = batch.get("spatial_mode", [])
+                if mixed_crop["enabled"] and spatial_modes:
+                    step_logs["data/full_frame_fraction"] = sum(
+                        mode == "full_frame" for mode in spatial_modes
+                    ) / len(spatial_modes)
                 if loss_div is not None:
                     step_logs["loss_div"] = loss_div.detach().item()
                 if loss_entropy is not None:

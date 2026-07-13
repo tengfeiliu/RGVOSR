@@ -199,6 +199,52 @@ class PromptAblationPipelineTests(unittest.TestCase):
             self.assertIn("--prompt_variant", cmd)
             self.assertEqual(cmd[cmd.index("--prompt_variant") + 1], "iqa_suggestion")
 
+    def test_runtime_prompt_variant_updates_curriculum_after_variant(self):
+        from tools.run_rg_flux_pipeline import create_runtime_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "train.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"flux_backend": "flux2_klein"},
+                        "text_encoding": {"mode": "online"},
+                        "data": {"crop_size": 512},
+                        "condition": {
+                            "lr_cond_mode": "flux2_image_concat",
+                            "prompt_variant": "suggestion",
+                            "prompt_schedule": {
+                                "enabled": True,
+                                "switch_step": 10000,
+                                "before_variant": "fixed",
+                                "after_variant": "suggestion",
+                            },
+                        },
+                        "training": {
+                            "stage": "0B",
+                            "output_dir": str(root / "exp"),
+                            "add_datetime_suffix": False,
+                            "suffix": "_curriculum",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config, run_dir, _ = create_runtime_config(
+                config_path,
+                prompt_variant="iqa_suggestion",
+            )
+
+        condition = runtime_config["condition"]
+        self.assertEqual(condition["prompt_variant"], "iqa_suggestion")
+        self.assertEqual(condition["prompt_schedule"]["before_variant"], "fixed")
+        self.assertEqual(condition["prompt_schedule"]["after_variant"], "iqa_suggestion")
+        self.assertTrue(condition["use_prompt"])
+        self.assertTrue(condition["use_suggestions"])
+        self.assertIn("prompt_iqa_suggestion", run_dir.name)
+
 
 if __name__ == "__main__":
     unittest.main()

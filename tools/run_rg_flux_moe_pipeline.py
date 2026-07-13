@@ -16,6 +16,7 @@ from tools.run_rg_flux_pipeline import (
     build_inference_command,
     build_train_command,
     cfg,
+    cfg_bool,
     checkpoint_artifact_paths,
     load_yaml,
     parse_dataset_dirs,
@@ -68,6 +69,9 @@ def _sync_text_and_condition_overrides(config, args):
         condition["prompt_variant"] = prompt_variant
         condition["use_prompt"] = prompt_variant != "fixed"
         condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
+        prompt_schedule = condition.get("prompt_schedule")
+        if isinstance(prompt_schedule, dict) and cfg_bool(config, "condition.prompt_schedule.enabled", False):
+            prompt_schedule["after_variant"] = prompt_variant
     if args.use_prompt is not None:
         condition["use_prompt"] = bool(args.use_prompt)
     if args.use_suggestions is not None:
