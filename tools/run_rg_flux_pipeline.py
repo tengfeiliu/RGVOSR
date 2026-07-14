@@ -11,6 +11,7 @@ import yaml
 
 DEFAULT_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"]
 PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
+SUGGESTION_PAIRINGS = ("matched", "shuffled")
 
 
 def cfg(config, path, default=None):
@@ -199,6 +200,45 @@ def checkpoint_artifact_paths(run_dir, checkpoint_name):
     }
 
 
+def suggestion_pairing_label(pairing, shuffle_seed=3407):
+    pairing = str(pairing).strip().lower()
+    if pairing not in SUGGESTION_PAIRINGS:
+        raise ValueError(f"Unsupported suggestion pairing: {pairing}")
+    if pairing == "matched":
+        return "pairing_matched"
+    return f"pairing_shuffled_seed{int(shuffle_seed)}"
+
+
+def suggestion_pairing_artifact_paths(
+    run_dir,
+    checkpoint_name,
+    pairing,
+    shuffle_seed=3407,
+    inference_output_root=None,
+):
+    run_dir = Path(run_dir)
+    checkpoint_name = Path(checkpoint_name).name
+    label = suggestion_pairing_label(pairing, shuffle_seed)
+    if inference_output_root:
+        inference_dir = Path(inference_output_root) / run_dir.name / checkpoint_name / label
+        metrics_dir = inference_dir / "metrics"
+        bad_cases_dir = inference_dir / "bad_cases"
+        comparison_dir = Path(inference_output_root) / run_dir.name / checkpoint_name / "pairing_comparison"
+    else:
+        inference_dir = run_dir / "inference" / checkpoint_name / label
+        metrics_dir = run_dir / "metrics" / checkpoint_name / label
+        bad_cases_dir = run_dir / "bad_cases" / checkpoint_name / label
+        comparison_dir = run_dir / "metrics" / checkpoint_name / "pairing_comparison"
+    return {
+        "label": label,
+        "inference_dir": inference_dir,
+        "inference_manifest": inference_dir / "inference_manifest.json",
+        "metrics_dir": metrics_dir,
+        "bad_cases_dir": bad_cases_dir,
+        "comparison_dir": comparison_dir,
+    }
+
+
 def write_run_summary(run_dir, runtime_config_path, records, pipeline_manifest_path=None, pipeline_type="single_lora", extra=None):
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +254,9 @@ def write_run_summary(run_dir, runtime_config_path, records, pipeline_manifest_p
             "metrics_output_dir": record.get("metrics_output_dir"),
             "bad_cases_output_dir": record.get("bad_cases_output_dir"),
         }
+        if record.get("suggestion_pairing_runs") is not None:
+            checkpoints[step]["suggestion_pairing_runs"] = record["suggestion_pairing_runs"]
+            checkpoints[step]["pairing_comparison_output_dir"] = record.get("pairing_comparison_output_dir")
     payload = {
         "pipeline_type": pipeline_type,
         "run_dir": str(run_dir),
@@ -251,7 +294,16 @@ def build_train_command(args, runtime_config_path):
     return cmd
 
 
-def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
+def build_inference_command(
+    args,
+    run_dir,
+    checkpoint_dir,
+    config_path=None,
+    output_dir=None,
+    suggestion_pairing=None,
+    suggestion_shuffle_seed=None,
+    text_encoding_mode=None,
+):
     checkpoint_dir = Path(checkpoint_dir)
     artifact_paths = checkpoint_artifact_paths(run_dir, checkpoint_dir.name)
     cmd = [
@@ -264,7 +316,11 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
         "--checkpoint_step",
         checkpoint_dir.name,
     ]
-    if args.inference_output_root:
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        manifest_path = output_dir / "inference_manifest.json"
+        cmd.extend(["--output_dir", str(output_dir)])
+    elif args.inference_output_root:
         output_root = Path(args.inference_output_root)
         manifest_path = output_root / Path(run_dir).name / checkpoint_dir.name / "inference_manifest.json"
         cmd.extend(["--output_root", str(output_root)])
@@ -272,7 +328,7 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
         manifest_path = artifact_paths["inference_manifest"]
         cmd.extend(["--output_dir", str(artifact_paths["inference_dir"])])
     _append_optional(cmd, "--config", config_path)
-    _append_optional(cmd, "--text_encoding_mode", args.text_encoding_mode)
+    _append_optional(cmd, "--text_encoding_mode", text_encoding_mode or args.text_encoding_mode)
     _append_optional(cmd, "--text_embedding_cache", args.text_embedding_cache)
     _append_optional(cmd, "--jsonl_path", args.jsonl_path)
     _append_optional(cmd, "--num_inference_steps", args.num_inference_steps)
@@ -282,12 +338,28 @@ def build_inference_command(args, run_dir, checkpoint_dir, config_path=None):
     _append_optional(cmd, "--lr_cond_mode", args.lr_cond_mode)
     _append_optional(cmd, "--min_size", args.min_size)
     _append_optional(cmd, "--prompt_variant", getattr(args, "prompt_variant", None))
+    _append_optional(cmd, "--seed", getattr(args, "seed", None))
+    _append_optional(cmd, "--suggestion_pairing", suggestion_pairing)
+    _append_optional(cmd, "--suggestion_shuffle_seed", suggestion_shuffle_seed)
     _append_optional_bool(cmd, "--use_prompt", "--no-use_prompt", args.use_prompt)
     _append_optional_bool(cmd, "--use_suggestions", "--no-use_suggestions", args.use_suggestions)
     _append_optional_bool(cmd, "--use_degradation_vector", "--no-use_degradation_vector", args.use_degradation_vector)
     if args.restore_input_size:
         cmd.append("--restore_input_size")
     return cmd, manifest_path
+
+
+def build_pairing_comparison_command(matched_metrics_dir, shuffled_metrics_dir, output_dir):
+    return [
+        sys.executable,
+        "tools/compare_rg_flux_pairing_metrics.py",
+        "--matched_metrics_dir",
+        str(matched_metrics_dir),
+        "--shuffled_metrics_dir",
+        str(shuffled_metrics_dir),
+        "--output_dir",
+        str(output_dir),
+    ]
 
 
 def build_eval_command(args, inference_manifest, metrics_dir=None):
@@ -436,6 +508,7 @@ def build_arg_parser():
     parser.add_argument("--lr_cond_mode", choices=["latent_adapter", "latent_concat", "flux2_image_concat"], default=None)
     parser.add_argument("--min_size", type=int, default=None)
     parser.add_argument("--restore_input_size", action="store_true")
+    parser.add_argument("--seed", type=int, default=42, help="Inference seed shared by all comparison runs.")
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
@@ -445,6 +518,20 @@ def build_arg_parser():
         help="Prompt ablation variant. Explicit variants override the legacy prompt booleans.",
     )
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--compare_suggestion_pairing",
+        action="store_true",
+        help=(
+            "Run matched and deterministic cross-image shuffled suggestions with the same checkpoint, "
+            "then produce paired metric deltas."
+        ),
+    )
+    parser.add_argument(
+        "--suggestion_shuffle_seed",
+        type=int,
+        default=3407,
+        help="Base seed for the deterministic no-self-match suggestion permutation.",
+    )
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--metric_device", default="cpu")
     parser.add_argument("--run_bad_cases", action="store_true", help="Run bad case analysis after metrics.")
@@ -493,8 +580,121 @@ def main(argv=None):
 
     apply_config_prompt_defaults(args, runtime_config)
 
+    if args.compare_suggestion_pairing:
+        if not args.jsonl_path:
+            raise ValueError("--compare_suggestion_pairing requires --jsonl_path.")
+        if args.prompt_variant not in {"suggestion", "iqa_suggestion"}:
+            raise ValueError(
+                "--compare_suggestion_pairing requires --prompt_variant suggestion or iqa_suggestion "
+                "so that changing the suggestion is the intended intervention."
+            )
+        if args.text_encoding_mode != "online":
+            print(
+                "[pipeline] suggestion pairing comparison uses online text encoding for both runs.",
+                flush=True,
+            )
+
     for step in args.checkpoint_steps:
         checkpoint_dir = planned_checkpoint_dir(run_dir, step) if args.dry_run_pipeline else resolve_checkpoint_dir(run_dir, step)
+        if args.compare_suggestion_pairing:
+            pairing_runs = {}
+            record = {
+                "checkpoint_step": checkpoint_dir.name,
+                "checkpoint_path": str(checkpoint_dir / "rg_flux_adapters"),
+                "suggestion_pairing_comparison": True,
+                "suggestion_shuffle_seed": args.suggestion_shuffle_seed,
+                "inference_seed": args.seed,
+                "text_encoding_mode": "online",
+                "suggestion_pairing_runs": pairing_runs,
+                "pairing_comparison_output_dir": None,
+                "pairing_comparison_command": None,
+                "pairing_comparison_returncode": None,
+            }
+
+            for pairing in SUGGESTION_PAIRINGS:
+                paths = suggestion_pairing_artifact_paths(
+                    run_dir=run_dir,
+                    checkpoint_name=checkpoint_dir.name,
+                    pairing=pairing,
+                    shuffle_seed=args.suggestion_shuffle_seed,
+                    inference_output_root=args.inference_output_root,
+                )
+                inference_cmd, inference_manifest = build_inference_command(
+                    args,
+                    run_dir,
+                    checkpoint_dir,
+                    runtime_config_path,
+                    output_dir=paths["inference_dir"],
+                    suggestion_pairing=pairing,
+                    suggestion_shuffle_seed=args.suggestion_shuffle_seed,
+                    text_encoding_mode="online",
+                )
+                eval_cmd, metrics_dir = build_eval_command(
+                    args,
+                    inference_manifest,
+                    paths["metrics_dir"],
+                )
+                bad_case_cmd = (
+                    build_bad_case_command(args, metrics_dir, paths["bad_cases_dir"])
+                    if args.run_bad_cases
+                    else None
+                )
+                pairing_record = {
+                    "pairing": pairing,
+                    "inference_manifest": str(inference_manifest),
+                    "inference_output_dir": str(paths["inference_dir"]),
+                    "metrics_output_dir": str(metrics_dir),
+                    "bad_cases_output_dir": str(paths["bad_cases_dir"]),
+                    "inference_command": inference_cmd,
+                    "eval_command": eval_cmd,
+                    "bad_case_command": bad_case_cmd,
+                    "inference_returncode": None,
+                    "eval_returncode": None,
+                    "bad_case_returncode": None,
+                }
+                pairing_runs[pairing] = pairing_record
+
+                if not args.dry_run_pipeline:
+                    pairing_record["inference_returncode"] = run_command(inference_cmd)
+                    if pairing_record["inference_returncode"] != 0:
+                        records.append(record)
+                        write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
+                        raise SystemExit(pairing_record["inference_returncode"])
+                    pairing_record["eval_returncode"] = run_command(eval_cmd)
+                    if pairing_record["eval_returncode"] != 0:
+                        records.append(record)
+                        write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
+                        raise SystemExit(pairing_record["eval_returncode"])
+                    if args.run_bad_cases:
+                        pairing_record["bad_case_returncode"] = run_command(bad_case_cmd)
+                        if pairing_record["bad_case_returncode"] != 0:
+                            records.append(record)
+                            write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
+                            raise SystemExit(pairing_record["bad_case_returncode"])
+
+            comparison_dir = suggestion_pairing_artifact_paths(
+                run_dir=run_dir,
+                checkpoint_name=checkpoint_dir.name,
+                pairing="matched",
+                shuffle_seed=args.suggestion_shuffle_seed,
+                inference_output_root=args.inference_output_root,
+            )["comparison_dir"]
+            comparison_cmd = build_pairing_comparison_command(
+                pairing_runs["matched"]["metrics_output_dir"],
+                pairing_runs["shuffled"]["metrics_output_dir"],
+                comparison_dir,
+            )
+            record["pairing_comparison_output_dir"] = str(comparison_dir)
+            record["pairing_comparison_command"] = comparison_cmd
+            if not args.dry_run_pipeline:
+                record["pairing_comparison_returncode"] = run_command(comparison_cmd)
+                if record["pairing_comparison_returncode"] != 0:
+                    records.append(record)
+                    write_pipeline_manifest(run_dir, runtime_config_path, args.checkpoint_steps, records, train_returncode)
+                    raise SystemExit(record["pairing_comparison_returncode"])
+            records.append(record)
+            continue
+
         inference_cmd, inference_manifest = build_inference_command(args, run_dir, checkpoint_dir, runtime_config_path)
         artifact_paths = checkpoint_artifact_paths(run_dir, checkpoint_dir.name)
         metrics_target = None if args.inference_output_root else artifact_paths["metrics_dir"]
