@@ -170,9 +170,14 @@ class RGFluxPipelineCliTests(unittest.TestCase):
                 RunContainedArgs,
                 contained_metrics_dir,
                 artifact_paths["bad_cases_dir"],
+                inference_manifest=contained_manifest,
             )
             self.assertIn("tools/analyze_rg_flux_bad_cases.py", bad_case_cmd)
             self.assertIn("--lq_dirs", bad_case_cmd)
+            self.assertIn("--inference_manifest", bad_case_cmd)
+            self.assertIn(str(contained_manifest), bad_case_cmd)
+            self.assertIn("--font_size", bad_case_cmd)
+            self.assertIn("40", bad_case_cmd)
             self.assertIn("realLQ250=/data/RealLQ250/lq", bad_case_cmd)
             self.assertIn(str(artifact_paths["bad_cases_dir"]), bad_case_cmd)
 

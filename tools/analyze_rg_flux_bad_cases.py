@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import html
 import json
@@ -12,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metrics.rg_sr_metrics import IMAGE_EXTENSIONS, LOWER_BETTER_FALLBACKS, parse_name_path
+from models.prompt_builder import DEFAULT_SR_PROMPT, build_sr_prompt
 
 
 def load_metric_rows(metrics_csv):
@@ -118,10 +120,228 @@ def find_lq_path(row, lq_indexes):
     return lq_indexes.get(dataset, {}).get(filename)
 
 
-def placeholder_image(size, text):
+def _normalized_path(value):
+    return str(value or "").replace("\\", "/")
+
+
+def _profile_lookup_keys(value, dataset=None):
+    if not value:
+        return []
+    normalized = _normalized_path(value)
+    name = Path(normalized).name
+    keys = [f"path:{normalized}"]
+    if dataset:
+        keys.append(f"dataset:{dataset}/{name}")
+    keys.append(f"name:{name}")
+    return keys
+
+
+def load_profile_index(jsonl_path=None, target_paths=None, target_names=None):
+    if not jsonl_path:
+        return {}
+    jsonl_path = Path(jsonl_path)
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"Prompt JSONL does not exist: {jsonl_path}")
+
+    target_paths = {_normalized_path(path) for path in (target_paths or []) if path}
+    target_names = {str(name) for name in (target_names or []) if name}
+    index = {}
+    ambiguous_names = set()
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record_paths = [
+                record.get(field)
+                for field in ("lq_path", "image_path", "path", "hq_path")
+                if record.get(field)
+            ]
+            if target_paths or target_names:
+                matches_path = any(_normalized_path(value) in target_paths for value in record_paths)
+                matches_name = any(Path(_normalized_path(value)).name in target_names for value in record_paths)
+                if not matches_path and not matches_name:
+                    continue
+            unipercept_raw = record.get("unipercept_raw")
+            profile = unipercept_raw.get("profile") if isinstance(unipercept_raw, dict) else None
+            if not isinstance(profile, dict):
+                continue
+            dataset = record.get("dataset_name") or record.get("dataset")
+            for field in ("lq_path", "image_path", "path", "hq_path"):
+                value = record.get(field)
+                for key in _profile_lookup_keys(value, dataset=dataset):
+                    if key.startswith("name:") and key in index and index[key] != profile:
+                        ambiguous_names.add(key)
+                    else:
+                        index[key] = profile
+    for key in ambiguous_names:
+        index.pop(key, None)
+    return index
+
+
+def _resolve_manifest_path(value, manifest_path):
+    if not value:
+        return None
+    path = Path(value)
+    if path.exists() or path.is_absolute():
+        return path
+    candidate = Path(manifest_path).parent / path
+    return candidate if candidate.exists() else path
+
+
+def load_inference_prompt_index(inference_manifest=None):
+    prompts = {}
+    pairing_rows = {}
+    if not inference_manifest:
+        return prompts, pairing_rows
+
+    inference_manifest = Path(inference_manifest)
+    if not inference_manifest.exists():
+        raise FileNotFoundError(f"Inference manifest does not exist: {inference_manifest}")
+    with inference_manifest.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    for dataset_entry in payload.get("datasets", []):
+        if not isinstance(dataset_entry, dict):
+            continue
+        dataset_name = str(dataset_entry.get("name") or "")
+        pairing_path = _resolve_manifest_path(
+            dataset_entry.get("suggestion_pairing_manifest"),
+            inference_manifest,
+        )
+        if pairing_path is None or not pairing_path.exists():
+            continue
+        with pairing_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pairing = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row_dataset = str(pairing.get("dataset") or dataset_name)
+                output_filename = pairing.get("output_filename")
+                if not output_filename:
+                    source_path = pairing.get("source_image_path") or pairing.get("source_lq_path")
+                    if source_path:
+                        output_filename = f"{Path(source_path).stem}.png"
+                if not output_filename:
+                    continue
+                key = (row_dataset, str(output_filename))
+                pairing_rows[key] = pairing
+                prompt = pairing.get("prompt")
+                if isinstance(prompt, str) and prompt.strip():
+                    prompts[key] = prompt.strip()
+    return prompts, pairing_rows
+
+
+def build_prompt_context(
+    *,
+    inference_manifest=None,
+    jsonl_path=None,
+    use_prompt=True,
+    use_suggestions=True,
+    prompt_variant=None,
+    case_rows=None,
+    lq_indexes=None,
+):
+    prompts, pairing_rows = load_inference_prompt_index(inference_manifest)
+    unresolved_rows = [
+        row
+        for row in (case_rows or [])
+        if (str(row.get("dataset") or ""), str(row.get("filename") or "")) not in prompts
+    ]
+    target_names = {str(row.get("filename") or "") for row in unresolved_rows}
+    target_paths = {
+        str(lq_path)
+        for row in unresolved_rows
+        for lq_path in [find_lq_path(row, lq_indexes or {})]
+        if lq_path is not None
+    }
+    return {
+        "prompts": prompts,
+        "pairing_rows": pairing_rows,
+        "profiles": load_profile_index(
+            jsonl_path,
+            target_paths=target_paths,
+            target_names=target_names,
+        ) if unresolved_rows else {},
+        "use_prompt": bool(use_prompt),
+        "use_suggestions": bool(use_suggestions),
+        "prompt_variant": prompt_variant,
+    }
+
+
+def resolve_case_prompt(row, lq_path, prompt_context):
+    if not prompt_context:
+        return ""
+    dataset = str(row.get("dataset") or "")
+    filename = str(row.get("filename") or "")
+    case_key = (dataset, filename)
+    exact_prompt = prompt_context["prompts"].get(case_key)
+    if exact_prompt:
+        return exact_prompt
+
+    pairing = prompt_context["pairing_rows"].get(case_key, {})
+    profile = None
+    lookup_values = [
+        lq_path,
+        pairing.get("source_lq_path"),
+        pairing.get("source_image_path"),
+        filename,
+    ]
+    for value in lookup_values:
+        for key in _profile_lookup_keys(value, dataset=dataset):
+            profile = prompt_context["profiles"].get(key)
+            if profile is not None:
+                break
+        if profile is not None:
+            break
+
+    prompt_variant = prompt_context["prompt_variant"]
+    use_prompt = prompt_context["use_prompt"]
+    use_suggestions = prompt_context["use_suggestions"]
+    if profile is None:
+        if prompt_variant == "fixed" or not use_prompt:
+            return DEFAULT_SR_PROMPT
+        return ""
+
+    profile = copy.deepcopy(profile)
+    donor_suggestion = pairing.get("donor_suggestion")
+    if donor_suggestion is not None:
+        profile["suggestion"] = donor_suggestion
+    return build_sr_prompt(
+        profile,
+        use_prompt=use_prompt,
+        use_suggestions=use_suggestions,
+        prompt_variant=prompt_variant,
+    )
+
+
+def load_report_font(font_size=40):
+    font_size = int(font_size)
+    if font_size <= 0:
+        raise ValueError(f"font_size must be positive, got {font_size}")
+    return ImageFont.load_default(size=font_size)
+
+
+def font_layout(font, font_size):
+    bbox = font.getbbox("Ag")
+    glyph_height = max(bbox[3] - bbox[1], int(font_size))
+    line_height = glyph_height + max(4, int(font_size) // 5)
+    padding = max(8, int(font_size) // 3)
+    return line_height, padding
+
+
+def placeholder_image(size, text, font=None):
     image = Image.new("RGB", size, color=(210, 210, 210))
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
+    font = font or ImageFont.load_default()
     bbox = draw.textbbox((0, 0), text, font=font)
     x = max((size[0] - (bbox[2] - bbox[0])) // 2, 0)
     y = max((size[1] - (bbox[3] - bbox[1])) // 2, 0)
@@ -129,37 +349,86 @@ def placeholder_image(size, text):
     return image
 
 
-def draw_text_lines(draw, xy, lines, fill=(0, 0, 0)):
-    font = ImageFont.load_default()
+def draw_text_lines(draw, xy, lines, fill=(0, 0, 0), font=None, line_height=14):
+    font = font or ImageFont.load_default()
     x, y = xy
     for line in lines:
         draw.text((x, y), line, fill=fill, font=font)
-        y += 14
+        y += line_height
 
 
-def compose_comparison_image(row, lq_path, output_path, metrics, title_metric=None):
+def _split_long_word(draw, word, max_width, font):
+    chunks = []
+    current = ""
+    for character in word:
+        candidate = current + character
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if current and bbox[2] - bbox[0] > max_width:
+            chunks.append(current)
+            current = character
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def wrap_text_pixels(draw, text, max_width, font):
+    lines = []
+    for paragraph in str(text or "").splitlines() or [""]:
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        current = ""
+        for word in paragraph.split():
+            candidate = f"{current} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if bbox[2] - bbox[0] <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            chunks = _split_long_word(draw, word, max_width, font)
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
+        if current:
+            lines.append(current)
+    return lines
+
+
+def compose_comparison_image(
+    row,
+    lq_path,
+    output_path,
+    metrics,
+    title_metric=None,
+    prompt="",
+    font_size=40,
+):
     sr_path = Path(row["path"])
     with Image.open(sr_path) as sr_image:
         sr = sr_image.convert("RGB")
+    font = load_report_font(font_size)
+    line_height, padding = font_layout(font, font_size)
     if lq_path is not None and Path(lq_path).exists():
         with Image.open(lq_path) as lq_image:
             lq = lq_image.convert("RGB").resize(sr.size, Image.Resampling.BICUBIC)
         lq_found = True
     else:
-        lq = placeholder_image(sr.size, "LQ unavailable")
+        lq = placeholder_image(sr.size, "LQ unavailable", font=font)
         lq_found = False
 
-    label_h = 24
-    caption_h = 58
-    width = sr.width * 2
-    height = label_h + sr.height + caption_h
-    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
-    canvas.paste(lq, (0, label_h))
-    canvas.paste(sr, (sr.width, label_h))
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle((0, 0, width, label_h), fill=(245, 245, 245))
-    draw.text((8, 6), "LQ upscaled", fill=(0, 0, 0), font=ImageFont.load_default())
-    draw.text((sr.width + 8, 6), "SR output", fill=(0, 0, 0), font=ImageFont.load_default())
+    label_h = line_height + padding * 2
+    width = max(sr.width * 2, int(font_size) * 20)
+    layout_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    prompt = str(prompt or "").strip()
+    prompt_lines = wrap_text_pixels(
+        layout_draw,
+        prompt,
+        max_width=width - padding * 2,
+        font=font,
+    ) if prompt else []
 
     score_parts = []
     if "joint_badness" in row:
@@ -167,19 +436,50 @@ def compose_comparison_image(row, lq_path, output_path, metrics, title_metric=No
     for metric in metrics:
         if metric in row:
             score_parts.append(f"{metric}={float(row[metric]):.6f}")
-    caption = [
+    caption_fields = [
         f"rank={row.get('rank', '')} dataset={row.get('dataset', '')} filename={row.get('filename', '')}",
         " ".join(score_parts),
         f"lq_found={str(lq_found).lower()} metric={title_metric or ''}",
     ]
-    draw_text_lines(draw, (8, label_h + sr.height + 6), caption)
+    caption = []
+    for field in caption_fields:
+        caption.extend(wrap_text_pixels(layout_draw, field, width - padding * 2, font))
+    caption_h = padding * 2 + line_height * len(caption)
+    prompt_h = 0 if not prompt_lines else padding * 2 + line_height * (len(prompt_lines) + 1)
+    height = label_h + sr.height + caption_h + prompt_h
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+    canvas.paste(lq, (0, label_h))
+    canvas.paste(sr, (sr.width, label_h))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, width, label_h), fill=(245, 245, 245))
+    draw.text((padding, padding), "LQ upscaled", fill=(0, 0, 0), font=font)
+    draw.text((sr.width + padding, padding), "SR output", fill=(0, 0, 0), font=font)
+
+    caption_top = label_h + sr.height
+    draw_text_lines(
+        draw,
+        (padding, caption_top + padding),
+        caption,
+        font=font,
+        line_height=line_height,
+    )
+    if prompt_lines:
+        prompt_top = caption_top + caption_h
+        draw.rectangle((0, prompt_top, width, height), fill=(245, 245, 245))
+        draw_text_lines(
+            draw,
+            (padding, prompt_top + padding),
+            ["Prompt:", *prompt_lines],
+            font=font,
+            line_height=line_height,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
     return lq_found
 
 
 def csv_fieldnames(rows, metrics):
-    base = ["rank", "dataset", "filename", "sr_path", "lq_path", "lq_found"]
+    base = ["rank", "dataset", "filename", "sr_path", "lq_path", "lq_found", "prompt"]
     extra = []
     if rows and "joint_badness" in rows[0]:
         extra.append("joint_badness")
@@ -220,6 +520,7 @@ def write_html_report(path, rows, metrics, title):
             "<section>"
             f"<h3>#{html.escape(str(row['rank']))} {html.escape(row.get('dataset', ''))} / {html.escape(row.get('filename', ''))}</h3>"
             f"<p>{html.escape(' | '.join(score_text))}</p>"
+            f"<pre style=\"white-space:pre-wrap\"><strong>Prompt:</strong> {html.escape(row.get('prompt', ''))}</pre>"
             f"<img src=\"{html.escape(rel_image)}\" style=\"max-width:100%;height:auto;\" />"
             "</section>"
         )
@@ -241,7 +542,15 @@ def image_output_name(rank, filename):
     return f"worst_{rank:04d}_{safe_stem}.png"
 
 
-def write_case_outputs(rows, metrics, output_dir, lq_indexes, title):
+def write_case_outputs(
+    rows,
+    metrics,
+    output_dir,
+    lq_indexes,
+    title,
+    prompt_context=None,
+    font_size=40,
+):
     output_dir = Path(output_dir)
     images_dir = output_dir / "images"
     output_rows = []
@@ -249,11 +558,21 @@ def write_case_outputs(rows, metrics, output_dir, lq_indexes, title):
         row = dict(row)
         row["rank"] = rank
         lq_path = find_lq_path(row, lq_indexes)
+        prompt = resolve_case_prompt(row, lq_path, prompt_context)
         comparison_path = images_dir / image_output_name(rank, row["filename"])
-        lq_found = compose_comparison_image(row, lq_path, comparison_path, metrics, title_metric=title)
+        lq_found = compose_comparison_image(
+            row,
+            lq_path,
+            comparison_path,
+            metrics,
+            title_metric=title,
+            prompt=prompt,
+            font_size=font_size,
+        )
         row["sr_path"] = row["path"]
         row["lq_path"] = str(lq_path) if lq_path else ""
         row["lq_found"] = "true" if lq_found else "false"
+        row["prompt"] = prompt
         row["comparison_path"] = str(comparison_path)
         output_rows.append(row)
 
@@ -267,31 +586,71 @@ def joint_output_name(metrics):
     return "joint_mean_" + "_".join(metrics)
 
 
-def run_analysis(metrics_csv, summary_json, metrics, mode, worst_k, lq_dirs, output_dir):
+def run_analysis(
+    metrics_csv,
+    summary_json,
+    metrics,
+    mode,
+    worst_k,
+    lq_dirs,
+    output_dir,
+    inference_manifest=None,
+    jsonl_path=None,
+    use_prompt=True,
+    use_suggestions=True,
+    prompt_variant=None,
+    font_size=40,
+):
     if not metrics:
         raise ValueError("At least one metric is required")
     if worst_k <= 0:
         raise ValueError("worst_k must be positive")
     if mode not in {"separate", "joint_mean"}:
         raise ValueError(f"Unsupported mode: {mode}")
+    if int(font_size) <= 0:
+        raise ValueError("font_size must be positive")
 
     rows = load_metric_rows(metrics_csv)
     directions = load_metric_directions(summary_json)
     lq_indexes = build_lq_indexes(lq_dirs)
     output_dir = Path(output_dir)
-    written = []
 
     if mode == "joint_mean":
         ranked = rank_joint_mean(rows, metrics, directions, worst_k)
-        target_dir = output_dir / joint_output_name(metrics)
-        written.append(write_case_outputs(ranked, metrics, target_dir, lq_indexes, joint_output_name(metrics)))
-        return written
+        ranked_groups = [
+            (ranked, metrics, output_dir / joint_output_name(metrics), joint_output_name(metrics))
+        ]
+    else:
+        multi_metric = len(metrics) > 1
+        ranked_groups = []
+        for metric in metrics:
+            ranked = rank_single_metric(rows, metric, directions, worst_k)
+            target_dir = output_dir / metric if multi_metric else output_dir
+            ranked_groups.append((ranked, [metric], target_dir, metric))
 
-    multi_metric = len(metrics) > 1
-    for metric in metrics:
-        ranked = rank_single_metric(rows, metric, directions, worst_k)
-        target_dir = output_dir / metric if multi_metric else output_dir
-        written.append(write_case_outputs(ranked, [metric], target_dir, lq_indexes, metric))
+    case_rows = [row for ranked, _, _, _ in ranked_groups for row in ranked]
+    prompt_context = build_prompt_context(
+        inference_manifest=inference_manifest,
+        jsonl_path=jsonl_path,
+        use_prompt=use_prompt,
+        use_suggestions=use_suggestions,
+        prompt_variant=prompt_variant,
+        case_rows=case_rows,
+        lq_indexes=lq_indexes,
+    )
+    written = []
+    for ranked, ranked_metrics, target_dir, title in ranked_groups:
+        written.append(
+            write_case_outputs(
+                ranked,
+                ranked_metrics,
+                target_dir,
+                lq_indexes,
+                title,
+                prompt_context=prompt_context,
+                font_size=font_size,
+            )
+        )
     return written
 
 
@@ -317,6 +676,31 @@ def build_arg_parser():
     parser.add_argument("--mode", choices=["separate", "joint_mean"], default="separate")
     parser.add_argument("--worst_k", type=int, default=50)
     parser.add_argument("--lq_dirs", nargs="*", default=[], help="Dataset LQ dirs in name=path format")
+    parser.add_argument(
+        "--inference_manifest",
+        type=Path,
+        default=None,
+        help="Inference manifest used to recover the exact per-image prompt when available.",
+    )
+    parser.add_argument(
+        "--jsonl_path",
+        type=Path,
+        default=None,
+        help="Condition JSONL used to reconstruct prompts from older inference outputs.",
+    )
+    parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--prompt_variant",
+        choices=("fixed", "suggestion", "iqa", "iqa_suggestion"),
+        default=None,
+    )
+    parser.add_argument(
+        "--font_size",
+        type=int,
+        default=40,
+        help="Pixel size for labels, metrics, and prompt text in comparison images.",
+    )
     parser.add_argument("--output_dir", type=Path, required=True)
     return parser
 
@@ -333,6 +717,12 @@ def main(argv=None):
         worst_k=args.worst_k,
         lq_dirs=lq_dirs,
         output_dir=args.output_dir,
+        inference_manifest=args.inference_manifest,
+        jsonl_path=args.jsonl_path,
+        use_prompt=args.use_prompt,
+        use_suggestions=args.use_suggestions,
+        prompt_variant=args.prompt_variant,
+        font_size=args.font_size,
     )
     print(f"Saved bad case analysis to: {args.output_dir}")
 

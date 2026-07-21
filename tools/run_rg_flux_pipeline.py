@@ -380,7 +380,7 @@ def build_eval_command(args, inference_manifest, metrics_dir=None):
     return cmd, metrics_dir
 
 
-def build_bad_case_command(args, metrics_dir, bad_cases_dir):
+def build_bad_case_command(args, metrics_dir, bad_cases_dir, inference_manifest=None):
     metrics = list(args.bad_case_metrics or [])
     if not metrics:
         raise ValueError("--bad_case_metrics must include at least one metric when --run_bad_cases is enabled.")
@@ -402,6 +402,22 @@ def build_bad_case_command(args, metrics_dir, bad_cases_dir):
         "--output_dir",
         str(bad_cases_dir),
     ]
+    _append_optional(cmd, "--inference_manifest", inference_manifest)
+    _append_optional(cmd, "--jsonl_path", getattr(args, "jsonl_path", None))
+    _append_optional(cmd, "--prompt_variant", getattr(args, "prompt_variant", None))
+    _append_optional(cmd, "--font_size", getattr(args, "bad_case_font_size", 40))
+    _append_optional_bool(
+        cmd,
+        "--use_prompt",
+        "--no-use_prompt",
+        getattr(args, "use_prompt", None),
+    )
+    _append_optional_bool(
+        cmd,
+        "--use_suggestions",
+        "--no-use_suggestions",
+        getattr(args, "use_suggestions", None),
+    )
     return cmd
 
 
@@ -538,6 +554,7 @@ def build_arg_parser():
     parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa", "musiq"])
     parser.add_argument("--bad_case_mode", choices=["separate", "joint_mean"], default="separate")
     parser.add_argument("--bad_case_worst_k", type=int, default=50)
+    parser.add_argument("--bad_case_font_size", type=int, default=40)
     parser.add_argument("--dry_run_train", action="store_true", help="Pass --dry_run to train_rg_flux_sr.py.")
     parser.add_argument("--dry_run_pipeline", action="store_true", help="Print/write command plan without running commands.")
     return parser
@@ -635,7 +652,12 @@ def main(argv=None):
                     paths["metrics_dir"],
                 )
                 bad_case_cmd = (
-                    build_bad_case_command(args, metrics_dir, paths["bad_cases_dir"])
+                    build_bad_case_command(
+                        args,
+                        metrics_dir,
+                        paths["bad_cases_dir"],
+                        inference_manifest=inference_manifest,
+                    )
                     if args.run_bad_cases
                     else None
                 )
@@ -700,7 +722,16 @@ def main(argv=None):
         metrics_target = None if args.inference_output_root else artifact_paths["metrics_dir"]
         eval_cmd, metrics_dir = build_eval_command(args, inference_manifest, metrics_target)
         bad_cases_dir = artifact_paths["bad_cases_dir"]
-        bad_case_cmd = build_bad_case_command(args, metrics_dir, bad_cases_dir) if args.run_bad_cases else None
+        bad_case_cmd = (
+            build_bad_case_command(
+                args,
+                metrics_dir,
+                bad_cases_dir,
+                inference_manifest=inference_manifest,
+            )
+            if args.run_bad_cases
+            else None
+        )
         record = {
             "checkpoint_step": checkpoint_dir.name,
             "checkpoint_path": str(checkpoint_dir / "rg_flux_adapters"),

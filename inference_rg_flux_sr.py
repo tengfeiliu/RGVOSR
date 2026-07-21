@@ -552,6 +552,17 @@ def run_inference_dataset(
         donor_image_path = donor_entry["image_path"]
         source_suggestion = source_profile.get("suggestion") if isinstance(source_profile, dict) else None
         donor_suggestion = donor_profile.get("suggestion") if isinstance(donor_profile, dict) else None
+        paired_profile = (
+            profile_with_donor_suggestion(source_profile, donor_profile)
+            if uses_suggestion
+            else source_profile
+        )
+        prompt = build_sr_prompt(
+            paired_profile,
+            use_prompt=args.use_prompt,
+            use_suggestions=args.use_suggestions,
+            prompt_variant=args.prompt_variant,
+        )
         pairing_rows.append(
             {
                 "dataset": dataset_name,
@@ -564,6 +575,9 @@ def run_inference_dataset(
                 "donor_lq_path": condition_source_path(donor_entry["condition"], donor_image_path),
                 "source_suggestion": source_suggestion,
                 "donor_suggestion": donor_suggestion,
+                "output_filename": f"{source_image_path.stem}.png",
+                "output_image_path": str(output_dir / f"{source_image_path.stem}.png"),
+                "prompt": prompt,
                 "self_pairing": source_index == donor_index,
                 "same_suggestion_text": (
                     str(source_suggestion or "").strip()
@@ -579,18 +593,7 @@ def run_inference_dataset(
         image_path = entry["image_path"]
         condition = entry["condition"]
         result = entry["result"]
-        donor_profile = entries[donor_indices[source_index]]["profile"]
-        profile = (
-            profile_with_donor_suggestion(entry["profile"], donor_profile)
-            if uses_suggestion
-            else entry["profile"]
-        )
-        prompt = build_sr_prompt(
-            profile,
-            use_prompt=args.use_prompt,
-            use_suggestions=args.use_suggestions,
-            prompt_variant=args.prompt_variant,
-        )
+        prompt = pairing_rows[source_index]["prompt"]
         lq_up_pil, original_size, lq_up = prepare_lq_up(
             image_path,
             upscale=args.upscale,

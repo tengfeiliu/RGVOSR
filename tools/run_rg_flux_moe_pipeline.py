@@ -233,6 +233,7 @@ def build_arg_parser():
     parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa", "musiq"])
     parser.add_argument("--bad_case_mode", choices=["separate", "joint_mean"], default="separate")
     parser.add_argument("--bad_case_worst_k", type=int, default=50)
+    parser.add_argument("--bad_case_font_size", type=int, default=40)
     parser.add_argument("--dry_run_train", action="store_true", help="Pass --dry_run to train_rg_flux_sr.py.")
     parser.add_argument("--dry_run_pipeline", action="store_true", help="Write command plan without running child commands.")
     return parser
@@ -266,7 +267,16 @@ def _run_inference_and_eval_for_steps(args, run_dir, runtime_config_path, checkp
         metrics_target = None if args.inference_output_root else artifact_paths["metrics_dir"]
         eval_cmd, metrics_dir = build_eval_command(args, inference_manifest, metrics_target)
         bad_cases_dir = artifact_paths["bad_cases_dir"]
-        bad_case_cmd = build_bad_case_command(args, metrics_dir, bad_cases_dir) if args.run_bad_cases else None
+        bad_case_cmd = (
+            build_bad_case_command(
+                args,
+                metrics_dir,
+                bad_cases_dir,
+                inference_manifest=inference_manifest,
+            )
+            if args.run_bad_cases
+            else None
+        )
         record = {
             "checkpoint_step": checkpoint_dir.name,
             "checkpoint_path": str(checkpoint_dir / "rg_flux_adapters"),

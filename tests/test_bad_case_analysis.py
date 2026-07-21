@@ -207,6 +207,199 @@ class BadCaseAnalysisTests(unittest.TestCase):
             self.assertEqual(rows[0]["lq_found"], "false")
             self.assertTrue((output / "images" / "worst_0001_missing.png").exists())
 
+    def test_legacy_inference_prompt_is_reconstructed_and_rendered_below_comparison(self):
+        from tools.analyze_rg_flux_bad_cases import run_analysis
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sr_dir = root / "sr"
+            lq_dir = root / "lq"
+            sr_path = sr_dir / "sample.png"
+            lq_path = lq_dir / "sample.png"
+            write_image(sr_path, "white", size=(64, 64))
+            write_image(lq_path, "black", size=(64, 64))
+
+            scores = root / "metrics" / "per_image_scores.csv"
+            write_scores(
+                scores,
+                [
+                    {
+                        "dataset": "RealLQ250",
+                        "filename": "sample.png",
+                        "path": sr_path,
+                        "width": 64,
+                        "height": 64,
+                        "maniqa": 0.1,
+                    }
+                ],
+                ["maniqa"],
+            )
+            conditions = root / "conditions.jsonl"
+            conditions.write_text(
+                json.dumps(
+                    {
+                        "lq_path": str(lq_path),
+                        "unipercept_raw": {
+                            "profile": {
+                                "iqa": {"distortion_type": "Visible blur."},
+                                "iaa": {},
+                                "suggestion": "Moderately reduce blur while preserving structure.",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            pairing = root / "inference" / "RealLQ250" / "suggestion_pairing.jsonl"
+            pairing.parent.mkdir(parents=True)
+            pairing.write_text(
+                json.dumps(
+                    {
+                        "dataset": "RealLQ250",
+                        "source_image_path": str(lq_path),
+                        "source_lq_path": str(lq_path),
+                        "donor_suggestion": "Carefully reduce ringing while preserving structure.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest = root / "inference" / "inference_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "datasets": [
+                            {
+                                "name": "RealLQ250",
+                                "suggestion_pairing_manifest": str(pairing),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output = root / "bad"
+            run_analysis(
+                metrics_csv=scores,
+                summary_json=None,
+                metrics=["maniqa"],
+                mode="separate",
+                worst_k=1,
+                lq_dirs={"RealLQ250": lq_dir},
+                output_dir=output,
+                inference_manifest=manifest,
+                jsonl_path=conditions,
+                prompt_variant="suggestion",
+            )
+
+            rows = read_worst_cases(output / "worst_cases.csv")
+            self.assertIn("Carefully reduce ringing", rows[0]["prompt"])
+            comparison_path = output / "images" / "worst_0001_sample.png"
+            with Image.open(comparison_path) as comparison:
+                self.assertGreater(comparison.height, 24 + 64 + 58)
+
+    def test_comparison_uses_configurable_large_font(self):
+        from tools.analyze_rg_flux_bad_cases import compose_comparison_image, load_report_font
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sr_path = root / "sr.png"
+            lq_path = root / "lq.png"
+            output_path = root / "comparison.png"
+            write_image(sr_path, "white", size=(128, 128))
+            write_image(lq_path, "black", size=(128, 128))
+            row = {
+                "path": str(sr_path),
+                "rank": 1,
+                "dataset": "RealLQ250",
+                "filename": "sr.png",
+                "maniqa": 0.1,
+            }
+
+            font = load_report_font(40)
+            self.assertGreaterEqual(font.getbbox("Ag")[3] - font.getbbox("Ag")[1], 36)
+            compose_comparison_image(
+                row,
+                lq_path,
+                output_path,
+                ["maniqa"],
+                prompt="A readable prompt rendered at forty pixels.",
+                font_size=40,
+            )
+            with Image.open(output_path) as comparison:
+                self.assertGreaterEqual(comparison.width, 800)
+
+
+    def test_exact_prompt_from_inference_manifest_takes_precedence(self):
+        from tools.analyze_rg_flux_bad_cases import run_analysis
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sr_dir = root / "sr"
+            lq_dir = root / "lq"
+            write_image(sr_dir / "sample.png", "white")
+            write_image(lq_dir / "sample.png", "black")
+            scores = root / "metrics" / "per_image_scores.csv"
+            write_scores(
+                scores,
+                [
+                    {
+                        "dataset": "RealLQ250",
+                        "filename": "sample.png",
+                        "path": sr_dir / "sample.png",
+                        "width": 16,
+                        "height": 16,
+                        "maniqa": 0.1,
+                    }
+                ],
+                ["maniqa"],
+            )
+            pairing = root / "inference" / "RealLQ250" / "suggestion_pairing.jsonl"
+            pairing.parent.mkdir(parents=True)
+            pairing.write_text(
+                json.dumps(
+                    {
+                        "dataset": "RealLQ250",
+                        "source_image_path": str(lq_dir / "sample.png"),
+                        "output_filename": "sample.png",
+                        "prompt": "Exact prompt used during inference.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest = root / "inference" / "inference_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "datasets": [
+                            {
+                                "name": "RealLQ250",
+                                "suggestion_pairing_manifest": str(pairing),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output = root / "bad"
+            run_analysis(
+                metrics_csv=scores,
+                summary_json=None,
+                metrics=["maniqa"],
+                mode="separate",
+                worst_k=1,
+                lq_dirs={"RealLQ250": lq_dir},
+                output_dir=output,
+                inference_manifest=manifest,
+            )
+
+            rows = read_worst_cases(output / "worst_cases.csv")
+            self.assertEqual(rows[0]["prompt"], "Exact prompt used during inference.")
+
 
 if __name__ == "__main__":
     unittest.main()
