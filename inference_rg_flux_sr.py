@@ -24,6 +24,8 @@ from rg_flux_fm import sample_multistep_fm
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 SUGGESTION_PAIRINGS = ("matched", "shuffled")
 SUGGESTION_PROMPT_VARIANTS = {"suggestion", "iqa_suggestion"}
+IQA_PAIRINGS = ("matched", "shuffled")
+IQA_PROMPT_VARIANTS = {"iqa", "iqa_suggestion"}
 
 
 def cfg(config, path, default=None):
@@ -212,6 +214,8 @@ def write_inference_manifest(
     datasets,
     suggestion_pairing=None,
     suggestion_shuffle_seed=None,
+    iqa_pairing=None,
+    iqa_shuffle_seed=None,
     dataset_metadata=None,
 ):
     manifest_path = Path(manifest_path)
@@ -235,6 +239,9 @@ def write_inference_manifest(
     if suggestion_pairing is not None:
         payload["suggestion_pairing"] = suggestion_pairing
         payload["suggestion_shuffle_seed"] = suggestion_shuffle_seed
+    if iqa_pairing is not None:
+        payload["iqa_pairing"] = iqa_pairing
+        payload["iqa_shuffle_seed"] = iqa_shuffle_seed
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     return payload
@@ -338,14 +345,35 @@ def normalize_suggestion_pairing(value):
     return normalized
 
 
+def normalize_iqa_pairing(value):
+    normalized = str(value or "matched").strip().lower().replace("-", "_")
+    if normalized not in IQA_PAIRINGS:
+        raise ValueError(
+            f"Unsupported iqa_pairing '{value}'. Expected one of: {', '.join(IQA_PAIRINGS)}"
+        )
+    return normalized
+
+
 def prompt_uses_suggestion(prompt_variant, use_prompt=True, use_suggestions=True):
     if prompt_variant is not None:
         return str(prompt_variant).strip().lower().replace("-", "_") in SUGGESTION_PROMPT_VARIANTS
     return bool(use_prompt and use_suggestions)
 
 
+def prompt_uses_iqa(prompt_variant, use_prompt=True):
+    if prompt_variant is not None:
+        return str(prompt_variant).strip().lower().replace("-", "_") in IQA_PROMPT_VARIANTS
+    return bool(use_prompt)
+
+
 def effective_suggestion_shuffle_seed(base_seed, dataset_name):
     payload = f"{int(base_seed)}:{dataset_name}".encode("utf-8")
+    dataset_offset = int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big")
+    return dataset_offset % (2**32)
+
+
+def effective_iqa_shuffle_seed(base_seed, dataset_name):
+    payload = f"iqa:{int(base_seed)}:{dataset_name}".encode("utf-8")
     dataset_offset = int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big")
     return dataset_offset % (2**32)
 
@@ -369,11 +397,36 @@ def build_suggestion_donor_indices(count, pairing="matched", seed=0):
     return donor_indices
 
 
+def build_iqa_donor_indices(count, pairing="matched", seed=0):
+    pairing = normalize_iqa_pairing(pairing)
+    if count < 0:
+        raise ValueError(f"count must be non-negative, got {count}")
+    if pairing == "matched":
+        return list(range(count))
+    if count < 2:
+        raise ValueError("Shuffled IQA pairing requires at least two valid images.")
+
+    donor_indices = list(range(count))
+    rng = random.Random(int(seed))
+    for index in range(count - 1, 0, -1):
+        swap_index = rng.randrange(index)
+        donor_indices[index], donor_indices[swap_index] = donor_indices[swap_index], donor_indices[index]
+    return donor_indices
+
+
 def profile_with_donor_suggestion(source_profile, donor_profile):
     source_profile = source_profile if isinstance(source_profile, dict) else {}
     donor_profile = donor_profile if isinstance(donor_profile, dict) else {}
     paired_profile = copy.deepcopy(source_profile)
     paired_profile["suggestion"] = donor_profile.get("suggestion")
+    return paired_profile
+
+
+def profile_with_donor_iqa(source_profile, donor_profile):
+    source_profile = source_profile if isinstance(source_profile, dict) else {}
+    donor_profile = donor_profile if isinstance(donor_profile, dict) else {}
+    paired_profile = copy.deepcopy(source_profile)
+    paired_profile["iqa"] = copy.deepcopy(donor_profile.get("iqa"))
     return paired_profile
 
 
@@ -386,13 +439,16 @@ def condition_source_path(condition, fallback):
     return str(fallback)
 
 
-def write_suggestion_pairing_manifest(path, rows):
+def write_pairing_manifest(path, rows):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     return path
+
+
+write_suggestion_pairing_manifest = write_pairing_manifest
 
 
 def append_inference_failure(log_path, image_path, reason, condition=None):
@@ -506,12 +562,21 @@ def run_inference_dataset(
         )
 
     suggestion_pairing = normalize_suggestion_pairing(args.suggestion_pairing)
+    iqa_pairing = normalize_iqa_pairing(args.iqa_pairing) if args.iqa_pairing is not None else None
     uses_suggestion = prompt_uses_suggestion(
         args.prompt_variant,
         use_prompt=args.use_prompt,
         use_suggestions=args.use_suggestions,
     )
-    if suggestion_pairing == "shuffled":
+    uses_iqa = prompt_uses_iqa(args.prompt_variant, use_prompt=args.use_prompt)
+    if iqa_pairing is not None and suggestion_pairing == "shuffled":
+        raise ValueError("IQA and suggestion cannot both be shuffled in the same inference run.")
+
+    pairing_field = "iqa" if iqa_pairing is not None else "suggestion"
+    pairing = iqa_pairing if iqa_pairing is not None else suggestion_pairing
+    shuffle_seed = args.iqa_shuffle_seed if pairing_field == "iqa" else args.suggestion_shuffle_seed
+
+    if pairing_field == "suggestion" and pairing == "shuffled":
         if not args.jsonl_path:
             raise ValueError("--suggestion_pairing shuffled requires --jsonl_path.")
         if not uses_suggestion:
@@ -530,17 +595,38 @@ def run_inference_dataset(
                 f"Shuffled suggestion pairing requires a non-empty suggestion for every valid image; "
                 f"missing {len(missing_suggestions)} (examples: {preview})."
             )
+    if pairing_field == "iqa":
+        if not args.jsonl_path:
+            raise ValueError("--iqa_pairing requires --jsonl_path.")
+        if not uses_iqa:
+            raise ValueError(
+                "--iqa_pairing requires prompt_variant iqa/iqa_suggestion "
+                "or legacy prompt settings that include IQA."
+            )
+        missing_iqa = [
+            str(entry["image_path"])
+            for entry in entries
+            if not isinstance(entry["profile"].get("iqa"), dict)
+            or not any(str(value or "").strip() for value in entry["profile"]["iqa"].values())
+        ]
+        if missing_iqa:
+            preview = ", ".join(missing_iqa[:3])
+            raise ValueError(
+                f"IQA pairing requires a non-empty IQA profile for every valid image; "
+                f"missing {len(missing_iqa)} (examples: {preview})."
+            )
 
     effective_seed = (
-        effective_suggestion_shuffle_seed(args.suggestion_shuffle_seed, dataset_name)
-        if suggestion_pairing == "shuffled"
+        (
+            effective_iqa_shuffle_seed(shuffle_seed, dataset_name)
+            if pairing_field == "iqa"
+            else effective_suggestion_shuffle_seed(shuffle_seed, dataset_name)
+        )
+        if pairing == "shuffled"
         else None
     )
-    donor_indices = build_suggestion_donor_indices(
-        len(entries),
-        pairing=suggestion_pairing,
-        seed=effective_seed or 0,
-    )
+    donor_builder = build_iqa_donor_indices if pairing_field == "iqa" else build_suggestion_donor_indices
+    donor_indices = donor_builder(len(entries), pairing=pairing, seed=effective_seed or 0)
     pairing_rows = []
 
     for source_index, donor_index in enumerate(donor_indices):
@@ -552,11 +638,14 @@ def run_inference_dataset(
         donor_image_path = donor_entry["image_path"]
         source_suggestion = source_profile.get("suggestion") if isinstance(source_profile, dict) else None
         donor_suggestion = donor_profile.get("suggestion") if isinstance(donor_profile, dict) else None
-        paired_profile = (
-            profile_with_donor_suggestion(source_profile, donor_profile)
-            if uses_suggestion
-            else source_profile
-        )
+        source_iqa = source_profile.get("iqa") if isinstance(source_profile, dict) else None
+        donor_iqa = donor_profile.get("iqa") if isinstance(donor_profile, dict) else None
+        if pairing_field == "iqa":
+            paired_profile = profile_with_donor_iqa(source_profile, donor_profile)
+        elif uses_suggestion:
+            paired_profile = profile_with_donor_suggestion(source_profile, donor_profile)
+        else:
+            paired_profile = source_profile
         prompt = build_sr_prompt(
             paired_profile,
             use_prompt=args.use_prompt,
@@ -566,8 +655,9 @@ def run_inference_dataset(
         pairing_rows.append(
             {
                 "dataset": dataset_name,
-                "pairing": suggestion_pairing,
-                "shuffle_seed": args.suggestion_shuffle_seed if suggestion_pairing == "shuffled" else None,
+                "pairing_field": pairing_field,
+                "pairing": pairing,
+                "shuffle_seed": shuffle_seed if pairing == "shuffled" else None,
                 "effective_dataset_seed": effective_seed,
                 "source_image_path": str(source_image_path),
                 "source_lq_path": condition_source_path(source_entry["condition"], source_image_path),
@@ -575,6 +665,8 @@ def run_inference_dataset(
                 "donor_lq_path": condition_source_path(donor_entry["condition"], donor_image_path),
                 "source_suggestion": source_suggestion,
                 "donor_suggestion": donor_suggestion,
+                "source_iqa": source_iqa,
+                "donor_iqa": donor_iqa,
                 "output_filename": f"{source_image_path.stem}.png",
                 "output_image_path": str(output_dir / f"{source_image_path.stem}.png"),
                 "prompt": prompt,
@@ -583,11 +675,13 @@ def run_inference_dataset(
                     str(source_suggestion or "").strip()
                     == str(donor_suggestion or "").strip()
                 ),
+                "same_iqa_profile": json.dumps(source_iqa, ensure_ascii=False, sort_keys=True)
+                == json.dumps(donor_iqa, ensure_ascii=False, sort_keys=True),
             }
         )
 
-    pairing_manifest_path = output_dir / "suggestion_pairing.jsonl"
-    write_suggestion_pairing_manifest(pairing_manifest_path, pairing_rows)
+    pairing_manifest_path = output_dir / f"{pairing_field}_pairing.jsonl"
+    write_pairing_manifest(pairing_manifest_path, pairing_rows)
 
     for source_index, entry in enumerate(tqdm(entries, desc=f"RG-FLUX-SR inference [{dataset_name}]")):
         image_path = entry["image_path"]
@@ -644,15 +738,17 @@ def run_inference_dataset(
             out_image = out_image.resize((original_size[0] * args.upscale, original_size[1] * args.upscale), Image.Resampling.LANCZOS)
         out_image.save(output_dir / f"{image_path.stem}.png")
 
-    return {
-        "suggestion_pairing_manifest": str(pairing_manifest_path),
-        "suggestion_pairing": suggestion_pairing,
-        "suggestion_shuffle_seed": args.suggestion_shuffle_seed if suggestion_pairing == "shuffled" else None,
-        "effective_suggestion_shuffle_seed": effective_seed,
+    metadata = {
+        f"{pairing_field}_pairing_manifest": str(pairing_manifest_path),
+        f"{pairing_field}_pairing": pairing,
+        f"{pairing_field}_shuffle_seed": shuffle_seed if pairing == "shuffled" else None,
+        f"effective_{pairing_field}_shuffle_seed": effective_seed,
         "valid_image_count": len(entries),
         "skipped_image_count": len(image_paths) - len(entries),
         "same_suggestion_text_count": sum(row["same_suggestion_text"] for row in pairing_rows),
+        "same_iqa_profile_count": sum(row["same_iqa_profile"] for row in pairing_rows),
     }
+    return metadata
 
 
 def main(args):
@@ -675,11 +771,13 @@ def main(args):
         config["text_encoding"]["cache_dir"] = args.text_embedding_cache
 
     args.suggestion_pairing = normalize_suggestion_pairing(args.suggestion_pairing)
-    if args.suggestion_pairing == "shuffled":
+    if args.iqa_pairing is not None:
+        args.iqa_pairing = normalize_iqa_pairing(args.iqa_pairing)
+    if args.suggestion_pairing == "shuffled" or args.iqa_pairing == "shuffled":
         text_encoding_mode = str(cfg(config, "text_encoding.mode", "online") or "online").strip().lower()
         if text_encoding_mode != "online":
             raise ValueError(
-                "Shuffled suggestions require online text encoding because cached embeddings are keyed by the "
+                "Shuffled prompt conditions require online text encoding because cached embeddings are keyed by the "
                 "matched image prompt. Pass --text_encoding_mode online."
             )
 
@@ -724,10 +822,12 @@ def main(args):
         checkpoint_path=resolved_run["checkpoint"],
         output_dir=resolved_run["output_dir"],
         datasets=datasets,
-        suggestion_pairing=args.suggestion_pairing,
+        suggestion_pairing=(None if args.iqa_pairing is not None else args.suggestion_pairing),
         suggestion_shuffle_seed=(
             args.suggestion_shuffle_seed if args.suggestion_pairing == "shuffled" else None
         ),
+        iqa_pairing=args.iqa_pairing,
+        iqa_shuffle_seed=(args.iqa_shuffle_seed if args.iqa_pairing == "shuffled" else None),
         dataset_metadata=dataset_metadata,
     )
 
@@ -783,6 +883,18 @@ def build_arg_parser():
         type=int,
         default=3407,
         help="Base seed for deterministic cross-image suggestion pairing.",
+    )
+    parser.add_argument(
+        "--iqa_pairing",
+        choices=("matched", "shuffled"),
+        default=None,
+        help="Use each image's own IQA profile or a deterministic cross-image IQA derangement.",
+    )
+    parser.add_argument(
+        "--iqa_shuffle_seed",
+        type=int,
+        default=3407,
+        help="Base seed for deterministic cross-image IQA pairing.",
     )
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)

@@ -107,7 +107,13 @@ def compare_metric_rows(matched_rows, shuffled_rows, directions):
     return output_rows
 
 
-def write_comparison_outputs(output_dir, rows, matched_metrics_dir, shuffled_metrics_dir):
+def write_comparison_outputs(
+    output_dir,
+    rows,
+    matched_metrics_dir,
+    shuffled_metrics_dir,
+    pairing_field="suggestion",
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "pairing_comparison.csv"
@@ -132,7 +138,11 @@ def write_comparison_outputs(output_dir, rows, matched_metrics_dir, shuffled_met
     payload = {
         "matched_metrics_dir": str(matched_metrics_dir),
         "shuffled_metrics_dir": str(shuffled_metrics_dir),
-        "interpretation": "matched_advantage > 0 means matched suggestions outperform shuffled suggestions",
+        "pairing_field": pairing_field,
+        "interpretation": (
+            f"matched_advantage > 0 means matched {pairing_field} conditions "
+            f"outperform shuffled {pairing_field} conditions"
+        ),
         "comparisons": rows,
     }
     with json_path.open("w", encoding="utf-8") as handle:
@@ -140,7 +150,12 @@ def write_comparison_outputs(output_dir, rows, matched_metrics_dir, shuffled_met
     return csv_path, json_path
 
 
-def compare_pairing_metrics(matched_metrics_dir, shuffled_metrics_dir, output_dir):
+def compare_pairing_metrics(
+    matched_metrics_dir,
+    shuffled_metrics_dir,
+    output_dir,
+    pairing_field="suggestion",
+):
     matched_metrics_dir = Path(matched_metrics_dir)
     shuffled_metrics_dir = Path(shuffled_metrics_dir)
     matched_rows = load_csv_rows(matched_metrics_dir / "per_image_scores.csv")
@@ -158,6 +173,7 @@ def compare_pairing_metrics(matched_metrics_dir, shuffled_metrics_dir, output_di
         rows=rows,
         matched_metrics_dir=matched_metrics_dir,
         shuffled_metrics_dir=shuffled_metrics_dir,
+        pairing_field=pairing_field,
     )
 
 
@@ -168,6 +184,7 @@ def build_arg_parser():
     parser.add_argument("--matched_metrics_dir", required=True)
     parser.add_argument("--shuffled_metrics_dir", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--pairing_field", choices=("suggestion", "iqa"), default="suggestion")
     return parser
 
 
@@ -177,6 +194,7 @@ def main(argv=None):
         matched_metrics_dir=args.matched_metrics_dir,
         shuffled_metrics_dir=args.shuffled_metrics_dir,
         output_dir=args.output_dir,
+        pairing_field=args.pairing_field,
     )
     print(f"Saved paired comparison CSV: {csv_path}")
     print(f"Saved paired comparison JSON: {json_path}")

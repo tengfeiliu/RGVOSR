@@ -21,6 +21,10 @@ class SuggestionPairingTests(unittest.TestCase):
             "effective_suggestion_shuffle_seed",
             "build_suggestion_donor_indices",
             "profile_with_donor_suggestion",
+            "normalize_iqa_pairing",
+            "effective_iqa_shuffle_seed",
+            "build_iqa_donor_indices",
+            "profile_with_donor_iqa",
         }
         helpers = [
             node
@@ -32,6 +36,7 @@ class SuggestionPairingTests(unittest.TestCase):
             "hashlib": hashlib,
             "random": random,
             "SUGGESTION_PAIRINGS": ("matched", "shuffled"),
+            "IQA_PAIRINGS": ("matched", "shuffled"),
         }
         exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
         return namespace
@@ -72,6 +77,29 @@ class SuggestionPairingTests(unittest.TestCase):
         self.assertEqual(paired["iqa"], source["iqa"])
         self.assertEqual(paired["iaa"], source["iaa"])
         self.assertEqual(source["suggestion"], "source suggestion")
+
+    def test_iqa_pairing_is_reproducible_and_swap_only_changes_iqa(self):
+        helpers = self.load_inference_helpers()
+        build_indices = helpers["build_iqa_donor_indices"]
+        first = build_indices(20, pairing="shuffled", seed=1234)
+        self.assertEqual(first, build_indices(20, pairing="shuffled", seed=1234))
+        self.assertEqual(sorted(first), list(range(20)))
+        self.assertTrue(all(source != donor for source, donor in enumerate(first)))
+
+        source = {
+            "iqa": {"distortion": "source diagnosis"},
+            "suggestion": "source suggestion",
+            "iaa": {"comprehensive": "source aesthetics"},
+        }
+        donor = {
+            "iqa": {"distortion": "donor diagnosis"},
+            "suggestion": "donor suggestion",
+        }
+        paired = helpers["profile_with_donor_iqa"](source, donor)
+        self.assertEqual(paired["iqa"], donor["iqa"])
+        self.assertEqual(paired["suggestion"], source["suggestion"])
+        self.assertEqual(paired["iaa"], source["iaa"])
+        self.assertEqual(source["iqa"], {"distortion": "source diagnosis"})
 
     def test_pipeline_builds_same_checkpoint_online_matched_and_shuffled_commands(self):
         from tools.run_rg_flux_pipeline import (
@@ -164,6 +192,61 @@ class SuggestionPairingTests(unittest.TestCase):
             self.assertEqual(set(record["suggestion_pairing_runs"]), {"matched", "shuffled"})
             self.assertTrue(
                 any("compare_rg_flux_pairing_metrics.py" in part for part in record["pairing_comparison_command"])
+            )
+
+    def test_dry_run_pipeline_records_iqa_pairing_comparison(self):
+        from tools.run_rg_flux_pipeline import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "pipeline_runtime_config.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "condition": {
+                            "prompt_variant": "iqa",
+                            "use_prompt": True,
+                            "use_suggestions": False,
+                            "use_degradation_vector": False,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            returncode = main(
+                [
+                    "--skip_train",
+                    "--run_dir",
+                    str(run_dir),
+                    "--checkpoint_steps",
+                    "20000",
+                    "--dataset_dirs",
+                    "RealLR200=/data/RealLR200",
+                    "--jsonl_path",
+                    "datasets/inference_cleaned.jsonl",
+                    "--compare_iqa_pairing",
+                    "--dry_run_pipeline",
+                ]
+            )
+            self.assertEqual(returncode, 0)
+            manifest = json.loads((run_dir / "pipeline_manifest.json").read_text(encoding="utf-8"))
+            record = manifest["records"][0]
+            self.assertEqual(set(record["iqa_pairing_runs"]), {"matched", "shuffled"})
+            for pairing, run in record["iqa_pairing_runs"].items():
+                command = run["inference_command"]
+                self.assertEqual(command[command.index("--iqa_pairing") + 1], pairing)
+                self.assertEqual(command[command.index("--prompt_variant") + 1], "iqa")
+                self.assertNotIn("--suggestion_pairing", command)
+            self.assertTrue(
+                any(
+                    "compare_rg_flux_pairing_metrics.py" in part
+                    for part in record["iqa_pairing_comparison_command"]
+                )
+            )
+            comparison_command = record["iqa_pairing_comparison_command"]
+            self.assertEqual(
+                comparison_command[comparison_command.index("--pairing_field") + 1],
+                "iqa",
             )
 
     def test_paired_metric_comparison_is_direction_aware(self):

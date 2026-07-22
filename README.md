@@ -810,6 +810,34 @@ python tools/run_rg_flux_pipeline.py \
 
 `latest` 会解析为 `<run_dir>/checkpoints/` 下最新的 `checkpoint-*` 目录。若指定 checkpoint 或 `rg_flux_adapters` 不存在，脚本会直接报错，避免静默跳过导致后续评估混乱。v1 版本默认等训练完全结束后再推理和评估，不会在训练中并发抢 GPU 显存。
 
+### IQA matched/shuffled 因果对比
+
+下面的命令使用同一 checkpoint、推理 seed 和采样参数依次运行 matched IQA 与跨图 shuffled IQA，随后自动生成逐图指标差值。shuffled 只替换 `profile.iqa`，不会替换图片自己的 suggestion；因此 `--prompt_variant iqa_suggestion` 也可以用于测量在 suggestion 固定时 IQA 的独立作用。
+
+```bash
+python tools/run_rg_flux_pipeline.py \
+  --skip_train \
+  --run_dir exp_rg_flux_sr/<existing_run> \
+  --checkpoint_steps latest \
+  --dataset_dirs \
+    realLQ250=/data/datasets/omgsr_eval/RealLQ250/lq \
+    realLR200=/data/datasets/omgsr_eval/RealLR200 \
+  --jsonl_path datasets/inference.cleaned.jsonl \
+  --prompt_variant iqa \
+  --use_prompt \
+  --no-use_suggestions \
+  --compare_iqa_pairing \
+  --iqa_shuffle_seed 3407 \
+  --seed 42 \
+  --text_encoding_mode online \
+  --num_inference_steps 25 \
+  --dtype bf16 \
+  --device cuda \
+  --metric_device cuda
+```
+
+输出分别位于 `iqa_pairing_matched`、`iqa_pairing_shuffled_seed3407` 和 `iqa_pairing_comparison` 目录。`pairing_comparison.csv` 中的 `matched_advantage > 0` 表示 matched IQA 优于 shuffled IQA。JSONL 必须覆盖所有推理图片，每条有效记录均需包含非空 `unipercept_raw.profile.iqa`，且 shuffled 对比至少需要两张有效图片。
+
 ### FLUX.2-klein LoRA-MoE Checkpoint 推理
 
 MoE 推理仍然使用同一个 `inference_rg_flux_sr.py`。只要 `--config` 指向 MoE 配置，`--checkpoint` 指向包含 `flux2_klein_lora_moe_state.pt` 的 `rg_flux_adapters` 目录，脚本会自动启用 Top-2 routing。

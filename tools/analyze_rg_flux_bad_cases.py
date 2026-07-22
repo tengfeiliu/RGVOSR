@@ -210,7 +210,8 @@ def load_inference_prompt_index(inference_manifest=None):
             continue
         dataset_name = str(dataset_entry.get("name") or "")
         pairing_path = _resolve_manifest_path(
-            dataset_entry.get("suggestion_pairing_manifest"),
+            dataset_entry.get("suggestion_pairing_manifest")
+            or dataset_entry.get("iqa_pairing_manifest"),
             inference_manifest,
         )
         if pairing_path is None or not pairing_path.exists():
