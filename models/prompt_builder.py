@@ -8,7 +8,7 @@ DEFAULT_SR_PROMPT = (
     "Avoid hallucinated details, over-sharpening, and semantic changes."
 )
 
-PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
+PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion") 
 
 
 def _safe_text(value, default=""):
