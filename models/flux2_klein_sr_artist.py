@@ -640,6 +640,58 @@ class Flux2KleinSRArtist(nn.Module):
             pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
+    def prompt_token_lengths(self, prompts):
+        """Count untruncated tokens with the tokenizer used by FLUX.2 Klein."""
+        if self.text_pipeline is None:
+            raise RuntimeError(
+                "Prompt token validation requires the FLUX.2 text pipeline; "
+                "use online text encoding while preparing a new prompt cache."
+            )
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        tokenizer = getattr(self.text_pipeline, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = getattr(self.text_pipeline, "tokenizer_2", None)
+        if tokenizer is None:
+            raise RuntimeError(
+                "FLUX.2 Klein text pipeline does not expose its tokenizer."
+            )
+        lengths = []
+        for prompt in prompts:
+            messages = [{"role": "user", "content": str(prompt)}]
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            encoded = tokenizer(
+                text,
+                padding=False,
+                truncation=False,
+            )
+            input_ids = (
+                encoded.get("input_ids")
+                if isinstance(encoded, dict)
+                else getattr(encoded, "input_ids", None)
+            )
+            if input_ids is None:
+                raise RuntimeError("FLUX.2 tokenizer did not return input_ids.")
+            if hasattr(input_ids, "ndim") and input_ids.ndim == 2:
+                lengths.append(int(input_ids.shape[1]))
+            elif input_ids and isinstance(input_ids[0], (list, tuple)):
+                lengths.append(len(input_ids[0]))
+            else:
+                lengths.append(len(input_ids))
+        return lengths
+
     def extract_visual_tokens(self, lq_up):
         return None
 

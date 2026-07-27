@@ -31,8 +31,13 @@ from dataloaders.degradation_meta import DEGRADATION_KEYS
 from dataloaders.rg_flux_jsonl_dataset import RGFluxSRJsonlDataset, rg_flux_collate_fn
 from metrics.rg_sr_metrics import DEFAULT_OMGSR_METRICS, evaluate_dataset_dirs
 from models.rg_flux_artist_factory import build_rg_flux_artist
-from models.prompt_builder import build_sr_prompt, normalize_prompt_variant
+from models.prompt_builder import (
+    build_sr_prompt,
+    normalize_prompt_variant,
+    validate_prompt_profile,
+)
 from models.text_embedding_cache import (
+    compute_prompt_hash,
     get_text_embedding_cache,
     normalize_text_encoding_mode,
     resolve_prompt_embeddings,
@@ -72,11 +77,21 @@ def cfg_bool(config, path, default=False):
 def resolve_prompt_schedule(config):
     enabled = cfg_bool(config, "condition.prompt_schedule.enabled", False)
     switch_step = int(cfg(config, "condition.prompt_schedule.switch_step", 0) or 0)
-    if switch_step < 0:
-        raise ValueError("condition.prompt_schedule.switch_step must be non-negative")
+    configured_max_steps = int(cfg(config, "training.max_steps", 100000))
+    if enabled and (switch_step < 0 or switch_step > configured_max_steps):
+        raise ValueError(
+            "condition.prompt_schedule.switch_step must satisfy "
+            f"0 <= switch_step <= training.max_steps ({configured_max_steps}); "
+            f"got {switch_step}"
+        )
 
     before_variant = normalize_prompt_variant(
         cfg(config, "condition.prompt_schedule.before_variant", "fixed")
+    )
+    before_include_caption = cfg_bool(
+        config,
+        "condition.prompt_schedule.before_include_caption",
+        False,
     )
     after_value = cfg(
         config,
@@ -84,11 +99,29 @@ def resolve_prompt_schedule(config):
         cfg(config, "condition.prompt_variant", "fixed"),
     )
     after_variant = normalize_prompt_variant(after_value or "fixed")
+    after_include_caption = cfg_bool(
+        config,
+        "condition.prompt_schedule.after_include_caption",
+        cfg_bool(config, "condition.include_caption", False),
+    )
+    if enabled and before_variant == "fixed" and before_include_caption:
+        raise ValueError(
+            "condition.prompt_schedule.before_variant=fixed cannot use "
+            "before_include_caption=true"
+        )
+    if enabled and after_variant == "fixed" and after_include_caption:
+        raise ValueError(
+            "condition.prompt_schedule.after_variant=fixed cannot use "
+            "after_include_caption=true"
+        )
     return {
         "enabled": enabled,
         "switch_step": switch_step,
         "before_variant": before_variant or "fixed",
+        "before_include_caption": before_include_caption,
         "after_variant": after_variant or "fixed",
+        "after_include_caption": after_include_caption,
+        "configured_max_steps": configured_max_steps,
     }
 
 
@@ -96,15 +129,155 @@ def prompt_variant_for_step(prompt_schedule, global_step):
     if not prompt_schedule.get("enabled", False):
         return None
     if int(global_step) < int(prompt_schedule["switch_step"]):
-        return prompt_schedule["before_variant"]
-    return prompt_schedule["after_variant"]
+        return {
+            "variant": prompt_schedule["before_variant"],
+            "include_caption": bool(prompt_schedule["before_include_caption"]),
+        }
+    return {
+        "variant": prompt_schedule["after_variant"],
+        "include_caption": bool(prompt_schedule["after_include_caption"]),
+    }
+
+
+def reachable_prompt_conditions(config, prompt_schedule=None):
+    prompt_schedule = prompt_schedule or resolve_prompt_schedule(config)
+    if not prompt_schedule["enabled"]:
+        variant = normalize_prompt_variant(cfg(config, "condition.prompt_variant", None))
+        include_caption = cfg_bool(config, "condition.include_caption", False)
+        if include_caption and not cfg_bool(config, "condition.use_prompt", True):
+            raise ValueError(
+                "condition.include_caption=true requires condition.use_prompt=true"
+            )
+        if variant is None:
+            return []
+        state = {
+            "variant": variant,
+            "include_caption": include_caption,
+        }
+        if variant == "fixed" and state["include_caption"]:
+            raise ValueError(
+                "condition.prompt_variant=fixed cannot use condition.include_caption=true"
+            )
+        return [state]
+
+    switch_step = int(prompt_schedule["switch_step"])
+    max_steps = int(prompt_schedule["configured_max_steps"])
+    before = {
+        "variant": prompt_schedule["before_variant"],
+        "include_caption": bool(prompt_schedule["before_include_caption"]),
+    }
+    after = {
+        "variant": prompt_schedule["after_variant"],
+        "include_caption": bool(prompt_schedule["after_include_caption"]),
+    }
+    if switch_step == 0:
+        return [after]
+    if switch_step == max_steps:
+        return [before]
+    return [before, after]
+
+
+def validate_dataset_prompt_profiles(records, config, prompt_schedule=None):
+    conditions = reachable_prompt_conditions(config, prompt_schedule=prompt_schedule)
+    for record in records:
+        for condition in conditions:
+            try:
+                validate_prompt_profile(
+                    record.get("profile"),
+                    prompt_variant=condition["variant"],
+                    include_caption=condition["include_caption"],
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "Prompt profile preflight failed for "
+                    f"sample_id={record.get('sample_id')} lq_path={record.get('lq_path')} "
+                    f"condition={condition}: {exc}"
+                ) from exc
+
+
+def validate_dataset_prompt_token_lengths(
+    artist,
+    records,
+    config,
+    prompt_schedule=None,
+    batch_size=64,
+):
+    max_length = int(cfg(config, "model.max_prompt_sequence_length", 0) or 0)
+    if max_length <= 0 or normalize_text_encoding_mode(config) == "cached":
+        return
+    conditions = reachable_prompt_conditions(config, prompt_schedule=prompt_schedule)
+    if not conditions:
+        return
+    counter = getattr(artist, "prompt_token_lengths", None)
+    if not callable(counter):
+        if str(cfg(config, "model.flux_backend", "")).lower() == "flux2_klein":
+            raise RuntimeError(
+                "FLUX.2 prompt validation requires artist.prompt_token_lengths()."
+            )
+        return
+
+    prompt_sources = {}
+    for record in records:
+        for condition in conditions:
+            prompt = build_sr_prompt(
+                record.get("profile"),
+                prompt_variant=condition["variant"],
+                include_caption=condition["include_caption"],
+            )
+            prompt_sources.setdefault(
+                prompt,
+                {
+                    "sample_id": record.get("sample_id"),
+                    "lq_path": record.get("lq_path"),
+                    "condition": condition,
+                },
+            )
+
+    unique_prompts = list(prompt_sources)
+    batch_size = max(int(batch_size), 1)
+    for start in range(0, len(unique_prompts), batch_size):
+        prompt_batch = unique_prompts[start : start + batch_size]
+        lengths = list(counter(prompt_batch))
+        if len(lengths) != len(prompt_batch):
+            raise RuntimeError(
+                "Prompt tokenizer returned a mismatched number of token lengths."
+            )
+        for prompt, token_length in zip(prompt_batch, lengths):
+            if int(token_length) > max_length:
+                source = prompt_sources[prompt]
+                raise ValueError(
+                    "Prompt exceeds model.max_prompt_sequence_length without "
+                    f"truncation: tokens={token_length} limit={max_length} "
+                    f"sample_id={source['sample_id']} lq_path={source['lq_path']} "
+                    f"condition={source['condition']}"
+                )
+    validated = getattr(artist, "_validated_prompt_length_hashes", None)
+    if validated is None:
+        validated = set()
+        setattr(artist, "_validated_prompt_length_hashes", validated)
+    validated.update(compute_prompt_hash(prompt) for prompt in unique_prompts)
 
 
 def resolve_batch_prompts(batch, config, global_step, prompt_schedule=None):
     prompt_schedule = prompt_schedule or resolve_prompt_schedule(config)
-    active_variant = prompt_variant_for_step(prompt_schedule, global_step)
-    if active_variant is None:
-        return list(batch["prompt"]), None
+    active_condition = prompt_variant_for_step(prompt_schedule, global_step)
+    if active_condition is None:
+        configured_variant = normalize_prompt_variant(
+            cfg(config, "condition.prompt_variant", None)
+        )
+        configured_condition = (
+            {
+                "variant": configured_variant,
+                "include_caption": cfg_bool(
+                    config,
+                    "condition.include_caption",
+                    False,
+                ),
+            }
+            if configured_variant is not None
+            else None
+        )
+        return list(batch["prompt"]), configured_condition
 
     profiles = batch.get("profile")
     if not isinstance(profiles, list) or len(profiles) != len(batch["prompt"]):
@@ -113,10 +286,14 @@ def resolve_batch_prompts(batch, config, global_step, prompt_schedule=None):
             "Enable return_profile on RGFluxSRJsonlDataset."
         )
     prompts = [
-        build_sr_prompt(profile, prompt_variant=active_variant)
+        build_sr_prompt(
+            profile,
+            prompt_variant=active_condition["variant"],
+            include_caption=active_condition["include_caption"],
+        )
         for profile in profiles
     ]
-    return prompts, active_variant
+    return prompts, active_condition
 
 
 def resolve_mixed_crop_config(config):
@@ -1032,6 +1209,21 @@ def run_rg_flux_evaluation(
     use_degradation_vector = bool(cfg(config, "condition.use_degradation_vector", True))
     num_inference_steps = int(cfg(config, "evaluation.num_inference_steps", cfg(config, "flow_matching.num_inference_steps", 25)))
     eval_seed = int(cfg(config, "evaluation.seed", cfg(config, "training.seed", 42) or 42))
+    eval_prompt_schedule = resolve_prompt_schedule(config)
+    eval_prompt_condition = prompt_variant_for_step(
+        eval_prompt_schedule,
+        max(int(global_step) - 1, 0),
+    )
+    eval_prompt_variant = (
+        eval_prompt_condition["variant"]
+        if eval_prompt_condition is not None
+        else cfg(config, "condition.prompt_variant", None)
+    )
+    eval_include_caption = (
+        eval_prompt_condition["include_caption"]
+        if eval_prompt_condition is not None
+        else cfg_bool(config, "condition.include_caption", False)
+    )
 
     try:
         with torch.no_grad():
@@ -1044,11 +1236,16 @@ def run_rg_flux_evaluation(
                     profile,
                     use_prompt=bool(cfg(config, "condition.use_prompt", True)),
                     use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
-                    prompt_variant=cfg(config, "condition.prompt_variant", None),
+                    prompt_variant=eval_prompt_variant,
+                    include_caption=eval_include_caption,
                 )
                 lq_up = prepare_eval_lq_up(
                     record["lq_path"],
-                    upscale=int(cfg(config, "data.scale", 4)),
+                    upscale=(
+                        1
+                        if cfg_bool(config, "data.pre_cropped", True)
+                        else int(cfg(config, "data.scale", 4))
+                    ),
                     align=int(cfg(config, "data.vae_align", 16)),
                 ).to(accelerator.device, dtype=weight_dtype)
                 z_lr = unwrapped_artist.encode_images(
@@ -1132,6 +1329,11 @@ def main(config_path, dry_run=False):
     config.setdefault("text_encoding", {})
     prompt_schedule = resolve_prompt_schedule(config)
     mixed_crop = resolve_mixed_crop_config(config)
+    pre_cropped = cfg_bool(config, "data.pre_cropped", True)
+    if pre_cropped and mixed_crop["enabled"]:
+        raise ValueError(
+            "data.pre_cropped=true and data.mixed_crop.enabled=true cannot be used together"
+        )
 
     output_root = Path(cfg(config, "training.output_dir", "exp_rg_flux_sr"))
     report_to = normalize_report_to(cfg(config, "training.report_to", None))
@@ -1180,12 +1382,15 @@ def main(config_path, dry_run=False):
         local_logger.info("  vae_device = %s", cfg(config, "model.vae_device", "cpu"))
         local_logger.info("  max_prompt_sequence_length = %s", cfg(config, "model.max_prompt_sequence_length", 128))
         local_logger.info(
-            "  prompt_schedule = enabled:%s switch_step:%s before:%s after:%s",
+            "  prompt_schedule = enabled:%s switch_step:%s before:%s caption:%s after:%s caption:%s",
             prompt_schedule["enabled"],
             prompt_schedule["switch_step"],
             prompt_schedule["before_variant"],
+            prompt_schedule["before_include_caption"],
             prompt_schedule["after_variant"],
+            prompt_schedule["after_include_caption"],
         )
+        local_logger.info("  data.pre_cropped = %s", pre_cropped)
         local_logger.info(
             "  mixed_crop = enabled:%s local_ratio:%.3f full_frame_ratio:%.3f max_long_side:%s align:%s",
             mixed_crop["enabled"],
@@ -1269,16 +1474,31 @@ def main(config_path, dry_run=False):
         mode="train",
         use_prompt=bool(cfg(config, "condition.use_prompt", True)),
         use_suggestions=bool(cfg(config, "condition.use_suggestions", True)),
-        prompt_variant=cfg(config, "condition.prompt_variant", None),
+        prompt_variant=(
+            "fixed"
+            if prompt_schedule["enabled"]
+            else cfg(config, "condition.prompt_variant", None)
+        ),
+        include_caption=(
+            False
+            if prompt_schedule["enabled"]
+            else cfg_bool(config, "condition.include_caption", False)
+        ),
         use_degradation_vector=bool(cfg(config, "condition.use_degradation_vector", True)),
         vae_align=int(cfg(config, "data.vae_align", 16)),
         return_profile=prompt_schedule["enabled"],
+        pre_cropped=pre_cropped,
         mixed_crop_enabled=mixed_crop["enabled"],
         full_frame_ratio=mixed_crop["full_frame_ratio"],
         full_frame_max_long_side=mixed_crop["full_frame_max_long_side"],
         full_frame_align=mixed_crop["full_frame_align"],
         full_frame_pad_mode=mixed_crop["full_frame_pad_mode"],
         full_frame_upscale_small=mixed_crop["full_frame_upscale_small"],
+    )
+    validate_dataset_prompt_profiles(
+        dataset.records,
+        config,
+        prompt_schedule=prompt_schedule,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -1292,6 +1512,12 @@ def main(config_path, dry_run=False):
     )
 
     artist = build_rg_flux_artist(config)
+    validate_dataset_prompt_token_lengths(
+        artist,
+        dataset.records,
+        config,
+        prompt_schedule=prompt_schedule,
+    )
     init_single_lora = cfg(config, "model.lora_moe.init_from_single_lora", None)
     if init_single_lora and not cfg(config, "training.resume_ckpt", None) and hasattr(artist, "initialize_moe_from_single_lora"):
         loaded_lora_tensors = artist.initialize_moe_from_single_lora(init_single_lora)
@@ -1413,7 +1639,7 @@ def main(config_path, dry_run=False):
             hq = batch["hq"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             lq_up = batch["lq_up"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             degradation_vector = batch["degradation_vector"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
-            prompts, active_prompt_variant = resolve_batch_prompts(
+            prompts, active_prompt_condition = resolve_batch_prompts(
                 batch,
                 config,
                 global_step,
@@ -1433,7 +1659,11 @@ def main(config_path, dry_run=False):
                     sample=lr_cond_mode != "flux2_image_concat",
                 ).to(accelerator.device, dtype=weight_dtype, non_blocking=True)
                 fixed_cache_key = None
-                if active_prompt_variant == "fixed" and text_encoding_mode == "online":
+                if (
+                    active_prompt_condition is not None
+                    and active_prompt_condition["variant"] == "fixed"
+                    and text_encoding_mode == "online"
+                ):
                     fixed_cache_key = (len(prompts), tuple(prompts))
                 cached_fixed_state = (
                     fixed_prompt_embedding_cache.get(fixed_cache_key)
@@ -1540,11 +1770,14 @@ def main(config_path, dry_run=False):
                     "loss_down": loss_down.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
-                if active_prompt_variant is not None:
+                if active_prompt_condition is not None:
                     step_logs["prompt/variant_id"] = float(
                         {"fixed": 0, "suggestion": 1, "iqa": 2, "iqa_suggestion": 3}[
-                            active_prompt_variant
+                            active_prompt_condition["variant"]
                         ]
+                    )
+                    step_logs["prompt/caption_enabled"] = float(
+                        active_prompt_condition["include_caption"]
                     )
                 spatial_modes = batch.get("spatial_mode", [])
                 if mixed_crop["enabled"] and spatial_modes:

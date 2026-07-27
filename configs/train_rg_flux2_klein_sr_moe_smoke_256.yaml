@@ -41,6 +41,7 @@ text_encoding:
 
 data:
   jsonl_path: datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl
+  pre_cropped: false
   crop_size: 512
   scale: 4
   batch_size: 1

@@ -12,6 +12,7 @@ from tools.generate_iqa_sr_suggestion_jsonl import (
     get_iqa,
     normalize_selected_degradations,
     render_user_prompt,
+    record_resume_key,
     replace_suggestion,
 )
 
@@ -156,6 +157,20 @@ class IqaSrSuggestionJsonlTests(unittest.TestCase):
         converted = replace_suggestion(record, "New suggestion.")
         self.assertEqual(record["unipercept_raw"]["profile"]["suggestion"], "Old unsafe suggestion.")
         self.assertEqual(converted["unipercept_raw"]["profile"]["suggestion"], "New suggestion.")
+        self.assertEqual(converted["annotation_status"]["suggestion"], "complete")
+
+    def test_resume_prefers_sample_id_and_falls_back_to_hq_path(self):
+        record = make_record()
+        record["sample_id"] = "crop-sample-1"
+        self.assertEqual(
+            record_resume_key(record),
+            ("sample_id", "crop-sample-1"),
+        )
+        record.pop("sample_id")
+        self.assertEqual(
+            record_resume_key(record),
+            ("hq_path", "/data/hq.png"),
+        )
 
 
 if __name__ == "__main__":

@@ -16,7 +16,11 @@ from tqdm import tqdm
 
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from models.rg_flux_artist_factory import build_rg_flux_artist
-from models.prompt_builder import PROMPT_VARIANTS, build_sr_prompt
+from models.prompt_builder import (
+    PROMPT_VARIANTS,
+    build_sr_prompt,
+    validate_prompt_profile,
+)
 from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
 from rg_flux_fm import sample_multistep_fm
 
@@ -460,7 +464,7 @@ def append_inference_failure(log_path, image_path, reason, condition=None):
     }
     record = condition.get("record") if isinstance(condition, dict) else None
     if isinstance(record, dict):
-        for key in ("lq_path", "hq_path"):
+        for key in ("sample_id", "lq_path", "hq_path"):
             value = record.get(key)
             if value:
                 payload[key] = value
@@ -514,8 +518,36 @@ def run_inference_dataset(
     to_pil = transforms.ToPILImage()
 
     entries = []
+    pre_cropped = bool(cfg(config, "data.pre_cropped", True))
+    expected_crop_size = int(cfg(config, "data.crop_size", 512))
     for image_path in image_paths:
         condition = None
+        if pre_cropped:
+            try:
+                with Image.open(image_path) as image:
+                    actual_mode = image.mode
+                    actual_size = image.size
+                if (
+                    actual_mode != "RGB"
+                    or actual_size
+                    != (expected_crop_size, expected_crop_size)
+                ):
+                    raise ValueError(
+                        f"actual_mode={actual_mode} actual_size={actual_size}; "
+                        f"expected RGB {expected_crop_size}x{expected_crop_size}"
+                    )
+            except Exception as exc:
+                append_inference_failure(
+                    failure_log_path,
+                    image_path=image_path,
+                    reason=f"invalid_pre_cropped_input: {exc}",
+                    condition=None,
+                )
+                print(
+                    f"[inference] skipped {image_path}: invalid pre-cropped input ({exc})",
+                    flush=True,
+                )
+                continue
         if args.jsonl_path:
             condition = condition_for_image(
                 condition_index,
@@ -546,6 +578,37 @@ def run_inference_dataset(
         else:
             profile = {}
             result = {}
+        if args.include_caption and not str(profile.get("caption") or "").strip():
+            append_inference_failure(
+                failure_log_path,
+                image_path=image_path,
+                reason="missing_profile.caption",
+                condition=condition,
+            )
+            print(
+                f"[inference] skipped {image_path}: missing profile.caption",
+                flush=True,
+            )
+            continue
+        if args.prompt_variant is not None:
+            try:
+                validate_prompt_profile(
+                    profile,
+                    prompt_variant=args.prompt_variant,
+                    include_caption=args.include_caption,
+                )
+            except ValueError as exc:
+                append_inference_failure(
+                    failure_log_path,
+                    image_path=image_path,
+                    reason=f"invalid_prompt_profile: {exc}",
+                    condition=condition,
+                )
+                print(
+                    f"[inference] skipped {image_path}: invalid prompt profile ({exc})",
+                    flush=True,
+                )
+                continue
         entries.append(
             {
                 "image_path": image_path,
@@ -651,6 +714,7 @@ def run_inference_dataset(
             use_prompt=args.use_prompt,
             use_suggestions=args.use_suggestions,
             prompt_variant=args.prompt_variant,
+            include_caption=args.include_caption,
         )
         pairing_rows.append(
             {
@@ -688,9 +752,10 @@ def run_inference_dataset(
         condition = entry["condition"]
         result = entry["result"]
         prompt = pairing_rows[source_index]["prompt"]
+        model_input_upscale = 1 if pre_cropped else args.upscale
         lq_up_pil, original_size, lq_up = prepare_lq_up(
             image_path,
-            upscale=args.upscale,
+            upscale=model_input_upscale,
             align=int(cfg(config, "data.vae_align", 16)),
             min_size=args.min_size,
         )
@@ -735,7 +800,14 @@ def run_inference_dataset(
 
         out_image = to_pil(sr[0].float().cpu())
         if args.restore_input_size:
-            out_image = out_image.resize((original_size[0] * args.upscale, original_size[1] * args.upscale), Image.Resampling.LANCZOS)
+            output_upscale = 1 if pre_cropped else args.upscale
+            out_image = out_image.resize(
+                (
+                    original_size[0] * output_upscale,
+                    original_size[1] * output_upscale,
+                ),
+                Image.Resampling.LANCZOS,
+            )
         out_image.save(output_dir / f"{image_path.stem}.png")
 
     metadata = {
@@ -764,6 +836,19 @@ def main(args):
         args.prompt_variant = cfg(config, "condition.prompt_variant", None)
     else:
         config["condition"]["prompt_variant"] = args.prompt_variant
+    if getattr(args, "include_caption", None) is None:
+        args.include_caption = bool(cfg(config, "condition.include_caption", False))
+    else:
+        config["condition"]["include_caption"] = bool(args.include_caption)
+    if args.prompt_variant == "fixed" and args.include_caption:
+        raise ValueError(
+            "prompt_variant=fixed cannot be combined with include_caption=true"
+        )
+    if args.include_caption and not args.jsonl_path:
+        raise ValueError(
+            "Caption-conditioned inference requires --jsonl_path with a crop-local "
+            "caption for every input LQ image."
+        )
     lr_cond_mode = config["condition"]["lr_cond_mode"]
     if args.text_encoding_mode is not None:
         config["text_encoding"]["mode"] = args.text_encoding_mode
@@ -872,6 +957,12 @@ def build_arg_parser():
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prompt_variant", choices=("fixed", "suggestion", "iqa", "iqa_suggestion"), default=None)
+    parser.add_argument(
+        "--include_caption",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include the crop-local profile.caption in the SR prompt.",
+    )
     parser.add_argument(
         "--suggestion_pairing",
         choices=("matched", "shuffled"),

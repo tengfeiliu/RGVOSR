@@ -17,6 +17,7 @@ from models.rg_flux_artist_factory import build_rg_flux_artist  # noqa: E402
 from models.text_embedding_cache import (  # noqa: E402
     TextEmbeddingCache,
     normalize_image_key,
+    validate_online_prompt_lengths,
 )
 
 
@@ -51,7 +52,13 @@ def iter_jsonl_records(jsonl_path, limit=None):
                 break
 
 
-def prompt_from_record(record, use_prompt=True, use_suggestions=True, prompt_variant=None):
+def prompt_from_record(
+    record,
+    use_prompt=True,
+    use_suggestions=True,
+    prompt_variant=None,
+    include_caption=False,
+):
     unipercept_raw = record.get("unipercept_raw")
     unipercept_raw = unipercept_raw if isinstance(unipercept_raw, dict) else {}
     profile = unipercept_raw.get("profile")
@@ -62,6 +69,7 @@ def prompt_from_record(record, use_prompt=True, use_suggestions=True, prompt_var
         use_prompt=use_prompt,
         use_suggestions=use_suggestions,
         prompt_variant=prompt_variant,
+        include_caption=include_caption,
     )
 
 
@@ -103,6 +111,9 @@ def main(args):
     use_prompt = bool(runtime_config.get("condition", {}).get("use_prompt", True))
     use_suggestions = bool(runtime_config.get("condition", {}).get("use_suggestions", True))
     prompt_variant = runtime_config.get("condition", {}).get("prompt_variant")
+    include_caption = bool(
+        runtime_config.get("condition", {}).get("include_caption", False)
+    )
 
     generated = 0
     skipped = 0
@@ -123,6 +134,7 @@ def main(args):
                 use_prompt=use_prompt,
                 use_suggestions=use_suggestions,
                 prompt_variant=prompt_variant,
+                include_caption=include_caption,
             )
             existing = cache.find_record(prompt, image_key=image_key, allow_prompt_reuse=True)
             if args.skip_existing and existing is not None:
@@ -134,6 +146,11 @@ def main(args):
                 continue
 
             with torch.no_grad():
+                validate_online_prompt_lengths(
+                    artist,
+                    [prompt],
+                    runtime_config,
+                )
                 prompt_embeds, pooled_prompt_embeds, text_ids = artist.encode_prompts(
                     [prompt],
                     device=device,

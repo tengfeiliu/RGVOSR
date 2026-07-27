@@ -27,10 +27,12 @@ class RGFluxSRJsonlDataset(Dataset):
         use_prompt=True,
         use_suggestions=True,
         prompt_variant=None,
+        include_caption=False,
         use_degradation_vector=True,
         vae_align=16,
         max_retry=100,
         return_profile=False,
+        pre_cropped=True,
         mixed_crop_enabled=False,
         full_frame_ratio=0.0,
         full_frame_max_long_side=768,
@@ -46,10 +48,12 @@ class RGFluxSRJsonlDataset(Dataset):
         self.use_prompt = bool(use_prompt)
         self.use_suggestions = bool(use_suggestions)
         self.prompt_variant = prompt_variant
+        self.include_caption = bool(include_caption)
         self.use_degradation_vector = bool(use_degradation_vector)
         self.vae_align = int(vae_align)
         self.max_retry = int(max_retry)
         self.return_profile = bool(return_profile)
+        self.pre_cropped = bool(pre_cropped)
         self.mixed_crop_enabled = bool(mixed_crop_enabled)
         self.full_frame_ratio = float(full_frame_ratio)
         self.full_frame_max_long_side = int(full_frame_max_long_side)
@@ -58,10 +62,20 @@ class RGFluxSRJsonlDataset(Dataset):
         self.full_frame_upscale_small = bool(full_frame_upscale_small)
         self.to_tensor = transforms.ToTensor()
 
-        if self.vae_align > 1:
+        if self.pre_cropped and self.vae_align > 1:
+            if self.crop_size % self.vae_align:
+                raise ValueError(
+                    "Strict pre-cropped crop_size must already be divisible by "
+                    f"vae_align; got crop_size={self.crop_size}, vae_align={self.vae_align}"
+                )
+        elif self.vae_align > 1:
             self.crop_size = self.crop_size - (self.crop_size % self.vae_align)
         if self.crop_size <= 0:
             raise ValueError("crop_size must be positive after VAE alignment")
+        if self.pre_cropped and self.mixed_crop_enabled:
+            raise ValueError(
+                "data.pre_cropped=true and data.mixed_crop.enabled=true cannot be used together"
+            )
         if not 0.0 <= self.full_frame_ratio <= 1.0:
             raise ValueError("full_frame_ratio must be between 0 and 1")
         if self.full_frame_max_long_side <= 0:
@@ -110,8 +124,11 @@ class RGFluxSRJsonlDataset(Dataset):
 
                 records.append(
                     {
+                        "sample_id": str(payload.get("sample_id") or f"line-{line_no}"),
+                        "source_hq_path": payload.get("source_hq_path"),
                         "hq_path": str(hq_path),
                         "lq_path": str(lq_path),
+                        "crop": payload.get("crop") if isinstance(payload.get("crop"), dict) else {},
                         "profile": profile,
                         "result": result,
                     }
@@ -123,9 +140,16 @@ class RGFluxSRJsonlDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
-    def _load_rgb(self, path):
+    def _load_rgb(self, path, record, label):
         with Image.open(path) as image:
             image.load()
+            if self.pre_cropped and image.mode != "RGB":
+                raise ValueError(
+                    "Invalid pre-cropped sample "
+                    f"sample_id={record['sample_id']} {label}_path={path} "
+                    f"actual_mode={image.mode} actual_size={image.size}; "
+                    f"expected_mode=RGB expected_size=({self.crop_size}, {self.crop_size})"
+                )
             return image.convert("RGB")
 
     def _ensure_min_size(self, image, min_size):
@@ -238,6 +262,14 @@ class RGFluxSRJsonlDataset(Dataset):
         return hq_frame, lq_frame, lq_up
 
     def _sample_pair(self, hq, lq):
+        if self.pre_cropped:
+            expected = (self.crop_size, self.crop_size)
+            if hq.size != expected or lq.size != expected:
+                raise ValueError(
+                    f"Expected strict pre-cropped RGB pairs of size {expected}, "
+                    f"got hq_size={hq.size}, lq_size={lq.size}"
+                )
+            return hq, lq, lq.copy(), "pre_cropped"
         use_full_frame = (
             self.mode == "train"
             and self.mixed_crop_enabled
@@ -262,8 +294,8 @@ class RGFluxSRJsonlDataset(Dataset):
         for retry in range(self.max_retry):
             record = self.records[(index + retry) % len(self.records)]
             try:
-                hq = self._load_rgb(record["hq_path"])
-                lq = self._load_rgb(record["lq_path"])
+                hq = self._load_rgb(record["hq_path"], record, "hq")
+                lq = self._load_rgb(record["lq_path"], record, "lq")
                 hq_crop, lq_crop, lq_up, spatial_mode = self._sample_pair(hq, lq)
                 profile = record["profile"]
                 result = record["result"]
@@ -276,18 +308,28 @@ class RGFluxSRJsonlDataset(Dataset):
                         use_prompt=self.use_prompt,
                         use_suggestions=self.use_suggestions,
                         prompt_variant=self.prompt_variant,
+                        include_caption=self.include_caption,
                     ),
                     "degradation_vector": self._degradation_vector(result),
                     "score": torch.tensor(float(result.get("score", 0.0) or 0.0), dtype=torch.float32),
                     "suggestions": list(result.get("suggestions") or []),
                     "hq_path": record["hq_path"],
                     "lq_path": record["lq_path"],
+                    "sample_id": record["sample_id"],
+                    "source_hq_path": record["source_hq_path"],
+                    "crop": record["crop"],
                     "spatial_mode": spatial_mode,
                 }
                 if self.return_profile:
                     sample["profile"] = profile
                 return sample
             except Exception as exc:
+                if self.pre_cropped:
+                    raise RuntimeError(
+                        "Failed strict pre-cropped sample "
+                        f"sample_id={record['sample_id']} hq_path={record['hq_path']} "
+                        f"lq_path={record['lq_path']}: {exc}"
+                    ) from exc
                 if retry == 0:
                     logger.warning("Failed to load RG-FLUX-SR sample %s: %s", record, exc)
         raise RuntimeError(f"Failed to load sample after {self.max_retry} retries from {self.jsonl_path}")
@@ -304,6 +346,9 @@ def rg_flux_collate_fn(batch):
     collated["suggestions"] = [item["suggestions"] for item in batch]
     collated["hq_path"] = [item["hq_path"] for item in batch]
     collated["lq_path"] = [item["lq_path"] for item in batch]
+    collated["sample_id"] = [item["sample_id"] for item in batch]
+    collated["source_hq_path"] = [item["source_hq_path"] for item in batch]
+    collated["crop"] = [item["crop"] for item in batch]
     collated["spatial_mode"] = [item.get("spatial_mode", "local_crop") for item in batch]
     if all("profile" in item for item in batch):
         collated["profile"] = [item["profile"] for item in batch]

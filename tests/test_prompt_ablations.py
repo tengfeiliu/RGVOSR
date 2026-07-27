@@ -51,6 +51,76 @@ class PromptAblationTests(unittest.TestCase):
         self.assertIn("Restoration suggestion:", prompt)
         self.assertNotIn("IAA comprehensive:", prompt)
 
+    def test_quality_variants_compose_independently_with_caption(self):
+        from models.prompt_builder import build_sr_prompt
+
+        profile = dict(self.profile)
+        profile["caption"] = "A person stands beside a bicycle on a street."
+        expectations = {
+            "iqa": (True, False),
+            "suggestion": (False, True),
+            "iqa_suggestion": (True, True),
+        }
+        for variant, (has_iqa, has_suggestion) in expectations.items():
+            for include_caption in (False, True):
+                with self.subTest(
+                    variant=variant,
+                    include_caption=include_caption,
+                ):
+                    prompt = build_sr_prompt(
+                        profile,
+                        prompt_variant=variant,
+                        include_caption=include_caption,
+                    )
+                    self.assertEqual(
+                        "Image description:" in prompt,
+                        include_caption,
+                    )
+                    self.assertEqual("IQA profile:" in prompt, has_iqa)
+                    self.assertEqual(
+                        "Restoration suggestion:" in prompt,
+                        has_suggestion,
+                    )
+                    headings = [
+                        heading
+                        for heading in (
+                            "Image description:",
+                            "IQA profile:",
+                            "Restoration suggestion:",
+                        )
+                        if heading in prompt
+                    ]
+                    positions = [prompt.index(heading) for heading in headings]
+                    self.assertEqual(positions, sorted(positions))
+
+    def test_fixed_caption_and_missing_explicit_fields_are_rejected(self):
+        from models.prompt_builder import build_sr_prompt
+
+        profile = dict(self.profile)
+        profile["caption"] = "A crop-local image description."
+        with self.assertRaisesRegex(ValueError, "fixed"):
+            build_sr_prompt(
+                profile,
+                prompt_variant="fixed",
+                include_caption=True,
+            )
+        with self.assertRaisesRegex(ValueError, "iqa.distortion_location"):
+            build_sr_prompt(
+                {"iqa": {}, "suggestion": "Restore detail."},
+                prompt_variant="iqa",
+            )
+        with self.assertRaisesRegex(ValueError, "suggestion"):
+            build_sr_prompt(
+                dict(self.profile, suggestion=""),
+                prompt_variant="suggestion",
+            )
+        with self.assertRaisesRegex(ValueError, "caption"):
+            build_sr_prompt(
+                self.profile,
+                prompt_variant="iqa",
+                include_caption=True,
+            )
+
     def test_invalid_prompt_variant_is_rejected(self):
         from models.prompt_builder import build_sr_prompt
 

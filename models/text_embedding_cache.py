@@ -7,7 +7,7 @@ import torch
 
 
 TEXT_EMBEDDING_KEYS = ("prompt_embeds", "pooled_prompt_embeds", "text_ids")
-PROMPT_BUILDER_SIGNATURE = "rg_flux_sr_prompt_builder_v1"
+PROMPT_BUILDER_SIGNATURE = "rg_flux_sr_prompt_builder_v2_caption_iqa"
 
 
 def cfg(config, path, default=None):
@@ -67,12 +67,27 @@ def compute_encoder_signature(config, dtype=None):
         "text_encoder_dtype": normalize_dtype_name(cfg(config, "model.text_encoder_dtype", "fp32")),
         "use_prompt": bool(cfg(config, "condition.use_prompt", True)),
         "use_suggestions": bool(cfg(config, "condition.use_suggestions", True)),
+        "include_caption": bool(cfg(config, "condition.include_caption", False)),
         "dtype": normalize_dtype_name(dtype or cfg(config, "text_encoding.dtype", cfg(config, "model.dtype", "bf16"))),
         "prompt_builder": PROMPT_BUILDER_SIGNATURE,
     }
     prompt_variant = cfg(config, "condition.prompt_variant", None)
     if prompt_variant is not None:
         payload["prompt_variant"] = str(prompt_variant)
+    prompt_schedule = cfg(config, "condition.prompt_schedule", None)
+    if isinstance(prompt_schedule, dict):
+        payload["prompt_schedule"] = {
+            "enabled": bool(prompt_schedule.get("enabled", False)),
+            "switch_step": int(prompt_schedule.get("switch_step", 0) or 0),
+            "before_variant": prompt_schedule.get("before_variant"),
+            "before_include_caption": bool(
+                prompt_schedule.get("before_include_caption", False)
+            ),
+            "after_variant": prompt_schedule.get("after_variant"),
+            "after_include_caption": bool(
+                prompt_schedule.get("after_include_caption", False)
+            ),
+        }
     return stable_json_hash(payload)
 
 
@@ -318,6 +333,7 @@ class TextEmbeddingCache:
             "use_prompt": bool(cfg(self.config, "condition.use_prompt", True)),
             "use_suggestions": bool(cfg(self.config, "condition.use_suggestions", True)),
             "prompt_variant": cfg(self.config, "condition.prompt_variant", None),
+            "include_caption": bool(cfg(self.config, "condition.include_caption", False)),
             "dtype": self.dtype_name,
         }
         return self.append_manifest_record(record)
@@ -329,6 +345,44 @@ def get_text_embedding_cache(config, dtype=None):
     if mode == "cached" and cache is None:
         raise ValueError("text_encoding.cache_dir is required when text_encoding.mode is cached.")
     return cache
+
+
+def validate_online_prompt_lengths(artist, prompts, config):
+    max_length = int(cfg(config, "model.max_prompt_sequence_length", 0) or 0)
+    counter = getattr(artist, "prompt_token_lengths", None)
+    if max_length <= 0 or not callable(counter):
+        return
+    validated = getattr(artist, "_validated_prompt_length_hashes", None)
+    if validated is None:
+        validated = set()
+        setattr(artist, "_validated_prompt_length_hashes", validated)
+    pending = [
+        (index, prompt, compute_prompt_hash(prompt))
+        for index, prompt in enumerate(prompts)
+        if compute_prompt_hash(prompt) not in validated
+    ]
+    if not pending:
+        return
+    lengths = list(counter([prompt for _, prompt, _ in pending]))
+    if len(lengths) != len(pending):
+        raise RuntimeError(
+            "Prompt tokenizer returned a mismatched number of token lengths."
+        )
+    overflows = [
+        (original_index, int(length))
+        for (original_index, _prompt, _prompt_hash), length in zip(
+            pending,
+            lengths,
+        )
+        if int(length) > max_length
+    ]
+    if overflows:
+        index, length = overflows[0]
+        raise ValueError(
+            "Prompt exceeds model.max_prompt_sequence_length without truncation: "
+            f"prompt_index={index} tokens={length} limit={max_length}"
+        )
+    validated.update(prompt_hash for _, _, prompt_hash in pending)
 
 
 def resolve_prompt_embeddings(artist, prompts, image_keys, config, device, dtype, cache=None):
@@ -344,12 +398,14 @@ def resolve_prompt_embeddings(artist, prompts, image_keys, config, device, dtype
         raise ValueError(f"image_keys length {len(image_keys)} does not match prompts length {len(prompts)}")
 
     if mode == "online":
+        validate_online_prompt_lengths(artist, prompts, config)
         return artist.encode_prompts(prompts, device=device, dtype=dtype)
 
     cache = cache or get_text_embedding_cache(config, dtype=dtype)
     if cache is None:
         if mode == "cached":
             raise ValueError("text_encoding.cache_dir is required when text_encoding.mode is cached.")
+        validate_online_prompt_lengths(artist, prompts, config)
         return artist.encode_prompts(prompts, device=device, dtype=dtype)
 
     states = []
@@ -364,6 +420,7 @@ def resolve_prompt_embeddings(artist, prompts, image_keys, config, device, dtype
         if state is None:
             if mode == "cached":
                 raise FileNotFoundError(f"Missing text embedding cache for image_key={normalize_image_key(image_key)}")
+            validate_online_prompt_lengths(artist, prompts, config)
             return artist.encode_prompts(prompts, device=device, dtype=dtype)
         states.append(state)
     return stack_embedding_states(states, device=device, dtype=dtype)

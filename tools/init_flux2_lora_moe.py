@@ -72,8 +72,12 @@ def initialize_prototypes(artist, config, device, dtype, num_samples, text_embed
         use_prompt=bool(config.get("condition", {}).get("use_prompt", True)),
         use_suggestions=bool(config.get("condition", {}).get("use_suggestions", True)),
         prompt_variant=config.get("condition", {}).get("prompt_variant"),
+        include_caption=bool(
+            config.get("condition", {}).get("include_caption", False)
+        ),
         use_degradation_vector=bool(config.get("condition", {}).get("use_degradation_vector", True)),
         vae_align=int(config.get("data", {}).get("vae_align", 16)),
+        pre_cropped=bool(config.get("data", {}).get("pre_cropped", True)),
     )
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=rg_flux_collate_fn)
     lr_cond_mode = config.get("condition", {}).get("lr_cond_mode", "latent_adapter")

@@ -346,6 +346,46 @@ class UniPerceptRawCacheTests(unittest.TestCase):
         self.assertEqual(list(result["profile"]["iqa"].keys()), list(module.IQA_PROFILE_PROMPTS.keys()))
         self.assertIn("raw_structural_annotation", result["profile"]["ista"])
 
+    def test_caption_iqa_profile_uses_five_chat_calls_without_reward(self):
+        from tools import generate_unipercept_raw_cache as module
+
+        analyzer = object.__new__(module.UniPerceptRawAnalyzer)
+        analyzer.profile_sections = ("caption", "iqa")
+        analyzer.include_reward_scores = False
+        calls = []
+
+        def fake_chat(image_path, prompt, max_new_tokens=1024):
+            calls.append((str(image_path), prompt, max_new_tokens))
+            if prompt == module.CAPTION_PROFILE_PROMPT:
+                return "A person stands beside a bicycle. " * 20
+            return "Visible moderate degradation."
+
+        analyzer._chat_prompt = fake_chat
+        analyzer._reward_scores = mock.Mock(
+            side_effect=AssertionError("reward must not run")
+        )
+
+        result = analyzer._analyze_with_profile("saved_lq_crop.png")
+
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(
+            all(call[0] == "saved_lq_crop.png" for call in calls)
+        )
+        self.assertEqual(
+            calls[0][1],
+            module.CAPTION_PROFILE_PROMPT,
+        )
+        self.assertLessEqual(
+            len(result["profile"]["caption"].split()),
+            60,
+        )
+        self.assertEqual(result["profile"]["iaa"], {})
+        self.assertEqual(result["profile"]["ista"], {})
+        self.assertEqual(
+            set(result["profile"]["iqa"]),
+            set(module.IQA_PROFILE_PROMPTS),
+        )
+
     def test_process_image_writes_profile_reasoning_and_keeps_degradation_score(self):
         from dataloaders.degradation_meta import compute_score
         from tools import generate_unipercept_raw_cache as module

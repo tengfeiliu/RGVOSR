@@ -94,6 +94,27 @@ class TextEmbeddingCacheTests(unittest.TestCase):
             cache.embedding_path(record).unlink()
             self.assertIsNone(cache.find_record("original prompt", "/images/a.png"))
 
+    def test_caption_and_schedule_flags_change_encoder_signature(self):
+        from models.text_embedding_cache import compute_encoder_signature
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = make_config(tmp_dir)
+            caption = make_config(tmp_dir)
+            caption["condition"]["include_caption"] = True
+            caption["condition"]["prompt_schedule"] = {
+                "enabled": True,
+                "switch_step": 10000,
+                "before_variant": "fixed",
+                "before_include_caption": False,
+                "after_variant": "iqa_suggestion",
+                "after_include_caption": True,
+            }
+
+            self.assertNotEqual(
+                compute_encoder_signature(base, dtype="bf16"),
+                compute_encoder_signature(caption, dtype="bf16"),
+            )
+
     def test_prompt_level_dedup_can_register_another_image(self):
         from models.text_embedding_cache import TextEmbeddingCache
 

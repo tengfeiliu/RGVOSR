@@ -269,9 +269,18 @@ def get_iqa(record: dict[str, Any]) -> dict[str, Any]:
     return iqa
 
 
-def replace_suggestion(record: dict[str, Any], suggestion: str) -> dict[str, Any]:
+def replace_suggestion(
+    record: dict[str, Any],
+    suggestion: str,
+    status: str = "complete",
+) -> dict[str, Any]:
     output = copy.deepcopy(record)
     get_profile(output)["suggestion"] = str(suggestion)
+    annotation_status = output.setdefault("annotation_status", {})
+    if not isinstance(annotation_status, dict):
+        annotation_status = {}
+        output["annotation_status"] = annotation_status
+    annotation_status["suggestion"] = str(status)
     return output
 
 
@@ -327,6 +336,7 @@ def convert_record(record: dict[str, Any], client) -> tuple[dict[str, Any], dict
     selected = normalize_selected_degradations(payload, iqa)
     suggestion = compile_suggestion(selected)
     return replace_suggestion(record, suggestion), {
+        "sample_id": record.get("sample_id"),
         "hq_path": record.get("hq_path"),
         "selected_degradations": selected,
         "suggestion": suggestion,
@@ -349,18 +359,37 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def completed_hq_paths(path: Path) -> set[str]:
+def record_resume_key(record: dict[str, Any]) -> tuple[str, str]:
+    sample_id = str(record.get("sample_id") or "").strip()
+    if sample_id:
+        return "sample_id", sample_id
+    hq_path = str(record.get("hq_path") or "").strip()
+    if not hq_path:
+        raise ValueError("Record is missing both sample_id and hq_path")
+    return "hq_path", hq_path
+
+
+def completed_record_keys(path: Path) -> set[tuple[str, str]]:
     if not path.exists():
         return set()
     completed = set()
     for item in load_jsonl(path):
-        hq_path = item.get("hq_path")
-        if not hq_path:
-            raise ValueError(f"Resume output contains a record without hq_path: {path}")
-        if hq_path in completed:
-            raise ValueError(f"Resume output contains duplicate hq_path: {hq_path}")
-        completed.add(str(hq_path))
+        key = record_resume_key(item)
+        if key in completed:
+            raise ValueError(
+                f"Resume output contains duplicate {key[0]}: {key[1]}"
+            )
+        completed.add(key)
     return completed
+
+
+def completed_hq_paths(path: Path) -> set[str]:
+    """Backward-compatible helper for legacy callers without sample_id."""
+    return {
+        value
+        for key_type, value in completed_record_keys(path)
+        if key_type == "hq_path"
+    }
 
 
 def append_jsonl(handle, record: dict[str, Any]):
@@ -396,7 +425,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Append only missing hq_path records when the new output is partial.",
+        help=(
+            "Append only missing records when output is partial. sample_id is "
+            "preferred; legacy records fall back to hq_path."
+        ),
     )
     parser.add_argument(
         "--error-log",
@@ -435,8 +467,10 @@ def main(argv: list[str] | None = None) -> int:
     records = load_jsonl(input_path)
     if args.limit:
         records = records[: args.limit]
-    completed = completed_hq_paths(output_path) if args.resume else set()
-    pending = [record for record in records if str(record.get("hq_path") or "") not in completed]
+    completed = completed_record_keys(output_path) if args.resume else set()
+    pending = [
+        record for record in records if record_resume_key(record) not in completed
+    ]
     if not pending:
         print(f"[iqa_sr_suggestion] Nothing to do: {output_path}", flush=True)
         return 0
@@ -450,10 +484,6 @@ def main(argv: list[str] | None = None) -> int:
         max_retries=args.max_retries,
     )
 
-    # Preflight before creating an output file, preventing an invalid model/key
-    # configuration from producing a JSONL filled with fallback prompts.
-    first_record, first_audit = convert_record(pending[0], client)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     error_path = Path(args.error_log) if args.error_log else Path(str(output_path) + ".errors.jsonl")
     audit_path = Path(args.audit_output) if args.audit_output else None
@@ -465,8 +495,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return (*convert_record(record, client), None)
         except Exception as exc:
-            fallback = replace_suggestion(record, FALLBACK_SUGGESTION)
+            fallback = replace_suggestion(
+                record,
+                FALLBACK_SUGGESTION,
+                status="fallback",
+            )
             audit = {
+                "sample_id": record.get("sample_id"),
                 "hq_path": record.get("hq_path"),
                 "selected_degradations": [],
                 "suggestion": FALLBACK_SUGGESTION,
@@ -474,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             return fallback, audit, str(exc)
 
+    first_record, first_audit, first_error = safe_convert(pending[0])
     mode = "a" if output_path.exists() else "x"
     audit_mode = "a" if audit_path and audit_path.exists() else "x"
     with output_path.open(mode, encoding="utf-8") as output_handle:
@@ -482,8 +518,21 @@ def main(argv: list[str] | None = None) -> int:
             append_jsonl(output_handle, first_record)
             if audit_handle:
                 append_jsonl(audit_handle, first_audit)
+            if first_error:
+                append_error(
+                    error_path,
+                    {
+                        "sample_id": first_record.get("sample_id"),
+                        "hq_path": first_record.get("hq_path"),
+                        "error": first_error,
+                        "fallback_suggestion": FALLBACK_SUGGESTION,
+                    },
+                    error_lock,
+                )
             print(
-                f"[iqa_sr_suggestion] 1/{len(pending)} hq_path={pending[0].get('hq_path')}",
+                f"[iqa_sr_suggestion] 1/{len(pending)} "
+                f"sample_id={pending[0].get('sample_id')} "
+                f"hq_path={pending[0].get('hq_path')} fallback={bool(first_error)}",
                 flush=True,
             )
 
@@ -503,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
                         append_error(
                             error_path,
                             {
+                                "sample_id": converted.get("sample_id"),
                                 "hq_path": converted.get("hq_path"),
                                 "error": error,
                                 "fallback_suggestion": FALLBACK_SUGGESTION,

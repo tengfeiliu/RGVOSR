@@ -1,6 +1,6 @@
 model:
   flux_backend: flux2_klein
-  flux_model_path: /root/autodl-tmp/models/FLUX.2-klein-base-4B/
+  flux_model_path: /data/models/FLUX.2-klein-base-4B
   dtype: bf16
   text_encoder_device: cuda
   text_encoder_dtype: fp32
@@ -8,12 +8,24 @@ model:
   vae_dtype: fp32
   max_prompt_sequence_length: 512
   use_lora: true
+  lora_backend: moe
   lora_rank: 32
   lora_alpha: 32
   gradient_checkpointing: false
   guidance_scale: 1.0
   latent_channels: 128
   context_dim: 15360
+  lora_moe:
+    num_routed_experts: 4
+    top_k: 2
+    latent_branch: stat_conv
+    router_hidden_dim: 1024
+    warmup_ratio: 0.1
+    init_temperature: 2.0
+    final_temperature: 0.7
+    shared_always_active: true
+    freeze_shared_during_warmup: true
+    init_from_single_lora: null
 
 text_encoding:
   mode: online
@@ -22,17 +34,26 @@ text_encoding:
   validate_prompt_hash: true
 
 data:
-  jsonl_path: datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl
-  pre_cropped: false
+  jsonl_path: datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl
   crop_size: 512
+  pre_cropped: true
   scale: 4
   batch_size: 1
   num_workers: 4
   vae_align: 16
 
 condition:
-  use_prompt: false
-  use_suggestions: false
+  use_prompt: true
+  use_suggestions: true
+  prompt_variant: iqa_suggestion
+  include_caption: true
+  prompt_schedule:
+    enabled: true
+    switch_step: 10000
+    before_variant: fixed
+    before_include_caption: false
+    after_variant: iqa_suggestion
+    after_include_caption: true
   use_degradation_vector: false
   use_visual_semantic_tokens: false
   deg_vector_dim: 8
@@ -53,8 +74,8 @@ training:
   lr_lora: 1.0e-4
   weight_decay: 0.01
   grad_accum_steps: 1
-  save_every: 2000
-  log_every: 2000
+  save_every: 1000
+  log_every: 1000
   loss_record_every: 1
   loss_record_formats: [jsonl, csv]
   output_dir: exp_rg_flux_sr
@@ -73,7 +94,7 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_stage0b512_ablation"
+  suffix: "_flux2_klein_lora_moe_stage0b512_prompt_curriculum_precropped"
 
 flow_matching:
   sigma_sampling: uniform
@@ -93,14 +114,15 @@ evaluation:
 
 loss:
   fm_weight: 1.0
-  latent_weight: 0.1
-  charb_weight: 0.1
-  down_weight: 0.1
+  latent_weight: 0.10
+  charb_weight: 1.0
+  down_weight: 0.50
   down_mode: area
   lpips_weight: 0
-  lpips_warmup_start: 1
+  lpips_warmup_start: 2000
   lpips_warmup_end: 6000
   lpips_resize: 256
+  image_loss_crop_size: 256
   image_loss_every: 1
   lpips_every: 1
   router_div_weight: 0.0

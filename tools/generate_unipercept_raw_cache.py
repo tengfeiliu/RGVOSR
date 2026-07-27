@@ -23,6 +23,10 @@ from dataloaders.degradation_meta import (  # noqa: E402
     read_jsonl_paths,
     to_jsonable,
 )
+from models.prompt_builder import (  # noqa: E402
+    PROFILE_WORD_LIMITS,
+    normalize_bounded_text,
+)
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -36,6 +40,20 @@ UNIPERCEPT_PROMPTS = {
     "iqa": "Analyze this image from the Image Quality Assessment (IQA) perspective. Return your raw assessment.",
     "ista": "Analyze this image from the Image-Text Semantic Alignment (ISTA) perspective. Return your raw assessment.",
 }
+CAPTION_PROFILE_PROMPT = (
+    "Describe only the scene content visibly supported by this low-quality image crop. "
+    "Use one concise factual English sentence. "
+    "Mention the major visible subjects, setting, and coarse spatial relationships. "
+    "Do not assess image quality, aesthetics, mood, or restoration needs. "
+    "Do not infer names, identities, unreadable text, hidden objects, or unsupported details. "
+    "Use at most 60 words."
+)
+CAPTION_FORBIDDEN_PATTERN = re.compile(
+    r"\b(?:image\s+quality|aesthetic|restor(?:e|ation)|super[-\s]?resolution|"
+    r"upscal(?:e|ing)|denois(?:e|ing)|deblur|sharpen|compression\s+artifact|"
+    r"low[-\s]?quality|high[-\s]?quality)\b",
+    re.IGNORECASE,
+)
 IAA_PROFILE_PROMPTS = {
     "composition_design": (
         "Analyze this image from the Image Aesthetics Assessment (IAA) perspective. "
@@ -406,6 +424,25 @@ def extract_conversation_answer(raw_text):
     return text
 
 
+def normalize_caption_response(raw_text):
+    text = extract_conversation_answer(raw_text)
+    text = re.sub(r"^\s*(?:[-*]\s*|\d+[.)]\s*)", "", text).strip()
+    first_sentence = re.split(r"(?<=[.!?])\s+|\n+", text, maxsplit=1)[0].strip()
+    caption = normalize_bounded_text(
+        first_sentence,
+        PROFILE_WORD_LIMITS["caption"],
+    )
+    if not caption:
+        raise ValueError("UniPercept caption is empty")
+    if not re.search(r"[A-Za-z]", caption):
+        raise ValueError("UniPercept caption must be an English sentence")
+    if CAPTION_FORBIDDEN_PATTERN.search(caption):
+        raise ValueError(
+            "UniPercept caption contains quality, aesthetics, or restoration language"
+        )
+    return caption
+
+
 def _parse_json_object(raw_text):
     text = str(raw_text or "").strip()
     if text.startswith("```"):
@@ -636,8 +673,34 @@ def build_result_from_unipercept_profile(meta, unipercept_raw):
 
 
 class UniPerceptRawAnalyzer:
-    def __init__(self, device="cuda", model_path=None, unipercept_repo=None, command=None, backend="reward"):
+    def __init__(
+        self,
+        device="cuda",
+        model_path=None,
+        unipercept_repo=None,
+        command=None,
+        backend="reward",
+        profile_sections=None,
+        include_reward_scores=True,
+    ):
         self.device = device
+        self.profile_sections = tuple(
+            str(section).strip().lower()
+            for section in (
+                profile_sections
+                if profile_sections is not None
+                else ("iaa", "iqa", "ista")
+            )
+        )
+        invalid_sections = sorted(
+            set(self.profile_sections) - {"caption", "iaa", "iqa", "ista"}
+        )
+        if invalid_sections:
+            raise ValueError(
+                "Unsupported UniPercept profile sections: "
+                + ", ".join(invalid_sections)
+            )
+        self.include_reward_scores = bool(include_reward_scores)
         if backend in {"reward", "conversation", "profile"}:
             self.model_path = require_local_unipercept_model_path(model_path, backend)
         elif model_path:
@@ -779,18 +842,40 @@ class UniPerceptRawAnalyzer:
         return str(response or "").strip()
 
     def _analyze_with_profile(self, image_path):
-        result = self._reward_scores(image_path)
+        sections = set(getattr(self, "profile_sections", ("iaa", "iqa", "ista")))
+        include_reward_scores = bool(getattr(self, "include_reward_scores", True))
+        result = self._reward_scores(image_path) if include_reward_scores else {}
         profile = {
+            "caption": "",
             "iaa": {},
             "iqa": {},
             "ista": {},
+            "suggestion": "",
         }
-        for key, prompt in IAA_PROFILE_PROMPTS.items():
-            profile["iaa"][key] = self._chat_prompt(image_path, prompt)
-        for key, prompt in IQA_PROFILE_PROMPTS.items():
-            profile["iqa"][key] = self._chat_prompt(image_path, prompt)
-        ista_raw = self._chat_prompt(image_path, ISTA_STRUCTURAL_ANNOTATION_PROMPT, max_new_tokens=2048)
-        profile["ista"] = normalize_ista_profile_response(ista_raw)
+        if "caption" in sections:
+            profile["caption"] = normalize_caption_response(
+                self._chat_prompt(
+                    image_path,
+                    CAPTION_PROFILE_PROMPT,
+                    max_new_tokens=96,
+                )
+            )
+        if "iaa" in sections:
+            for key, prompt in IAA_PROFILE_PROMPTS.items():
+                profile["iaa"][key] = self._chat_prompt(image_path, prompt)
+        if "iqa" in sections:
+            for key, prompt in IQA_PROFILE_PROMPTS.items():
+                profile["iqa"][key] = normalize_bounded_text(
+                    self._chat_prompt(image_path, prompt),
+                    PROFILE_WORD_LIMITS[key],
+                )
+        if "ista" in sections:
+            ista_raw = self._chat_prompt(
+                image_path,
+                ISTA_STRUCTURAL_ANNOTATION_PROMPT,
+                max_new_tokens=2048,
+            )
+            profile["ista"] = normalize_ista_profile_response(ista_raw)
         result["profile"] = profile
         return result
 
@@ -928,6 +1013,22 @@ def parse_args():
             "The command must print JSON or raw text to stdout."
         ),
     )
+    parser.add_argument(
+        "--profile-sections",
+        nargs="+",
+        choices=["caption", "iaa", "iqa", "ista"],
+        default=None,
+        help=(
+            "Profile sections generated by the profile backend. Defaults to the "
+            "legacy iaa+iqa+ista set."
+        ),
+    )
+    parser.add_argument(
+        "--reward-scores",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run UniPercept scalar reward scoring in addition to profile generation.",
+    )
     return parser.parse_args()
 
 
@@ -947,6 +1048,8 @@ def main():
             unipercept_repo=args.unipercept_repo,
             command=args.unipercept_command,
             backend=args.unipercept_backend,
+            profile_sections=getattr(args, "profile_sections", None),
+            include_reward_scores=getattr(args, "reward_scores", True),
         )
 
         for item in items:
@@ -994,6 +1097,8 @@ def main():
         unipercept_repo=args.unipercept_repo,
         command=args.unipercept_command,
         backend=args.unipercept_backend,
+        profile_sections=getattr(args, "profile_sections", None),
+        include_reward_scores=getattr(args, "reward_scores", True),
     )
 
     for image_path in images:

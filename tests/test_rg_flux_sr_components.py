@@ -1461,6 +1461,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
                 mode="val",
                 use_prompt=True,
                 use_degradation_vector=True,
+                pre_cropped=False,
             )
             sample = dataset[0]
 
@@ -1515,6 +1516,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
                 scale=4,
                 mode="val",
                 use_prompt=True,
+                pre_cropped=False,
             )
             sample = dataset[0]
 
@@ -1558,9 +1560,15 @@ class RGFluxSRComponentTests(unittest.TestCase):
             prompt_schedule=schedule,
         )
 
-        self.assertEqual(before_variant, "fixed")
+        self.assertEqual(
+            before_variant,
+            {"variant": "fixed", "include_caption": False},
+        )
         self.assertNotIn("Moderately restore stable edges.", before_prompts[0])
-        self.assertEqual(after_variant, "suggestion")
+        self.assertEqual(
+            after_variant,
+            {"variant": "suggestion", "include_caption": False},
+        )
         self.assertIn("Moderately restore stable edges.", after_prompts[0])
 
     def test_jsonl_dataset_full_frame_branch_preserves_composition_and_aligns_to_32(self):
@@ -1597,6 +1605,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
                 scale=4,
                 mode="train",
                 return_profile=True,
+                pre_cropped=False,
                 mixed_crop_enabled=True,
                 full_frame_ratio=1.0,
                 full_frame_max_long_side=768,

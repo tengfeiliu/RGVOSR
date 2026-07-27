@@ -22,17 +22,26 @@ text_encoding:
   validate_prompt_hash: true
 
 data:
-  jsonl_path: datasets/LSDIR_unipercept_raw_cache/valid.cleaned.jsonl
-  pre_cropped: false
+  jsonl_path: datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl
   crop_size: 512
+  pre_cropped: true
   scale: 4
   batch_size: 1
   num_workers: 4
   vae_align: 16
 
 condition:
-  use_prompt: false
-  use_suggestions: false
+  use_prompt: true
+  use_suggestions: true
+  prompt_variant: iqa_suggestion
+  include_caption: true
+  prompt_schedule:
+    enabled: true
+    switch_step: 10000
+    before_variant: fixed
+    before_include_caption: false
+    after_variant: iqa_suggestion
+    after_include_caption: true
   use_degradation_vector: false
   use_visual_semantic_tokens: false
   deg_vector_dim: 8
@@ -73,7 +82,7 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_stage0b512_ablation"
+  suffix: "_flux2_klein_stage0b512_prompt_curriculum_precropped"
 
 flow_matching:
   sigma_sampling: uniform
@@ -101,6 +110,7 @@ loss:
   lpips_warmup_start: 1
   lpips_warmup_end: 6000
   lpips_resize: 256
+  image_loss_crop_size: 512
   image_loss_every: 1
   lpips_every: 1
   router_div_weight: 0.0
