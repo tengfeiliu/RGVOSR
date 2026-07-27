@@ -9,6 +9,13 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
+from dataloaders.torchvision_compat import install_functional_tensor_compat
+
+
+# BasicSR 1.4.2 imports a module removed by torchvision 0.20. Install the
+# narrow compatibility alias before importing any BasicSR package modules.
+install_functional_tensor_compat()
+
 from basicsr.data.transforms import augment
 from basicsr.data.degradations import circular_lowpass_kernel, random_mixed_kernels
 from basicsr.utils import DiffJPEG, USMSharp, img2tensor, tensor2img
