@@ -22,7 +22,7 @@ PROFILE_WORD_LIMITS = {
     "distortion_severity": 60,
     "distortion_type": 30,
     "overall_quality": 80,
-    "suggestion": 45,
+    "suggestion": 100,
 }
 
 

@@ -7,7 +7,9 @@ import torch
 
 
 TEXT_EMBEDDING_KEYS = ("prompt_embeds", "pooled_prompt_embeds", "text_ids")
-PROMPT_BUILDER_SIGNATURE = "rg_flux_sr_prompt_builder_v2_caption_iqa"
+PROMPT_BUILDER_SIGNATURE = (
+    "rg_flux_sr_prompt_builder_v3_crop_local_suggestion100"
+)
 
 
 def cfg(config, path, default=None):

@@ -42,9 +42,10 @@ def _validate_rgb_to_grayscale(rgb_to_grayscale):
 def install_functional_tensor_compat():
     """Provide BasicSR 1.4.2's removed functional_tensor import when needed.
 
-    torchvision 0.20 exposes ``rgb_to_grayscale`` from
-    ``torchvision.transforms.functional`` but no longer ships the historical
-    ``functional_tensor`` module imported by BasicSR 1.4.2.
+    torchvision 0.20 retains the tensor implementation in
+    ``torchvision.transforms._functional_tensor`` but no longer ships the
+    historical ``functional_tensor`` module imported by BasicSR 1.4.2. This
+    installs only an import alias to that retained implementation.
     """
     try:
         importlib.import_module(LEGACY_FUNCTIONAL_TENSOR_MODULE)

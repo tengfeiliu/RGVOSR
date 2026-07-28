@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import unittest
 from types import SimpleNamespace
@@ -71,6 +72,10 @@ class TorchvisionCompatTests(unittest.TestCase):
 
         self.assertIs(raised.exception, error)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "PyTorch is required for the numerical compatibility check",
+    )
     def test_reference_validation_rejects_wrong_grayscale_math(self):
         import torch
 

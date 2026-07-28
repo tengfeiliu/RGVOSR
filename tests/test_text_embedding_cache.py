@@ -166,6 +166,16 @@ class TextEmbeddingCacheTests(unittest.TestCase):
 
 
 class TextEmbeddingCacheStaticTests(unittest.TestCase):
+    def test_prompt_builder_signature_covers_location_suggestion100(self):
+        source = Path("models/text_embedding_cache.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "rg_flux_sr_prompt_builder_v3_crop_local_suggestion100",
+            source,
+        )
+
     def test_cache_cli_supports_resume_skip_existing_and_overwrite(self):
         source = Path("tools/cache_rg_flux_text_embeddings.py").read_text(encoding="utf-8")
 

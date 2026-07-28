@@ -18,7 +18,10 @@ python tools/generate_precropped_unipercept_cache.py \
   --resume
 ```
 
-Generate crop-invariant suggestions from the four IQA fields only:
+Generate crop-local, location-aware suggestions from the four IQA fields only.
+The LLM selects degradation types and quotes crop-local location evidence; the
+tool validates that evidence and compiles the final suggestion deterministically.
+Suggestions are bounded to 100 English words:
 
 ```bash
 python tools/generate_iqa_sr_suggestion_jsonl.py \
@@ -26,6 +29,22 @@ python tools/generate_iqa_sr_suggestion_jsonl.py \
   --output datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl \
   --resume
 ```
+
+Location output is enabled by default for the pre-cropped workflow. Legacy
+full-image datasets that still apply a random crop during training must pass
+`--no-include-location` so their suggestions remain crop-invariant:
+
+```bash
+python tools/generate_iqa_sr_suggestion_jsonl.py \
+  --input datasets/legacy/train.iqa.jsonl \
+  --output datasets/legacy/train.iqa_suggestion.jsonl \
+  --no-include-location \
+  --resume
+```
+
+Existing completed suggestion JSONL records are not rewritten by `--resume`.
+Generate a new output JSONL when migrating from location-free suggestions.
+Prompt text changes invalidate old text embedding caches.
 
 Train either backend with the same JSONL:
 
