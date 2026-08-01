@@ -1531,18 +1531,30 @@ def main(config_path, dry_run=False):
     trainable_params = [param for _, param in trainable_named_params]
     if not trainable_named_params:
         raise RuntimeError("No trainable parameters found for RG-FLUX-SR-MS Stage A/B.")
+    router_params = [
+        param
+        for name, param in trainable_named_params
+        if name.startswith("moe_router.")
+    ]
+    router_param_ids = {id(param) for param in router_params}
     lora_params = [
         param
         for name, param in trainable_named_params
-        if "lora" in name.lower() or name.startswith("transformer.")
+        if id(param) not in router_param_ids and ("lora" in name.lower() or name.startswith("transformer."))
     ]
     lora_param_ids = {id(param) for param in lora_params}
-    adapter_params = [param for _, param in trainable_named_params if id(param) not in lora_param_ids]
+    adapter_params = [
+        param
+        for _, param in trainable_named_params
+        if id(param) not in lora_param_ids and id(param) not in router_param_ids
+    ]
     param_groups = []
     if adapter_params:
         param_groups.append({"params": adapter_params, "lr": float(cfg(config, "training.lr_adapter", 1e-4))})
     if lora_params:
         param_groups.append({"params": lora_params, "lr": float(cfg(config, "training.lr_lora", 5e-5))})
+    if router_params:
+        param_groups.append({"params": router_params, "lr": float(cfg(config, "training.lr_router", 1e-4))})
 
     optimizer_class = torch.optim.AdamW
     if bool(cfg(config, "training.use_8bit_adam", False)):
@@ -1611,9 +1623,10 @@ def main(config_path, dry_run=False):
     latent_weight = float(cfg(config, "loss.latent_weight", 0.0))
     charb_weight = float(cfg(config, "loss.charb_weight", 0.0))
     down_weight = float(cfg(config, "loss.down_weight", 0.0))
-    router_div_weight = float(cfg(config, "loss.router_div_weight", 0.0))
-    router_entropy_weight = float(cfg(config, "loss.router_entropy_weight", 0.0))
-    router_balance_weight = float(cfg(config, "loss.router_balance_weight", 0.0))
+    lora_moe_enabled = str(cfg(config, "model.lora_backend", "peft")).lower() == "moe"
+    router_div_weight = float(cfg(config, "loss.router_div_weight", 1.0e-3 if lora_moe_enabled else 0.0))
+    router_entropy_weight = float(cfg(config, "loss.router_entropy_weight", 1.0e-4 if lora_moe_enabled else 0.0))
+    router_balance_weight = float(cfg(config, "loss.router_balance_weight", 1.0e-3 if lora_moe_enabled else 0.0))
     checkpoint_dir = output_dir / "checkpoints"
     save_every = int(cfg(config, "training.save_every", 5000))
     log_every = int(cfg(config, "training.log_every", 100))

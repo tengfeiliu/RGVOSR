@@ -1242,9 +1242,14 @@ class RGFluxSRComponentTests(unittest.TestCase):
             self.assertEqual(config["loss"]["image_loss_crop_size"], 256)
             self.assertEqual(config["loss"]["image_loss_every"], 1)
             self.assertEqual(config["loss"]["lpips_every"], 1)
-            self.assertEqual(config["loss"]["router_div_weight"], 0.0)
-            self.assertEqual(config["loss"]["router_entropy_weight"], 0.0)
-            self.assertEqual(config["loss"]["router_balance_weight"], 0.0)
+        self.assertEqual(single_config["loss"]["router_div_weight"], 0.0)
+        self.assertEqual(single_config["loss"]["router_entropy_weight"], 0.0)
+        self.assertEqual(single_config["loss"]["router_balance_weight"], 0.0)
+        self.assertEqual(moe_config["loss"]["router_div_weight"], 1.0e-3)
+        self.assertEqual(moe_config["loss"]["router_entropy_weight"], 1.0e-4)
+        self.assertEqual(moe_config["loss"]["router_balance_weight"], 1.0e-3)
+        self.assertEqual(moe_config["training"]["lr_router"], 1.0e-4)
+        self.assertEqual(moe_config["model"]["lora_moe"]["prototype_scale"], 1.0)
         self.assertNotEqual(single_config["model"].get("lora_backend"), "moe")
         self.assertEqual(moe_config["model"]["lora_backend"], "moe")
         self.assertIn("lora_moe", moe_config["model"])
@@ -1262,6 +1267,7 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("flux2_klein_lora_moe_state.pt", source)
         self.assertIn("set_moe_training_schedule", train_source)
         self.assertIn("moe_auxiliary_losses", train_source)
+        self.assertIn('cfg(config, "training.lr_router", 1e-4)', train_source)
         self.assertIn("model.lora_moe.init_from_single_lora", train_source)
         self.assertIn("initialize_moe_from_single_lora(init_single_lora)", train_source)
         moe_source = Path("models/lora_moe.py").read_text(encoding="utf-8")
@@ -1273,6 +1279,20 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertEqual(config["model"]["lora_moe"]["top_k"], 2)
         self.assertTrue(config["training"]["freeze_flux_transformer"])
         self.assertGreater(config["loss"]["router_div_weight"], 0)
+
+    def test_flux2_lora_moe_uses_calibrated_router_defaults(self):
+        config_paths = (
+            "configs/train_rg_flux2_klein_sr_moe_smoke_256.yaml",
+            "configs/train_rg_flux2_klein_sr_moe_stage0b_512.yaml",
+            "configs/train_rg_flux2_klein_sr_moe_stage0b_512_prompt_curriculum_precropped.yaml",
+        )
+        for config_path in config_paths:
+            config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+            self.assertEqual(config["model"]["lora_moe"]["prototype_scale"], 1.0)
+            self.assertEqual(config["training"]["lr_router"], 1.0e-4)
+            self.assertEqual(config["loss"]["router_div_weight"], 1.0e-3)
+            self.assertEqual(config["loss"]["router_entropy_weight"], 1.0e-4)
+            self.assertEqual(config["loss"]["router_balance_weight"], 1.0e-3)
 
     def test_flux2_lora_moe_init_tool_loads_single_lora_and_initializes_prototypes(self):
         source = Path("tools/init_flux2_lora_moe.py").read_text(encoding="utf-8")

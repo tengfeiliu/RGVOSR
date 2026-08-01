@@ -52,6 +52,17 @@ class SharedRoutedMoELoRALinear(nn.Module):
         nn.init.normal_(self.routed_lora_A, std=0.01)
         nn.init.zeros_(self.routed_lora_B)
 
+    @torch.no_grad()
+    def initialize_routed_residuals(self, perturb_scale=0.01):
+        """Initialize routed experts as zero-output residuals around the shared A basis."""
+        perturb_scale = max(float(perturb_scale), 0.0)
+        source = self.shared_lora_A.detach()
+        noise_scale = max(source.float().std(unbiased=False).item(), 1e-6) * perturb_scale
+        for expert_idx in range(self.num_routed_experts):
+            noise = torch.randn_like(source) * noise_scale
+            self.routed_lora_A[expert_idx].copy_(source + noise)
+        self.routed_lora_B.zero_()
+
     def set_routing(self, alpha):
         if alpha is None:
             self._routing_alpha = None
@@ -149,6 +160,7 @@ class ProfileLatentRouter(nn.Module):
 
     def reset_parameters(self):
         nn.init.normal_(self.prototypes, std=0.02)
+        nn.init.zeros_(self.logit_head.weight)
         nn.init.zeros_(self.logit_head.bias)
 
     def text_features(self, prompt_embeds):

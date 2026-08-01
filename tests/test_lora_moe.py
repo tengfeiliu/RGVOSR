@@ -44,6 +44,27 @@ class LoRAMoETests(unittest.TestCase):
         self.assertTrue(torch.allclose(top2.sum(dim=-1), torch.ones(2)))
         self.assertTrue(torch.equal((top2 > 0).sum(dim=-1), torch.tensor([2, 2])))
 
+    def test_single_lora_initialization_is_function_preserving(self):
+        from models.lora_moe import SharedRoutedMoELoRALinear
+
+        base = nn.Linear(4, 3, bias=False)
+        layer = SharedRoutedMoELoRALinear(base, rank=2, alpha=2, num_routed_experts=3)
+        single_a = torch.randn_like(layer.shared_lora_A)
+        single_b = torch.randn_like(layer.shared_lora_B)
+        with torch.no_grad():
+            layer.shared_lora_A.copy_(single_a)
+            layer.shared_lora_B.copy_(single_b)
+        layer.initialize_routed_residuals(perturb_scale=0.01)
+        layer.set_routing(torch.tensor([[0.7, 0.2, 0.1], [0.1, 0.3, 0.6]]))
+
+        x = torch.randn(2, 5, 4)
+        shared_hidden = torch.nn.functional.linear(x, single_a)
+        expected = layer.base_layer(x) + torch.nn.functional.linear(shared_hidden, single_b) * layer.scaling
+
+        self.assertTrue(torch.allclose(layer(x), expected, atol=1e-6))
+        self.assertTrue(torch.equal(layer.routed_lora_B, torch.zeros_like(layer.routed_lora_B)))
+        self.assertFalse(torch.equal(layer.routed_lora_A[0], layer.routed_lora_A[1]))
+
     def test_profile_latent_router_modes_return_expected_shapes(self):
         from models.lora_moe import ProfileLatentRouter
 
@@ -63,6 +84,7 @@ class LoRAMoETests(unittest.TestCase):
             self.assertEqual(alpha.shape, (3, 4))
             self.assertEqual(features.shape, (3, 32))
             self.assertTrue(torch.allclose(alpha.sum(dim=-1), torch.ones(3), atol=1e-6))
+            self.assertTrue(torch.equal(router.logit_head.weight, torch.zeros_like(router.logit_head.weight)))
 
     def test_moe_auxiliary_losses_are_differentiable(self):
         from models.lora_moe import (

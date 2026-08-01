@@ -373,6 +373,7 @@ class Flux2KleinSRArtist(nn.Module):
             num_experts=int(moe_cfg.get("num_routed_experts", 4)),
             hidden_dim=int(moe_cfg.get("router_hidden_dim", 1024)),
             latent_branch=str(moe_cfg.get("latent_branch", "stat_conv")),
+            prototype_scale=float(moe_cfg.get("prototype_scale", 1.0)),
         )
 
     def _apply_lora_moe(self):
@@ -475,6 +476,7 @@ class Flux2KleinSRArtist(nn.Module):
         single_state = torch.load(lora_state_path, map_location="cpu")
 
         loaded = 0
+        initialized_modules = {}
         with torch.no_grad():
             for state_name, tensor in single_state.items():
                 if ".lora_A." in state_name:
@@ -499,9 +501,6 @@ class Flux2KleinSRArtist(nn.Module):
                             f"vs MoE {tuple(module.shared_lora_A.shape)}"
                         )
                     module.shared_lora_A.copy_(target)
-                    for expert_idx in range(module.num_routed_experts):
-                        noise = torch.randn_like(target) * max(target.float().std().item(), 1e-6) * float(perturb_scale)
-                        module.routed_lora_A[expert_idx].copy_(target + noise)
                 else:
                     target = tensor.to(device=module.shared_lora_B.device, dtype=module.shared_lora_B.dtype)
                     if tuple(target.shape) != tuple(module.shared_lora_B.shape):
@@ -510,12 +509,17 @@ class Flux2KleinSRArtist(nn.Module):
                             f"vs MoE {tuple(module.shared_lora_B.shape)}"
                         )
                     module.shared_lora_B.copy_(target)
-                    for expert_idx in range(module.num_routed_experts):
-                        noise = torch.randn_like(target) * max(target.float().std().item(), 1e-6) * float(perturb_scale)
-                        module.routed_lora_B[expert_idx].copy_(target + noise)
+                initialized_modules.setdefault(module_name, {"module": module, "parts": set()})["parts"].add(attr)
                 loaded += 1
         if loaded == 0:
             raise RuntimeError(f"No matching FLUX.2 single-LoRA tensors were loaded from {lora_state_path}")
+        incomplete = [name for name, item in initialized_modules.items() if item["parts"] != {"A", "B"}]
+        if incomplete:
+            raise RuntimeError(
+                "Single-LoRA checkpoint is missing an A/B tensor pair for: " + ", ".join(sorted(incomplete))
+            )
+        for item in initialized_modules.values():
+            item["module"].initialize_routed_residuals(perturb_scale=perturb_scale)
         return loaded
 
     def _apply_train_strategy(self):
@@ -872,6 +876,7 @@ class Flux2KleinSRArtist(nn.Module):
                 "num_routed_experts": int(moe_cfg.get("num_routed_experts", 4)),
                 "top_k": int(moe_cfg.get("top_k", 2)),
                 "latent_branch": str(moe_cfg.get("latent_branch", "stat_conv")),
+                "prototype_scale": float(moe_cfg.get("prototype_scale", 1.0)),
             }
         if save_files:
             output_dir.mkdir(parents=True, exist_ok=True)
