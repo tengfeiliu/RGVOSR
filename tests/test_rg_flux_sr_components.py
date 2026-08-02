@@ -1303,6 +1303,13 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertIn("compute_router_features", source)
         self.assertIn("flux2_klein_lora_moe_state.pt", Path("models/flux2_klein_sr_artist.py").read_text(encoding="utf-8"))
 
+    def test_full_frame_inference_overrides_only_runtime_pre_cropped_flag(self):
+        source = Path("inference_rg_flux_sr.py").read_text(encoding="utf-8")
+
+        self.assertIn('if getattr(args, "full_frame_inference", False):', source)
+        self.assertIn('config["data"]["pre_cropped"] = False', source)
+        self.assertIn('parser.add_argument(\n        "--full_frame_inference"', source)
+
     def test_adapter_checkpoint_loader_reports_zero3_partitioned_tensors(self):
         source = Path("models/flux_sr_artist.py").read_text(encoding="utf-8")
 

@@ -382,6 +382,8 @@ def build_inference_command(
     _append_optional(cmd, "--device", args.device)
     _append_optional(cmd, "--lr_cond_mode", args.lr_cond_mode)
     _append_optional(cmd, "--min_size", args.min_size)
+    if getattr(args, "full_frame_inference", False):
+        cmd.append("--full_frame_inference")
     _append_optional(cmd, "--prompt_variant", getattr(args, "prompt_variant", None))
     _append_optional(cmd, "--seed", getattr(args, "seed", None))
     _append_optional(cmd, "--suggestion_pairing", suggestion_pairing)
@@ -578,6 +580,11 @@ def build_arg_parser():
     parser.add_argument("--lr_cond_mode", choices=["latent_adapter", "latent_concat", "flux2_image_concat"], default=None)
     parser.add_argument("--min_size", type=int, default=None)
     parser.add_argument("--restore_input_size", action="store_true")
+    parser.add_argument(
+        "--full_frame_inference",
+        action="store_true",
+        help="Use arbitrary-size full-frame inputs for inference without changing the training crop configuration.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Inference seed shared by all comparison runs.")
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)

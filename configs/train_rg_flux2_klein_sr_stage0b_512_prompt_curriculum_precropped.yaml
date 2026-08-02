@@ -37,7 +37,7 @@ condition:
   include_caption: true
   prompt_schedule:
     enabled: true
-    switch_step: 10000
+    switch_step: 0
     before_variant: fixed
     before_include_caption: false
     after_variant: iqa_suggestion

@@ -26,10 +26,14 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
                 "realLR200=/data/RealLR200/lq",
                 "--inference_output_root",
                 "eval/inference/moe",
+                "--full_frame_inference",
+                "--restore_input_size",
             ]
         )
         self.assertEqual(args.single_lora_checkpoint, "exp/single/checkpoints/checkpoint-00032000/rg_flux_adapters")
         self.assertIsNone(args.single_lora_run_dir)
+        self.assertTrue(args.full_frame_inference)
+        self.assertTrue(args.restore_input_size)
 
         args = parser.parse_args(
             [
@@ -207,6 +211,7 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
                 lr_cond_mode = None
                 min_size = None
                 restore_input_size = False
+                full_frame_inference = True
                 use_prompt = False
                 use_suggestions = False
                 use_degradation_vector = None
@@ -229,6 +234,7 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertIn(str(runtime_config), inference_cmd)
             self.assertIn("--no-use_prompt", inference_cmd)
             self.assertIn("--no-use_suggestions", inference_cmd)
+            self.assertIn("--full_frame_inference", inference_cmd)
             self.assertEqual(
                 inference_manifest,
                 root / "eval" / "inference" / run_dir.name / "checkpoint-00020000" / "inference_manifest.json",

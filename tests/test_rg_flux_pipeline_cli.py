@@ -105,6 +105,7 @@ class RGFluxPipelineCliTests(unittest.TestCase):
                 lr_cond_mode = None
                 min_size = None
                 restore_input_size = False
+                full_frame_inference = True
                 use_prompt = None
                 use_suggestions = None
                 use_degradation_vector = None
@@ -126,6 +127,7 @@ class RGFluxPipelineCliTests(unittest.TestCase):
             self.assertIn("checkpoint-00020000", inference_cmd)
             self.assertIn("--dataset_dirs", inference_cmd)
             self.assertIn("realLR200=/data/RealLR200/lq", inference_cmd)
+            self.assertIn("--full_frame_inference", inference_cmd)
             self.assertEqual(
                 inference_manifest,
                 root / "eval" / "inference" / run_dir.name / "checkpoint-00020000" / "inference_manifest.json",

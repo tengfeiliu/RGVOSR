@@ -223,6 +223,11 @@ def build_arg_parser():
     parser.add_argument("--lr_cond_mode", choices=["latent_adapter", "latent_concat", "flux2_image_concat"], default=None)
     parser.add_argument("--min_size", type=int, default=None)
     parser.add_argument("--restore_input_size", action="store_true")
+    parser.add_argument(
+        "--full_frame_inference",
+        action="store_true",
+        help="Use arbitrary-size full-frame inputs for inference without changing the pre-cropped training config.",
+    )
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--prompt_variant", choices=PROMPT_VARIANTS, default=None)

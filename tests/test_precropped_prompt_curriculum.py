@@ -251,7 +251,7 @@ class PrecroppedPromptCurriculumTests(unittest.TestCase):
             self.assertEqual(config["data"]["crop_size"], 512)
             self.assertEqual(
                 config["condition"]["prompt_schedule"]["switch_step"],
-                10000,
+                0,
             )
             self.assertEqual(
                 config["condition"]["prompt_schedule"]["after_variant"],

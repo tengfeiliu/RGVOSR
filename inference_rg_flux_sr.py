@@ -815,6 +815,8 @@ def run_inference_dataset(
         f"{pairing_field}_pairing": pairing,
         f"{pairing_field}_shuffle_seed": shuffle_seed if pairing == "shuffled" else None,
         f"effective_{pairing_field}_shuffle_seed": effective_seed,
+        "pre_cropped_input": pre_cropped,
+        "restore_input_size": bool(args.restore_input_size),
         "valid_image_count": len(entries),
         "skipped_image_count": len(image_paths) - len(entries),
         "same_suggestion_text_count": sum(row["same_suggestion_text"] for row in pairing_rows),
@@ -826,8 +828,11 @@ def run_inference_dataset(
 def main(args):
     resolved_run = resolve_inference_run(args)
     config = load_config(resolved_run["checkpoint"], args.config)
+    config.setdefault("data", {})
     config.setdefault("condition", {})
     config.setdefault("text_encoding", {})
+    if getattr(args, "full_frame_inference", False):
+        config["data"]["pre_cropped"] = False
     config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
     config["condition"]["use_prompt"] = args.use_prompt
     config["condition"]["use_degradation_vector"] = args.use_degradation_vector
@@ -994,6 +999,14 @@ def build_arg_parser():
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--min_size", type=int, default=None)
     parser.add_argument("--restore_input_size", action="store_true")
+    parser.add_argument(
+        "--full_frame_inference",
+        action="store_true",
+        help=(
+            "Override data.pre_cropped only during inference so arbitrary-size images are processed as full frames. "
+            "Training configuration and checkpoints are not modified."
+        ),
+    )
     return parser
 
 
