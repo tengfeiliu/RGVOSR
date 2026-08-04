@@ -1,6 +1,6 @@
 model:
   flux_backend: flux2_klein
-  flux_model_path: /data/models/FLUX.2-klein-base-4B
+  flux_model_path: /root/autodl-tmp/models/FLUX.2-klein-base-4B/
   dtype: bf16
   text_encoder_device: cuda
   text_encoder_dtype: fp32
@@ -18,12 +18,27 @@ model:
   lora_moe:
     num_routed_experts: 4
     top_k: 2
+    router_input_mode: prompt_lr
+    router_condition_version: text8_v1
+    router_condition_dim: 8
+    router_timestep_dim: 32
     latent_branch: stat_conv
     router_hidden_dim: 1024
     prototype_scale: 1.0
-    warmup_ratio: 0.1
+    router_ema_decay: 0.99
+    router_noise_std: 0.10
+    router_noise_end_ratio: 0.30
+    warmup_ratio: 0.30
     init_temperature: 2.0
     final_temperature: 0.7
+    inference_routing_mode: topk
+    inference_temperature: 0.7
+    inference_top_k: 2
+    teacher_routing_enabled: false
+    semantic_prototype_init: false
+    teacher_start_ratio: 0.15
+    teacher_end_ratio: 0.35
+    teacher_target_temperature: 0.7
     shared_always_active: true
     freeze_shared_during_warmup: true
     init_from_single_lora: null
@@ -127,6 +142,7 @@ loss:
   image_loss_crop_size: 256
   image_loss_every: 1
   lpips_every: 1
-  router_div_weight: 1.0e-2
-  router_entropy_weight: 1.0e-3
-  router_balance_weight: 1.0e-2
+  router_div_weight: 0
+  router_entropy_weight: 1.0e-4
+  router_balance_weight: 0
+  router_teacher_weight: 0.0

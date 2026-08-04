@@ -12,6 +12,10 @@ from torchvision.transforms import functional as tv_functional
 
 from dataloaders.degradation_meta import DEGRADATION_KEYS
 from models.prompt_builder import build_sr_prompt
+from models.router_condition import (
+    ROUTER_CONDITION_VERSION,
+    extract_router_condition,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,8 @@ class RGFluxSRJsonlDataset(Dataset):
         prompt_variant=None,
         include_caption=False,
         use_degradation_vector=True,
+        use_router_condition=False,
+        router_condition_version=ROUTER_CONDITION_VERSION,
         vae_align=16,
         max_retry=100,
         return_profile=False,
@@ -50,6 +56,8 @@ class RGFluxSRJsonlDataset(Dataset):
         self.prompt_variant = prompt_variant
         self.include_caption = bool(include_caption)
         self.use_degradation_vector = bool(use_degradation_vector)
+        self.use_router_condition = bool(use_router_condition)
+        self.router_condition_version = str(router_condition_version)
         self.vae_align = int(vae_align)
         self.max_retry = int(max_retry)
         self.return_profile = bool(return_profile)
@@ -320,6 +328,29 @@ class RGFluxSRJsonlDataset(Dataset):
                     "crop": record["crop"],
                     "spatial_mode": spatial_mode,
                 }
+                if self.use_router_condition:
+                    router_condition = extract_router_condition(
+                        profile,
+                        version=self.router_condition_version,
+                    )
+                    sample.update(
+                        {
+                            "router_condition": torch.tensor(
+                                router_condition.values,
+                                dtype=torch.float32,
+                            ),
+                            "router_condition_mask": torch.tensor(
+                                router_condition.valid_mask,
+                                dtype=torch.float32,
+                            ),
+                            "router_condition_confidence": torch.tensor(
+                                router_condition.confidence,
+                                dtype=torch.float32,
+                            ),
+                            "router_condition_source_hash": router_condition.source_hash,
+                            "router_condition_version": router_condition.version,
+                        }
+                    )
                 if self.return_profile:
                     sample["profile"] = profile
                 return sample
@@ -352,4 +383,17 @@ def rg_flux_collate_fn(batch):
     collated["spatial_mode"] = [item.get("spatial_mode", "local_crop") for item in batch]
     if all("profile" in item for item in batch):
         collated["profile"] = [item["profile"] for item in batch]
+    if all("router_condition" in item for item in batch):
+        for key in (
+            "router_condition",
+            "router_condition_mask",
+            "router_condition_confidence",
+        ):
+            collated[key] = torch.stack([item[key] for item in batch], dim=0)
+        collated["router_condition_source_hash"] = [
+            item["router_condition_source_hash"] for item in batch
+        ]
+        collated["router_condition_version"] = [
+            item["router_condition_version"] for item in batch
+        ]
     return collated

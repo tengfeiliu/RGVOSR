@@ -105,11 +105,35 @@ def apply_prompt_variant(config, prompt_variant):
     return config
 
 
-def create_runtime_config(train_config_path, now=None, prompt_variant=None):
+def create_runtime_config(
+    train_config_path,
+    now=None,
+    prompt_variant=None,
+    resume_checkpoint=None,
+    resume_training_state=True,
+    max_steps=None,
+    grad_accum_steps=None,
+    image_loss_crop_size=None,
+    stage_label=None,
+):
     source_config = load_yaml(train_config_path)
     runtime_config = copy.deepcopy(source_config)
     apply_prompt_variant(runtime_config, prompt_variant)
     runtime_config.setdefault("training", {})
+    if resume_checkpoint is not None:
+        runtime_config["training"]["resume_ckpt"] = str(resume_checkpoint)
+        runtime_config["training"]["resume_training_state"] = bool(resume_training_state)
+        runtime_config["training"]["auto_resume"] = False
+    if max_steps is not None:
+        runtime_config["training"]["max_steps"] = int(max_steps)
+    if grad_accum_steps is not None:
+        runtime_config["training"]["grad_accum_steps"] = int(grad_accum_steps)
+    if image_loss_crop_size is not None:
+        runtime_config.setdefault("loss", {})["image_loss_crop_size"] = int(
+            image_loss_crop_size
+        )
+    if stage_label:
+        runtime_config["training"]["suffix"] = str(stage_label)
     output_root = Path(cfg(runtime_config, "training.output_dir", "exp_rg_flux_sr"))
     exp_name, run_id = resolve_experiment_name(runtime_config, output_root=output_root, now=now)
     runtime_config["training"]["exp_name"] = exp_name
@@ -558,6 +582,31 @@ def build_arg_parser():
     parser.add_argument("--train_config", default=None, help="Training YAML config. Required unless --skip_train.")
     parser.add_argument("--accelerate_config", default=None, help="Accelerate config used for training.")
     parser.add_argument("--num_processes", type=int, default=None, help="Optional accelerate --num_processes.")
+    parser.add_argument(
+        "--resume_checkpoint",
+        default=None,
+        help="Optional external checkpoint used to continue a fair Single-LoRA control run.",
+    )
+    parser.add_argument(
+        "--resume_training_state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore optimizer/scheduler state; disable for a model-only fresh-optimizer control.",
+    )
+    parser.add_argument("--max_steps", type=int, default=None, help="Override training.max_steps.")
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=None,
+        help="Override training.grad_accum_steps.",
+    )
+    parser.add_argument(
+        "--image_loss_crop_size",
+        type=int,
+        default=None,
+        help="Override loss.image_loss_crop_size for a fair control.",
+    )
+    parser.add_argument("--stage_label", default=None, help="Override training suffix.")
     parser.add_argument("--skip_train", action="store_true", help="Skip training and use --run_dir checkpoints.")
     parser.add_argument("--run_dir", default=None, help="Existing run directory, required with --skip_train.")
     parser.add_argument("--checkpoint_steps", nargs="+", required=True, help="Checkpoint steps, e.g. 20000 40000 latest.")
@@ -660,6 +709,12 @@ def main(argv=None):
         runtime_config, run_dir, runtime_config_path = create_runtime_config(
             args.train_config,
             prompt_variant=args.prompt_variant,
+            resume_checkpoint=args.resume_checkpoint,
+            resume_training_state=args.resume_training_state,
+            max_steps=args.max_steps,
+            grad_accum_steps=args.grad_accum_steps,
+            image_loss_crop_size=args.image_loss_crop_size,
+            stage_label=args.stage_label,
         )
         train_cmd = build_train_command(args, runtime_config_path)
         if args.dry_run_pipeline:

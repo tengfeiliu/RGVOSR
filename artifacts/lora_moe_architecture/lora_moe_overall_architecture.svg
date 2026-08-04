@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3400" height="2350" viewBox="0 0 3400 2350">
+<title>当前代码中的 LoRA-MoE 总体架构</title>
+<rect width="100%" height="100%" fill="#F7F9FC"/>
+<text x="1700" y="72" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="68" font-weight="500" text-anchor="middle" dominant-baseline="middle">当前代码中的 LoRA-MoE 总体架构</text>
+<text x="1700" y="132" fill="#526079" font-family="Microsoft YaHei, sans-serif" font-size="32" font-weight="400" text-anchor="middle" dominant-baseline="middle">Single-LoRA 初始化  ·  Prompt/LR 全局路由  ·  Shared LoRA + Top-2 Routed Experts</text>
+<rect x="70" y="185" width="3260" height="495" rx="30" fill="#E7F0FF" stroke="#4777C4" stroke-width="3"/>
+<rect x="96" y="205" width="800" height="58" rx="20" fill="#FFFFFF" stroke="#4777C4" stroke-width="2"/>
+<text x="496.0" y="234" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">阶段一：从 Single-LoRA 初始化 MoE</text>
+<rect x="140" y="320" width="540" height="240" rx="22" fill="#FFFFFF" stroke="#4777C4" stroke-width="3"/>
+<text x="410.0" y="416.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="33" font-weight="500" text-anchor="middle" dominant-baseline="middle">Single-LoRA checkpoint</text>
+<text x="410.0" y="463.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="33" font-weight="400" text-anchor="middle" dominant-baseline="middle">A_single，B_single</text>
+<rect x="820" y="320" width="570" height="240" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="1105.0" y="393.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="33" font-weight="500" text-anchor="middle" dominant-baseline="middle">Shared LoRA</text>
+<text x="1105.0" y="436.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="33" font-weight="400" text-anchor="middle" dominant-baseline="middle">A_s ← A_single</text>
+<text x="1105.0" y="483.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="33" font-weight="400" text-anchor="middle" dominant-baseline="middle">B_s ← B_single</text>
+<rect x="1530" y="295" width="710" height="290" rx="22" fill="#FFFFFF" stroke="#CC7A20" stroke-width="3"/>
+<text x="1885.0" y="373.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">4 个 Routed Experts</text>
+<text x="1885.0" y="419.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">A_e ← A_s + 0.01 × 噪声</text>
+<text x="1885.0" y="464.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">B_e ← 0</text>
+<text x="1885.0" y="507.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">初始 routed 输出为 0</text>
+<rect x="2400" y="275" width="850" height="330" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="2825.0" y="374.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">Router prototypes</text>
+<text x="2825.0" y="417.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">128 个训练样本</text>
+<text x="2825.0" y="462.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">提取 Prompt/LR Router 特征</text>
+<text x="2825.0" y="506.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">K-Means → 4 个中心</text>
+<polyline points="680,440 820,440" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="820.0,440.0 802.0,430.1 802.0,449.9" fill="#4777C4"/>
+<polyline points="1390,440 1530,440" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1530.0,440.0 1512.0,430.1 1512.0,449.9" fill="#4777C4"/>
+<rect x="70" y="750" width="700" height="1060" rx="30" fill="#EEF2F7" stroke="#778398" stroke-width="3"/>
+<rect x="96" y="770" width="360" height="58" rx="20" fill="#FFFFFF" stroke="#778398" stroke-width="2"/>
+<text x="276.0" y="799" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">输入与条件编码</text>
+<rect x="135" y="880" width="570" height="145" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="420.0" y="931.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">Prompt</text>
+<text x="420.0" y="973.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Caption + IQA + Suggestion</text>
+<rect x="135" y="1100" width="570" height="145" rx="22" fill="#FFFFFF" stroke="#4777C4" stroke-width="3"/>
+<text x="420.0" y="1152.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">LR 全图／512 crop</text>
+<text x="420.0" y="1194.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">推理／训练输入</text>
+<rect x="135" y="1320" width="570" height="145" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="420.0" y="1372.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">HR 512 crop</text>
+<text x="420.0" y="1413.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">仅训练时使用</text>
+<rect x="135" y="1535" width="570" height="175" rx="22" fill="#FFFFFF" stroke="#778398" stroke-width="3"/>
+<text x="420.0" y="1581.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="500" text-anchor="middle" dominant-baseline="middle">编码结果</text>
+<text x="420.0" y="1621.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">Prompt embeddings</text>
+<text x="420.0" y="1663.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">z_lr 及训练时的 z_hr、z_t</text>
+<polyline points="420,1025 420,1535" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="420.0,1535.0 429.9,1517.0 410.1,1517.0" fill="#7658C2"/>
+<polyline points="420,1245 420,1535" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="420.0,1535.0 429.9,1517.0 410.1,1517.0" fill="#4777C4"/>
+<polyline points="420,1465 420,1535" fill="none" stroke="#3F9565" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="420.0,1535.0 429.9,1517.0 410.1,1517.0" fill="#3F9565"/>
+<rect x="850" y="750" width="1020" height="1060" rx="30" fill="#EEE8FF" stroke="#7658C2" stroke-width="3"/>
+<rect x="876" y="770" width="704" height="58" rx="20" fill="#FFFFFF" stroke="#7658C2" stroke-width="2"/>
+<text x="1228.0" y="799" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">全局 ProfileLatentRouter</text>
+<rect x="915" y="875" width="430" height="170" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="1130.0" y="921.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="500" text-anchor="middle" dominant-baseline="middle">Prompt 分支</text>
+<text x="1130.0" y="962.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">序列维 Mean Pool</text>
+<text x="1130.0" y="1001.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">无 attention mask</text>
+<rect x="1390" y="875" width="415" height="170" rx="22" fill="#FFFFFF" stroke="#4777C4" stroke-width="3"/>
+<text x="1597.5" y="922.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="500" text-anchor="middle" dominant-baseline="middle">LR 统计分支</text>
+<text x="1597.5" y="961.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">mean / std</text>
+<text x="1597.5" y="999.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">min / max</text>
+<rect x="1390" y="1100" width="415" height="170" rx="22" fill="#FFFFFF" stroke="#4777C4" stroke-width="3"/>
+<text x="1597.5" y="1149.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="500" text-anchor="middle" dominant-baseline="middle">LR Conv 分支</text>
+<text x="1597.5" y="1185.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">Conv2d</text>
+<text x="1597.5" y="1221.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">全局池化</text>
+<rect x="915" y="1100" width="430" height="170" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="1130.0" y="1165.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">融合 MLP</text>
+<text x="1130.0" y="1205.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">得到全局特征 f</text>
+<rect x="915" y="1340" width="890" height="165" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="1360.0" y="1401.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">Router logits</text>
+<text x="1360.0" y="1444.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Linear Head(f) + cosine(f, prototypes)</text>
+<rect x="915" y="1570" width="890" height="165" rx="22" fill="#FFFFFF" stroke="#CC7A20" stroke-width="3"/>
+<text x="1360.0" y="1611.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="500" text-anchor="middle" dominant-baseline="middle">路由调度 → α ∈ R^(B×4)</text>
+<text x="1360.0" y="1653.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">Warmup：4-way Softmax  ·  后期：Top-2</text>
+<text x="1360.0" y="1694.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="28" font-weight="400" text-anchor="middle" dominant-baseline="middle">Temperature：2.0 → 0.7</text>
+<polyline points="1130,1045 1130,1100" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1130.0,1100.0 1139.9,1082.0 1120.1,1082.0" fill="#7658C2"/>
+<polyline points="1598,1045 1598,1100" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1598.0,1100.0 1607.9,1082.0 1588.1,1082.0" fill="#4777C4"/>
+<polyline points="1598,1270 1598,1305 1360,1305 1360,1340" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1360.0,1340.0 1369.9,1322.0 1350.1,1322.0" fill="#4777C4"/>
+<polyline points="1130,1270 1130,1340" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1130.0,1340.0 1139.9,1322.0 1120.1,1322.0" fill="#7658C2"/>
+<polyline points="1360,1505 1360,1570" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1360.0,1570.0 1369.9,1552.0 1350.1,1552.0" fill="#7658C2"/>
+<polyline points="2825,605 2825,705 1760,705 1760,1340" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="14 10"/>
+<polygon points="1760.0,1340.0 1769.9,1322.0 1750.1,1322.0" fill="#7658C2"/>
+<polyline points="705,952 810,952 810,960 915,960" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="915.0,960.0 897.0,950.1 897.0,969.9" fill="#7658C2"/>
+<polyline points="705,1172 815,1172 815,1070 1598,1070 1598,1045" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1598.0,1045.0 1588.1,1063.0 1607.9,1063.0" fill="#4777C4"/>
+<polyline points="705,1172 825,1172 825,1295 1598,1295 1598,1270" fill="none" stroke="#4777C4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1598.0,1270.0 1588.1,1288.0 1607.9,1288.0" fill="#4777C4"/>
+<rect x="1950" y="750" width="1380" height="1060" rx="30" fill="#E5F6EC" stroke="#3F9565" stroke-width="3"/>
+<rect x="1976" y="770" width="992" height="58" rx="20" fill="#FFFFFF" stroke="#3F9565" stroke-width="2"/>
+<text x="2472.0" y="799" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">Frozen FLUX.2-Klein Transformer</text>
+<rect x="2025" y="875" width="1230" height="160" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="2640.0" y="932.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">Transformer 条件输入</text>
+<text x="2640.0" y="976.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">z_t + LR condition tokens + Prompt embeddings</text>
+<rect x="2025" y="1100" width="1230" height="145" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="2640.0" y="1150.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">Transformer Blocks</text>
+<text x="2640.0" y="1191.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">Attention + FFN；基础权重保持冻结</text>
+<rect x="2025" y="1315" width="1230" height="230" rx="22" fill="#FFFFFF" stroke="#CC7A20" stroke-width="3"/>
+<text x="2640.0" y="1389.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">目标 Attention Linear 被替换</text>
+<text x="2640.0" y="1429.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">SharedRoutedMoELoRALinear</text>
+<text x="2640.0" y="1470.0" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="400" text-anchor="middle" dominant-baseline="middle">y = W0 x + ΔW_shared x + Σ a_e ΔW_e x</text>
+<rect x="2025" y="1615" width="1230" height="130" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="2640.0" y="1658.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="30" font-weight="500" text-anchor="middle" dominant-baseline="middle">输出</text>
+<text x="2640.0" y="1700.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="30" font-weight="400" text-anchor="middle" dominant-baseline="middle">Flow / Velocity prediction</text>
+<polyline points="2640,1035 2640,1100" fill="none" stroke="#3F9565" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="2640.0,1100.0 2649.9,1082.0 2630.1,1082.0" fill="#3F9565"/>
+<polyline points="2640,1245 2640,1315" fill="none" stroke="#3F9565" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="2640.0,1315.0 2649.9,1297.0 2630.1,1297.0" fill="#3F9565"/>
+<polyline points="2640,1545 2640,1615" fill="none" stroke="#3F9565" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="2640.0,1615.0 2649.9,1597.0 2630.1,1597.0" fill="#3F9565"/>
+<polyline points="705,1620 790,1620 790,715 2640,715 2640,875" fill="none" stroke="#3F9565" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="2640.0,875.0 2649.9,857.0 2630.1,857.0" fill="#3F9565"/>
+<rect x="2110" y="1258" width="1060" height="47" rx="18" fill="#FFF1DD" stroke="#CC7A20" stroke-width="3"/>
+<text x="2640" y="1282" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="25" font-weight="500" text-anchor="middle" dominant-baseline="middle">同一组 α 广播到所有层、所有 token 和所有空间位置</text>
+<polyline points="1805,1652 1905,1652 1905,1282 2110,1282" fill="none" stroke="#CC7A20" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="2110.0,1282.0 2092.0,1272.1 2092.0,1291.9" fill="#CC7A20"/>
+<rect x="70" y="1890" width="3260" height="385" rx="30" fill="#FDEBEC" stroke="#C55A64" stroke-width="3"/>
+<rect x="96" y="1910" width="360" height="58" rx="20" fill="#FFFFFF" stroke="#C55A64" stroke-width="2"/>
+<text x="276.0" y="1939" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="31" font-weight="500" text-anchor="middle" dominant-baseline="middle">训练目标与可训练参数</text>
+<rect x="150" y="2010" width="880" height="185" rx="22" fill="#FFFFFF" stroke="#C55A64" stroke-width="3"/>
+<text x="590.0" y="2060.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">SR 主损失</text>
+<text x="590.0" y="2101.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Flow Matching + Latent + Charbonnier</text>
+<text x="590.0" y="2143.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Downsample consistency</text>
+<rect x="1260" y="2010" width="880" height="185" rx="22" fill="#FFFFFF" stroke="#7658C2" stroke-width="3"/>
+<text x="1700.0" y="2060.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">MoE 辅助损失</text>
+<text x="1700.0" y="2101.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Router balance + entropy</text>
+<text x="1700.0" y="2143.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Expert A/B parameter diversity</text>
+<rect x="2370" y="2010" width="880" height="185" rx="22" fill="#FFFFFF" stroke="#3F9565" stroke-width="3"/>
+<text x="2810.0" y="2064.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="500" text-anchor="middle" dominant-baseline="middle">参数更新范围</text>
+<text x="2810.0" y="2102.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">Shared LoRA + 4 Routed LoRAs + Router</text>
+<text x="2810.0" y="2140.5" fill="#172033" font-family="Microsoft YaHei, sans-serif" font-size="29" font-weight="400" text-anchor="middle" dominant-baseline="middle">FLUX 基础权重与 VAE/Text Encoder 冻结</text>
+<polyline points="2640,1745 2640,1850 590,1850 590,2010" fill="none" stroke="#C55A64" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="590.0,2010.0 599.9,1992.0 580.1,1992.0" fill="#C55A64"/>
+<polyline points="1360,1735 1360,2010" fill="none" stroke="#7658C2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polygon points="1360.0,2010.0 1369.9,1992.0 1350.1,1992.0" fill="#7658C2"/>
+</svg>

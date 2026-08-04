@@ -36,6 +36,7 @@ from models.prompt_builder import (
     normalize_prompt_variant,
     validate_prompt_profile,
 )
+from models.router_condition import router_condition_tensors
 from models.text_embedding_cache import (
     compute_prompt_hash,
     get_text_embedding_cache,
@@ -61,6 +62,42 @@ def cfg(config, path, default=None):
             return default
         current = current[part]
     return current
+
+
+def validate_lora_moe_config(config):
+    if str(cfg(config, "model.lora_backend", "peft")).lower() != "moe":
+        return
+    mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
+    condition_mode = mode in {"condition8", "condition8_timestep"}
+    condition_dim = int(cfg(config, "model.lora_moe.router_condition_dim", 8))
+    teacher_enabled = bool(cfg(config, "model.lora_moe.teacher_routing_enabled", False))
+    teacher_weight = float(cfg(config, "loss.router_teacher_weight", 0.0))
+    if condition_mode and condition_dim != 8:
+        raise ValueError("The text8_v1 router condition requires router_condition_dim: 8")
+    if condition_mode and bool(cfg(config, "condition.use_degradation_vector", True)):
+        raise ValueError(
+            "condition8 routing must use condition.use_degradation_vector: false; "
+            "the legacy degradation_vector is invalid and is never a fallback."
+        )
+    if teacher_enabled and not condition_mode:
+        raise ValueError("Teacher routing requires router_input_mode condition8 or condition8_timestep")
+    if teacher_weight > 0.0 and not teacher_enabled:
+        raise ValueError("loss.router_teacher_weight > 0 requires teacher_routing_enabled: true")
+    if teacher_enabled:
+        num_experts = int(cfg(config, "model.lora_moe.num_routed_experts", 4))
+        score_matrix = cfg(config, "model.lora_moe.teacher_expert_score_matrix", None)
+        if score_matrix is None and num_experts != 4:
+            raise ValueError(
+                "The default teacher expert semantics require num_routed_experts: 4; "
+                "provide teacher_expert_score_matrix for another expert count."
+            )
+        if score_matrix is not None and (
+            len(score_matrix) != num_experts
+            or any(len(row) != 8 for row in score_matrix)
+        ):
+            raise ValueError(
+                f"teacher_expert_score_matrix must have shape [{num_experts}, 8]"
+            )
 
 
 def cfg_bool(config, path, default=False):
@@ -1059,6 +1096,13 @@ def load_rg_checkpoint(accelerator, artist, optimizer, lr_scheduler, checkpoint_
         global_step = int(state.get("global_step", 0))
         if resume_training_state:
             optimizer_state = state.get("optimizer", {})
+            if not optimizer_state:
+                raise RuntimeError(
+                    f"Checkpoint training state {state_path} does not contain optimizer state. "
+                    "A full-state resume is impossible; use a rank-local "
+                    "training_state_rank-*.pt checkpoint or explicitly set "
+                    "training.resume_training_state: false for a model-only fresh-optimizer run."
+                )
             if _optimizer_requires_rank_state_dict(optimizer) and not _is_rank_keyed_optimizer_state(optimizer_state, rank):
                 raise RuntimeError(
                     f"Checkpoint {checkpoint_dir} was saved without rank-local ZeRO-3 optimizer state for rank {rank}. "
@@ -1203,10 +1247,23 @@ def run_rg_flux_evaluation(
 
     unwrapped_artist = accelerator.unwrap_model(artist)
     was_training = artist.training
+    previous_moe_schedule = None
+    if getattr(unwrapped_artist, "is_lora_moe_enabled", lambda: False)():
+        previous_moe_schedule = {
+            "routing_mode": unwrapped_artist.moe_routing_mode,
+            "temperature": unwrapped_artist.moe_temperature,
+            "top_k": unwrapped_artist.moe_top_k,
+            "noise_std": unwrapped_artist.moe_router_noise_std,
+            "teacher_router_mix": unwrapped_artist.moe_teacher_router_mix,
+            "stage": unwrapped_artist._last_moe_stage,
+        }
+        unwrapped_artist.set_moe_inference_schedule()
     artist.eval()
     to_pil = transforms.ToPILImage()
     lr_cond_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
     use_degradation_vector = bool(cfg(config, "condition.use_degradation_vector", True))
+    router_input_mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
+    use_router_condition = router_input_mode in {"condition8", "condition8_timestep"}
     num_inference_steps = int(cfg(config, "evaluation.num_inference_steps", cfg(config, "flow_matching.num_inference_steps", 25)))
     eval_seed = int(cfg(config, "evaluation.seed", cfg(config, "training.seed", 42) or 42))
     eval_prompt_schedule = resolve_prompt_schedule(config)
@@ -1267,6 +1324,25 @@ def run_rg_flux_evaluation(
                     weight_dtype,
                     use_degradation_vector=use_degradation_vector,
                 )
+                router_condition = None
+                router_condition_mask = None
+                router_condition_confidence = None
+                if use_router_condition:
+                    values, valid_mask, confidence = router_condition_tensors(
+                        profile,
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                        version=str(
+                            cfg(
+                                config,
+                                "model.lora_moe.router_condition_version",
+                                "text8_v1",
+                            )
+                        ),
+                    )
+                    router_condition = values.unsqueeze(0)
+                    router_condition_mask = valid_mask.unsqueeze(0)
+                    router_condition_confidence = confidence.unsqueeze(0)
                 dino_tokens = unwrapped_artist.extract_visual_tokens(lq_up)
                 with fork_rng_for_device(accelerator.device):
                     torch.manual_seed(eval_seed + sample_index)
@@ -1282,6 +1358,9 @@ def run_rg_flux_evaluation(
                         z_lr=z_lr,
                         dino_tokens=dino_tokens,
                         lr_cond_mode=lr_cond_mode,
+                        router_condition=router_condition,
+                        router_condition_mask=router_condition_mask,
+                        router_condition_confidence=router_condition_confidence,
                         num_steps=num_inference_steps,
                         device=accelerator.device,
                         dtype=weight_dtype,
@@ -1291,6 +1370,13 @@ def run_rg_flux_evaluation(
                     to_pil(sr[0].float().cpu()).save(image_dir / f"{sample_index:04d}_{Path(record['lq_path']).stem}.png")
                 accelerator.wait_for_everyone()
     finally:
+        if previous_moe_schedule is not None:
+            unwrapped_artist.moe_routing_mode = previous_moe_schedule["routing_mode"]
+            unwrapped_artist.moe_temperature = previous_moe_schedule["temperature"]
+            unwrapped_artist.moe_top_k = previous_moe_schedule["top_k"]
+            unwrapped_artist.moe_router_noise_std = previous_moe_schedule["noise_std"]
+            unwrapped_artist.moe_teacher_router_mix = previous_moe_schedule["teacher_router_mix"]
+            unwrapped_artist._last_moe_stage = previous_moe_schedule["stage"]
         if was_training:
             artist.train()
 
@@ -1327,6 +1413,7 @@ def main(config_path, dry_run=False):
     config.setdefault("condition", {})
     config.setdefault("evaluation", {})
     config.setdefault("text_encoding", {})
+    validate_lora_moe_config(config)
     prompt_schedule = resolve_prompt_schedule(config)
     mixed_crop = resolve_mixed_crop_config(config)
     pre_cropped = cfg_bool(config, "data.pre_cropped", True)
@@ -1361,6 +1448,15 @@ def main(config_path, dry_run=False):
         log_with=report_to,
         project_config=accelerator_project_config,
     )
+    if (
+        accelerator.num_processes > 1
+        and str(cfg(config, "model.lora_backend", "peft")).lower() == "moe"
+        and float(cfg(config, "loss.router_balance_weight", 0.0)) > 0.0
+    ):
+        raise ValueError(
+            "Router EMA balance currently supports --num_processes 1 only; "
+            "cross-rank EMA synchronization is not implemented."
+        )
 
     local_logger = logger
     if accelerator.is_main_process:
@@ -1467,6 +1563,8 @@ def main(config_path, dry_run=False):
             )
             local_logger.info("Disabled Flux transformer gradient checkpointing for DeepSpeed ZeRO-3 compatibility.")
 
+    router_input_mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
+    use_router_condition = router_input_mode in {"condition8", "condition8_timestep"}
     dataset = RGFluxSRJsonlDataset(
         jsonl_path=cfg(config, "data.jsonl_path"),
         crop_size=int(cfg(config, "data.crop_size", 512)),
@@ -1485,6 +1583,10 @@ def main(config_path, dry_run=False):
             else cfg_bool(config, "condition.include_caption", False)
         ),
         use_degradation_vector=bool(cfg(config, "condition.use_degradation_vector", True)),
+        use_router_condition=use_router_condition,
+        router_condition_version=str(
+            cfg(config, "model.lora_moe.router_condition_version", "text8_v1")
+        ),
         vae_align=int(cfg(config, "data.vae_align", 16)),
         return_profile=prompt_schedule["enabled"],
         pre_cropped=pre_cropped,
@@ -1627,6 +1729,7 @@ def main(config_path, dry_run=False):
     router_div_weight = float(cfg(config, "loss.router_div_weight", 1.0e-3 if lora_moe_enabled else 0.0))
     router_entropy_weight = float(cfg(config, "loss.router_entropy_weight", 1.0e-4 if lora_moe_enabled else 0.0))
     router_balance_weight = float(cfg(config, "loss.router_balance_weight", 1.0e-3 if lora_moe_enabled else 0.0))
+    router_teacher_weight = float(cfg(config, "loss.router_teacher_weight", 0.0))
     checkpoint_dir = output_dir / "checkpoints"
     save_every = int(cfg(config, "training.save_every", 5000))
     log_every = int(cfg(config, "training.log_every", 100))
@@ -1652,6 +1755,25 @@ def main(config_path, dry_run=False):
             hq = batch["hq"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             lq_up = batch["lq_up"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
             degradation_vector = batch["degradation_vector"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+            router_condition = batch.get("router_condition")
+            router_condition_mask = batch.get("router_condition_mask")
+            router_condition_confidence = batch.get("router_condition_confidence")
+            if router_condition is not None:
+                router_condition = router_condition.to(
+                    accelerator.device,
+                    dtype=weight_dtype,
+                    non_blocking=True,
+                )
+                router_condition_mask = router_condition_mask.to(
+                    accelerator.device,
+                    dtype=weight_dtype,
+                    non_blocking=True,
+                )
+                router_condition_confidence = router_condition_confidence.to(
+                    accelerator.device,
+                    dtype=weight_dtype,
+                    non_blocking=True,
+                )
             prompts, active_prompt_condition = resolve_batch_prompts(
                 batch,
                 config,
@@ -1718,6 +1840,9 @@ def main(config_path, dry_run=False):
                         z_lr=z_lr,
                         dino_tokens=dino_tokens,
                         lr_cond_mode=lr_cond_mode,
+                        router_condition=router_condition,
+                        router_condition_mask=router_condition_mask,
+                        router_condition_confidence=router_condition_confidence,
                     )
                     if v_pred.shape != v_target.shape:
                         raise RuntimeError(f"v_pred shape {tuple(v_pred.shape)} != target {tuple(v_target.shape)}")
@@ -1748,19 +1873,27 @@ def main(config_path, dry_run=False):
                         + down_weight * loss_down
                     )
                     moe_aux = (
-                        unwrapped_artist.moe_auxiliary_losses()
+                        unwrapped_artist.moe_auxiliary_losses(
+                            compute_div=bool(router_div_weight),
+                            compute_entropy=bool(router_entropy_weight),
+                            compute_balance=bool(router_balance_weight),
+                            compute_teacher=bool(router_teacher_weight),
+                        )
                         if hasattr(unwrapped_artist, "moe_auxiliary_losses")
                         else {}
                     )
                     loss_div = moe_aux.get("div")
                     loss_entropy = moe_aux.get("entropy")
                     loss_balance = moe_aux.get("balance")
+                    loss_teacher = moe_aux.get("teacher")
                     if loss_div is not None and router_div_weight:
                         loss = loss + router_div_weight * loss_div
                     if loss_entropy is not None and router_entropy_weight:
                         loss = loss + router_entropy_weight * loss_entropy
                     if loss_balance is not None and router_balance_weight:
                         loss = loss + router_balance_weight * loss_balance
+                    if loss_teacher is not None and router_teacher_weight:
+                        loss = loss + router_teacher_weight * loss_teacher
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and float(cfg(config, "training.max_grad_norm", 1.0)) > 0:
@@ -1781,6 +1914,9 @@ def main(config_path, dry_run=False):
                     "loss_lpips": loss_lpips.detach().item(),
                     "loss_lpips_weight": float(loss_lpips_weight),
                     "loss_down": loss_down.detach().item(),
+                    "loss_router_teacher": 0.0
+                    if loss_teacher is None
+                    else loss_teacher.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
                 if active_prompt_condition is not None:
@@ -1797,6 +1933,13 @@ def main(config_path, dry_run=False):
                     step_logs["data/full_frame_fraction"] = sum(
                         mode == "full_frame" for mode in spatial_modes
                     ) / len(spatial_modes)
+                if router_condition_mask is not None:
+                    step_logs["router/condition_valid_fraction"] = float(
+                        router_condition_mask.float().mean().item()
+                    )
+                    step_logs["router/condition_confidence"] = float(
+                        router_condition_confidence.float().mean().item()
+                    )
                 if loss_div is not None:
                     step_logs["loss_div"] = loss_div.detach().item()
                 if loss_entropy is not None:

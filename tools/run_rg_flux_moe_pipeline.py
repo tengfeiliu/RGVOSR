@@ -78,6 +78,24 @@ def _sync_text_and_condition_overrides(config, args):
         condition["use_suggestions"] = bool(args.use_suggestions)
     if args.use_degradation_vector is not None:
         condition["use_degradation_vector"] = bool(args.use_degradation_vector)
+    moe = config.setdefault("model", {}).setdefault("lora_moe", {})
+    router_input_mode = getattr(args, "router_input_mode", None)
+    teacher_routing_enabled = getattr(args, "teacher_routing_enabled", None)
+    router_teacher_weight = getattr(args, "router_teacher_weight", None)
+    stage_label = getattr(args, "stage_label", None)
+    if router_input_mode is not None:
+        moe["router_input_mode"] = str(router_input_mode)
+    if teacher_routing_enabled is not None:
+        moe["teacher_routing_enabled"] = bool(teacher_routing_enabled)
+    semantic_prototype_init = getattr(args, "semantic_prototype_init", None)
+    if semantic_prototype_init is not None:
+        moe["semantic_prototype_init"] = bool(semantic_prototype_init)
+    if router_teacher_weight is not None:
+        config.setdefault("loss", {})["router_teacher_weight"] = float(
+            router_teacher_weight
+        )
+    if stage_label:
+        config.setdefault("training", {})["suffix"] = str(stage_label)
 
 
 def create_moe_runtime_config(moe_config_path, args, now=None):
@@ -86,6 +104,14 @@ def create_moe_runtime_config(moe_config_path, args, now=None):
     runtime_config["model"]["flux_backend"] = "flux2_klein"
     runtime_config["model"]["lora_backend"] = "moe"
     _sync_text_and_condition_overrides(runtime_config, args)
+    init_seed = getattr(args, "init_seed", None)
+    if init_seed is None:
+        init_seed = int(cfg(runtime_config, "training.seed", 42))
+    runtime_config.setdefault("_runtime", {})["moe_init_seed"] = int(init_seed)
+    expert_init_seed = getattr(args, "expert_init_seed", None)
+    if expert_init_seed is None:
+        expert_init_seed = init_seed
+    runtime_config["_runtime"]["moe_expert_init_seed"] = int(expert_init_seed)
 
     runtime_config.setdefault("training", {})
     output_root = Path(cfg(runtime_config, "training.output_dir", "exp_rg_flux_sr"))
@@ -110,6 +136,13 @@ def create_moe_runtime_config(moe_config_path, args, now=None):
 
 
 def build_stage1_command(args, runtime_config_path, single_lora_checkpoint, stage1_output):
+    runtime_config = _load_config_file(runtime_config_path)
+    init_seed = getattr(args, "init_seed", None)
+    if init_seed is None:
+        init_seed = int(cfg(runtime_config, "_runtime.moe_init_seed", 42))
+    expert_init_seed = getattr(args, "expert_init_seed", None)
+    if expert_init_seed is None:
+        expert_init_seed = int(cfg(runtime_config, "_runtime.moe_expert_init_seed", init_seed))
     cmd = [
         sys.executable,
         "tools/init_flux2_lora_moe.py",
@@ -127,6 +160,10 @@ def build_stage1_command(args, runtime_config_path, single_lora_checkpoint, stag
         str(args.dtype),
         "--perturb_scale",
         str(args.perturb_scale),
+        "--seed",
+        str(init_seed),
+        "--expert_init_seed",
+        str(expert_init_seed),
     ]
     return cmd
 
@@ -155,6 +192,8 @@ def write_moe_pipeline_manifest(
     train_returncode=None,
     stage1_command=None,
     train_command=None,
+    stage1_seed=None,
+    expert_init_seed=None,
 ):
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +206,8 @@ def write_moe_pipeline_manifest(
         "checkpoint_steps": list(checkpoint_steps),
         "stage1_command": stage1_command,
         "stage1_returncode": stage1_returncode,
+        "stage1_seed": stage1_seed,
+        "expert_init_seed": expert_init_seed,
         "train_command": train_command,
         "train_returncode": train_returncode,
         "records": records,
@@ -211,8 +252,44 @@ def build_arg_parser():
         ),
     )
     parser.add_argument("--prototype_num_samples", type=int, default=128)
-    parser.add_argument("--perturb_scale", type=float, default=0.01)
+    parser.add_argument("--perturb_scale", type=float, default=0.3)
+    parser.add_argument(
+        "--router_input_mode",
+        choices=["prompt_lr", "prompt_only", "condition8", "condition8_timestep"],
+        default=None,
+        help="Override model.lora_moe.router_input_mode for staged ablations.",
+    )
+    parser.add_argument(
+        "--teacher_routing_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable structured IQA/Suggestion teacher routing.",
+    )
+    parser.add_argument("--router_teacher_weight", type=float, default=None)
+    parser.add_argument(
+        "--semantic_prototype_init",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use confidence-weighted expert semantics instead of unsupervised KMeans prototypes.",
+    )
+    parser.add_argument(
+        "--stage_label",
+        default=None,
+        help="Override training suffix so staged runs are easy to distinguish.",
+    )
     parser.add_argument("--init_device", default="cuda")
+    parser.add_argument(
+        "--init_seed",
+        type=int,
+        default=None,
+        help="Stage1 initialization seed; defaults to training.seed from the runtime config.",
+    )
+    parser.add_argument(
+        "--expert_init_seed",
+        type=int,
+        default=None,
+        help="Independent routed-A perturbation seed; defaults to init_seed.",
+    )
     parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)
     parser.add_argument("--text_embedding_cache", default=None)
     parser.add_argument("--jsonl_path", default=None)
@@ -322,6 +399,8 @@ def main(argv=None):
     train_command = None
     single_lora_checkpoint = None
     stage1_output = None
+    stage1_seed = None
+    expert_init_seed = None
 
     if args.skip_train:
         run_dir = Path(args.moe_run_dir)
@@ -330,8 +409,12 @@ def main(argv=None):
         runtime_config_path = resolve_skip_train_config_path(run_dir, args.moe_config)
         runtime_config = _load_config_file(runtime_config_path)
         stage1_output = run_dir / "stage1_init" / "rg_flux_adapters"
+        stage1_seed = cfg(runtime_config, "_runtime.moe_init_seed", None)
+        expert_init_seed = cfg(runtime_config, "_runtime.moe_expert_init_seed", None)
     else:
         runtime_config, run_dir, runtime_config_path, stage1_output = create_moe_runtime_config(args.moe_config, args)
+        stage1_seed = int(cfg(runtime_config, "_runtime.moe_init_seed", 42))
+        expert_init_seed = int(cfg(runtime_config, "_runtime.moe_expert_init_seed", stage1_seed))
         single_lora_checkpoint = resolve_single_lora_checkpoint(
             single_lora_checkpoint=args.single_lora_checkpoint,
             single_lora_run_dir=args.single_lora_run_dir,
@@ -352,6 +435,8 @@ def main(argv=None):
                     train_returncode=train_returncode,
                     stage1_command=stage1_command,
                     train_command=train_command,
+                    stage1_seed=stage1_seed,
+                    expert_init_seed=expert_init_seed,
                 )
                 raise SystemExit(stage1_returncode)
             validate_stage1_output(stage1_output)
@@ -371,6 +456,8 @@ def main(argv=None):
                     train_returncode=train_returncode,
                     stage1_command=stage1_command,
                     train_command=train_command,
+                    stage1_seed=stage1_seed,
+                    expert_init_seed=expert_init_seed,
                 )
                 raise SystemExit(train_returncode)
 
@@ -398,6 +485,8 @@ def main(argv=None):
             train_returncode=train_returncode,
             stage1_command=stage1_command,
             train_command=train_command,
+            stage1_seed=stage1_seed,
+            expert_init_seed=expert_init_seed,
         )
         print(f"[moe_pipeline] saved manifest: {manifest_path}", flush=True)
     return 0

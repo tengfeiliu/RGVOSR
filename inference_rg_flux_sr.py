@@ -22,6 +22,7 @@ from models.prompt_builder import (
     validate_prompt_profile,
 )
 from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
+from models.router_condition import extract_router_condition, router_condition_tensors
 from rg_flux_fm import sample_multistep_fm
 
 
@@ -221,6 +222,7 @@ def write_inference_manifest(
     iqa_pairing=None,
     iqa_shuffle_seed=None,
     dataset_metadata=None,
+    moe_routing=None,
 ):
     manifest_path = Path(manifest_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +248,8 @@ def write_inference_manifest(
     if iqa_pairing is not None:
         payload["iqa_pairing"] = iqa_pairing
         payload["iqa_shuffle_seed"] = iqa_shuffle_seed
+    if moe_routing is not None:
+        payload["moe_routing"] = moe_routing
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     return payload
@@ -691,6 +695,12 @@ def run_inference_dataset(
     donor_builder = build_iqa_donor_indices if pairing_field == "iqa" else build_suggestion_donor_indices
     donor_indices = donor_builder(len(entries), pairing=pairing, seed=effective_seed or 0)
     pairing_rows = []
+    paired_profiles = []
+    router_input_mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
+    use_router_condition = router_input_mode in {"condition8", "condition8_timestep"}
+    router_condition_version = str(
+        cfg(config, "model.lora_moe.router_condition_version", "text8_v1")
+    )
 
     for source_index, donor_index in enumerate(donor_indices):
         source_entry = entries[source_index]
@@ -716,6 +726,12 @@ def run_inference_dataset(
             prompt_variant=args.prompt_variant,
             include_caption=args.include_caption,
         )
+        paired_profiles.append(paired_profile)
+        extracted_router_condition = (
+            extract_router_condition(paired_profile, version=router_condition_version)
+            if use_router_condition
+            else None
+        )
         pairing_rows.append(
             {
                 "dataset": dataset_name,
@@ -735,6 +751,9 @@ def run_inference_dataset(
                 "output_image_path": str(output_dir / f"{source_image_path.stem}.png"),
                 "prompt": prompt,
                 "self_pairing": source_index == donor_index,
+                "router_condition": None
+                if extracted_router_condition is None
+                else extracted_router_condition.as_dict(),
                 "same_suggestion_text": (
                     str(source_suggestion or "").strip()
                     == str(donor_suggestion or "").strip()
@@ -746,6 +765,17 @@ def run_inference_dataset(
 
     pairing_manifest_path = output_dir / f"{pairing_field}_pairing.jsonl"
     write_pairing_manifest(pairing_manifest_path, pairing_rows)
+    missing_router_condition_count = sum(
+        row.get("router_condition") is not None
+        and float(row["router_condition"].get("confidence", 0.0)) <= 0.0
+        for row in pairing_rows
+    )
+    if missing_router_condition_count:
+        print(
+            f"[inference] {missing_router_condition_count} samples have no recognized "
+            "IQA/Suggestion router condition; learned-router fallback is used (no teacher).",
+            flush=True,
+        )
 
     for source_index, entry in enumerate(tqdm(entries, desc=f"RG-FLUX-SR inference [{dataset_name}]")):
         image_path = entry["image_path"]
@@ -781,6 +811,19 @@ def run_inference_dataset(
                 cache=text_embedding_cache,
             )
             degradation_vector = degradation_tensor(result, device, dtype, args.use_degradation_vector)
+            router_condition = None
+            router_condition_mask = None
+            router_condition_confidence = None
+            if use_router_condition:
+                values, valid_mask, confidence = router_condition_tensors(
+                    paired_profiles[source_index],
+                    device=device,
+                    dtype=dtype,
+                    version=router_condition_version,
+                )
+                router_condition = values.unsqueeze(0)
+                router_condition_mask = valid_mask.unsqueeze(0)
+                router_condition_confidence = confidence.unsqueeze(0)
             dino_tokens = artist.extract_visual_tokens(lq_up)
             sr_latent = sample_multistep_fm(
                 artist=artist,
@@ -792,6 +835,9 @@ def run_inference_dataset(
                 z_lr=z_lr,
                 dino_tokens=dino_tokens,
                 lr_cond_mode=lr_cond_mode,
+                router_condition=router_condition,
+                router_condition_mask=router_condition_mask,
+                router_condition_confidence=router_condition_confidence,
                 num_steps=args.num_inference_steps,
                 device=device,
                 dtype=dtype,
@@ -821,6 +867,8 @@ def run_inference_dataset(
         "skipped_image_count": len(image_paths) - len(entries),
         "same_suggestion_text_count": sum(row["same_suggestion_text"] for row in pairing_rows),
         "same_iqa_profile_count": sum(row["same_iqa_profile"] for row in pairing_rows),
+        "missing_router_condition_count": missing_router_condition_count,
+        "router_missing_condition_policy": "learned_router_fallback",
     }
     return metadata
 
@@ -835,8 +883,21 @@ def main(args):
         config["data"]["pre_cropped"] = False
     config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
     config["condition"]["use_prompt"] = args.use_prompt
+    if args.use_degradation_vector is None:
+        args.use_degradation_vector = bool(
+            cfg(config, "condition.use_degradation_vector", True)
+        )
     config["condition"]["use_degradation_vector"] = args.use_degradation_vector
     config["condition"]["use_suggestions"] = args.use_suggestions
+    router_input_mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
+    if (
+        router_input_mode in {"condition8", "condition8_timestep"}
+        and args.use_degradation_vector
+    ):
+        raise ValueError(
+            "condition8 inference requires --no-use_degradation_vector; the legacy "
+            "degradation_vector is invalid and is not used as a fallback."
+        )
     if args.prompt_variant is None:
         args.prompt_variant = cfg(config, "condition.prompt_variant", None)
     else:
@@ -885,8 +946,9 @@ def main(args):
         config,
         dtype=cfg(config, "text_encoding.dtype", dtype_name),
     )
-    if hasattr(artist, "set_moe_training_schedule"):
-        artist.set_moe_training_schedule(global_step=1, max_steps=1)
+    moe_inference_schedule = None
+    if hasattr(artist, "set_moe_inference_schedule"):
+        moe_inference_schedule = artist.set_moe_inference_schedule()
 
     condition_index = load_jsonl_conditions(args.jsonl_path)
     datasets = resolve_inference_datasets(args, output_dir=resolved_run["output_dir"])
@@ -919,6 +981,7 @@ def main(args):
         iqa_pairing=args.iqa_pairing,
         iqa_shuffle_seed=(args.iqa_shuffle_seed if args.iqa_pairing == "shuffled" else None),
         dataset_metadata=dataset_metadata,
+        moe_routing=moe_inference_schedule,
     )
 
 
@@ -992,7 +1055,12 @@ def build_arg_parser():
         default=3407,
         help="Base seed for deterministic cross-image IQA pairing.",
     )
-    parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use_degradation_vector",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override checkpoint config; condition8 checkpoints default to their configured false value.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="bf16")

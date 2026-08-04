@@ -28,12 +28,25 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
                 "eval/inference/moe",
                 "--full_frame_inference",
                 "--restore_input_size",
+                "--router_input_mode",
+                "condition8_timestep",
+                "--teacher_routing_enabled",
+                "--router_teacher_weight",
+                "0.01",
+                "--stage_label",
+                "_s5",
+                "--semantic_prototype_init",
             ]
         )
         self.assertEqual(args.single_lora_checkpoint, "exp/single/checkpoints/checkpoint-00032000/rg_flux_adapters")
         self.assertIsNone(args.single_lora_run_dir)
         self.assertTrue(args.full_frame_inference)
         self.assertTrue(args.restore_input_size)
+        self.assertEqual(args.router_input_mode, "condition8_timestep")
+        self.assertTrue(args.teacher_routing_enabled)
+        self.assertEqual(args.router_teacher_weight, 0.01)
+        self.assertEqual(args.stage_label, "_s5")
+        self.assertTrue(args.semantic_prototype_init)
 
         args = parser.parse_args(
             [
@@ -161,6 +174,8 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertIsNone(original_after["training"]["resume_ckpt"])
             self.assertEqual(runtime_config["model"]["flux_backend"], "flux2_klein")
             self.assertEqual(runtime_config["model"]["lora_backend"], "moe")
+            self.assertEqual(runtime_config["_runtime"]["moe_init_seed"], 42)
+            self.assertEqual(runtime_config["_runtime"]["moe_expert_init_seed"], 42)
             self.assertTrue(runtime_config["training"]["exp_name"].endswith("_26063009"))
             self.assertEqual(runtime_config["training"]["resume_ckpt"], str(stage1_output))
             self.assertFalse(runtime_config["training"]["resume_training_state"])
@@ -224,6 +239,13 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertIn(str(single_lora), stage1_cmd)
             self.assertIn("--output", stage1_cmd)
             self.assertIn(str(stage1_output), stage1_cmd)
+            self.assertIn("--seed", stage1_cmd)
+            self.assertEqual(stage1_cmd[stage1_cmd.index("--seed") + 1], "42")
+            self.assertIn("--expert_init_seed", stage1_cmd)
+            self.assertEqual(
+                stage1_cmd[stage1_cmd.index("--expert_init_seed") + 1],
+                "42",
+            )
 
             train_cmd = build_train_command(Args, runtime_config)
             self.assertIn("train_rg_flux_sr.py", train_cmd)
@@ -280,6 +302,8 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
                 records=[{"checkpoint_step": "checkpoint-00020000"}],
                 stage1_returncode=0,
                 train_returncode=0,
+                stage1_seed=42,
+                expert_init_seed=42,
             )
 
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -287,6 +311,8 @@ class RGFluxMoEPipelineCliTests(unittest.TestCase):
             self.assertEqual(payload["single_lora_checkpoint"], str(Path("single/rg_flux_adapters")))
             self.assertEqual(payload["stage1_returncode"], 0)
             self.assertEqual(payload["train_returncode"], 0)
+            self.assertEqual(payload["stage1_seed"], 42)
+            self.assertEqual(payload["expert_init_seed"], 42)
             self.assertEqual(payload["records"][0]["checkpoint_step"], "checkpoint-00020000")
             summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["pipeline_type"], "moe_lora")

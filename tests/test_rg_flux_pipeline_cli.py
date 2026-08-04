@@ -25,11 +25,27 @@ class RGFluxPipelineCliTests(unittest.TestCase):
                 "realLR200=/data/RealLR200/lq",
                 "--inference_output_root",
                 "eval/inference",
+                "--resume_checkpoint",
+                "exp/single/checkpoints/checkpoint-00024000",
+                "--no-resume_training_state",
+                "--max_steps",
+                "64000",
+                "--grad_accum_steps",
+                "8",
+                "--image_loss_crop_size",
+                "256",
+                "--stage_label",
+                "_s0_control",
             ]
         )
 
         self.assertTrue(args.skip_train)
         self.assertEqual(args.checkpoint_steps, ["20000", "40000"])
+        self.assertEqual(args.max_steps, 64000)
+        self.assertFalse(args.resume_training_state)
+        self.assertEqual(args.grad_accum_steps, 8)
+        self.assertEqual(args.image_loss_crop_size, 256)
+        self.assertEqual(args.stage_label, "_s0_control")
         self.assertEqual(
             parse_dataset_dirs(args.dataset_dirs),
             {
@@ -59,6 +75,12 @@ class RGFluxPipelineCliTests(unittest.TestCase):
             runtime_config, run_dir, runtime_path = create_runtime_config(
                 train_config,
                 now=datetime.datetime(2026, 6, 28, 10, 5),
+                resume_checkpoint="exp/single/checkpoints/checkpoint-00024000",
+                resume_training_state=False,
+                max_steps=64000,
+                grad_accum_steps=8,
+                image_loss_crop_size=256,
+                stage_label="_s0_single_continue_control",
             )
 
             original_after = yaml.safe_load(train_config.read_text(encoding="utf-8"))
@@ -66,6 +88,16 @@ class RGFluxPipelineCliTests(unittest.TestCase):
             self.assertTrue(runtime_config["training"]["exp_name"].endswith("_26062810"))
             self.assertEqual(runtime_config["training"]["resolved_exp_name"], runtime_config["training"]["exp_name"])
             self.assertEqual(runtime_config["training"]["resolved_run_id"], "26062810")
+            self.assertEqual(
+                runtime_config["training"]["resume_ckpt"],
+                "exp/single/checkpoints/checkpoint-00024000",
+            )
+            self.assertFalse(runtime_config["training"]["resume_training_state"])
+            self.assertFalse(runtime_config["training"]["auto_resume"])
+            self.assertEqual(runtime_config["training"]["max_steps"], 64000)
+            self.assertEqual(runtime_config["training"]["grad_accum_steps"], 8)
+            self.assertEqual(runtime_config["loss"]["image_loss_crop_size"], 256)
+            self.assertIn("_s0_single_continue_control", run_dir.name)
             self.assertEqual(run_dir.name, runtime_config["training"]["exp_name"])
             self.assertEqual(runtime_path, run_dir / "pipeline_runtime_config.yaml")
             self.assertTrue(runtime_path.exists())

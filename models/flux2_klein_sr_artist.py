@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.degradation_vector_encoder import DegradationVectorEncoder
 from models.flux_sr_artist import (
@@ -23,6 +24,8 @@ from models.lr_condition_encoder import LRConditionEncoder
 from models.lora_moe import (
     ProfileLatentRouter,
     SharedRoutedMoELoRALinear,
+    add_moe_persistent_buffers,
+    blend_teacher_routing,
     iter_moe_lora_layers,
     moe_diversity_loss,
     moe_routing,
@@ -30,6 +33,11 @@ from models.lora_moe import (
     routing_entropy,
     routing_entropy_loss,
     set_shared_lora_trainable,
+    teacher_router_mix,
+)
+from models.router_condition import (
+    ROUTER_CONDITION_VERSION,
+    condition_to_expert_target,
 )
 from models.text_embedding_cache import normalize_text_encoding_mode, text_encoder_should_load
 from models.visual_condition_adapter import VisualConditionAdapter
@@ -161,6 +169,8 @@ class Flux2KleinSRArtist(nn.Module):
         self.moe_routing_mode = "soft"
         self.moe_temperature = float(_cfg(config, "model.lora_moe.init_temperature", 2.0))
         self.moe_top_k = int(_cfg(config, "model.lora_moe.top_k", 2))
+        self.moe_router_noise_std = 0.0
+        self.moe_teacher_router_mix = 1.0
         self._last_moe_router_output = None
         self._last_moe_stage = "peft"
 
@@ -374,6 +384,10 @@ class Flux2KleinSRArtist(nn.Module):
             hidden_dim=int(moe_cfg.get("router_hidden_dim", 1024)),
             latent_branch=str(moe_cfg.get("latent_branch", "stat_conv")),
             prototype_scale=float(moe_cfg.get("prototype_scale", 1.0)),
+            input_mode=str(moe_cfg.get("router_input_mode", "prompt_lr")),
+            condition_dim=int(moe_cfg.get("router_condition_dim", 8)),
+            timestep_dim=int(moe_cfg.get("router_timestep_dim", 32)),
+            ema_decay=float(moe_cfg.get("router_ema_decay", 0.99)),
         )
 
     def _apply_lora_moe(self):
@@ -406,11 +420,28 @@ class Flux2KleinSRArtist(nn.Module):
         if not self.is_lora_moe_enabled():
             return {"enabled": False}
         moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
-        warmup_ratio = float(moe_cfg.get("warmup_ratio", 0.1))
+        warmup_ratio = float(moe_cfg.get("warmup_ratio", 0.3))
         init_temp = float(moe_cfg.get("init_temperature", 2.0))
         final_temp = float(moe_cfg.get("final_temperature", 0.7))
         max_steps = max(int(max_steps), 1)
         progress = min(max(float(global_step) / float(max_steps), 0.0), 1.0)
+        teacher_enabled = bool(moe_cfg.get("teacher_routing_enabled", False))
+        teacher_start = float(moe_cfg.get("teacher_start_ratio", 0.15))
+        teacher_end = float(moe_cfg.get("teacher_end_ratio", 0.35))
+        if not 0.0 <= teacher_start <= teacher_end <= 1.0:
+            raise ValueError(
+                "MoE teacher schedule must satisfy 0 <= teacher_start_ratio "
+                "<= teacher_end_ratio <= 1"
+            )
+        self.moe_teacher_router_mix = teacher_router_mix(
+            progress,
+            start_ratio=teacher_start,
+            end_ratio=teacher_end,
+            enabled=teacher_enabled,
+        )
+        noise_std = float(moe_cfg.get("router_noise_std", 0.0))
+        noise_end = float(moe_cfg.get("router_noise_end_ratio", warmup_ratio))
+        self.moe_router_noise_std = noise_std * max(1.0 - progress / max(noise_end, 1e-8), 0.0)
         in_warmup = progress < warmup_ratio
         if in_warmup:
             local_progress = progress / max(warmup_ratio, 1e-8)
@@ -429,42 +460,121 @@ class Flux2KleinSRArtist(nn.Module):
             "stage": self._last_moe_stage,
             "routing_mode": self.moe_routing_mode,
             "temperature": self.moe_temperature,
+            "router_noise_std": self.moe_router_noise_std,
+            "teacher_router_mix": self.moe_teacher_router_mix,
         }
 
-    def compute_router_features(self, prompt_embeds, z_lr):
+    def set_moe_inference_schedule(self):
+        if not self.is_lora_moe_enabled():
+            return {"enabled": False}
+        moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+        self.moe_routing_mode = str(moe_cfg.get("inference_routing_mode", "topk"))
+        self.moe_temperature = float(
+            moe_cfg.get("inference_temperature", moe_cfg.get("final_temperature", 0.7))
+        )
+        self.moe_top_k = int(moe_cfg.get("inference_top_k", moe_cfg.get("top_k", 2)))
+        self.moe_router_noise_std = 0.0
+        self.moe_teacher_router_mix = 1.0
+        self._last_moe_stage = "inference"
+        return {
+            "enabled": True,
+            "stage": "inference",
+            "routing_mode": self.moe_routing_mode,
+            "temperature": self.moe_temperature,
+            "top_k": self.moe_top_k,
+        }
+
+    def compute_router_features(
+        self,
+        prompt_embeds=None,
+        z_lr=None,
+        router_condition=None,
+        router_condition_mask=None,
+        router_condition_confidence=None,
+        timestep=None,
+    ):
         if not self.is_lora_moe_enabled():
             raise RuntimeError("compute_router_features requires model.lora_backend: moe")
-        return self.moe_router.router_features(prompt_embeds, z_lr)
+        return self.moe_router.router_features(
+            prompt_embeds=prompt_embeds,
+            z_lr=z_lr,
+            router_condition=router_condition,
+            router_condition_mask=router_condition_mask,
+            router_condition_confidence=router_condition_confidence,
+            timestep=timestep,
+        )
 
-    def moe_auxiliary_losses(self):
+    def moe_auxiliary_losses(
+        self,
+        compute_div=True,
+        compute_entropy=True,
+        compute_balance=True,
+        compute_teacher=True,
+    ):
         if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
             return {}
-        alpha = self._last_moe_router_output["alpha"]
-        layers = list(iter_moe_lora_layers(self.transformer))
+        alpha = self._last_moe_router_output["alpha_used"]
+        alpha_router = self._last_moe_router_output["alpha_router"]
+        dense_alpha = self._last_moe_router_output["clean_dense_alpha"]
+        dispatch_dense_alpha = self._last_moe_router_output["dispatch_dense_alpha"]
         encourage_high = self._last_moe_stage == "warmup"
-        return {
-            "div": moe_diversity_loss(layers).to(device=alpha.device),
-            "entropy": routing_entropy_loss(alpha, encourage_high_entropy=encourage_high),
-            "balance": routing_balance_loss(alpha),
-            "entropy_value": routing_entropy(alpha).detach(),
+        losses = {
+            "entropy_value": routing_entropy(alpha_router).detach(),
             "alpha": alpha.detach(),
+            "alpha_router": alpha_router.detach(),
+            "dense_alpha": dense_alpha.detach(),
+            "dispatch_dense_alpha": dispatch_dense_alpha.detach(),
         }
+        if compute_div:
+            layers = list(iter_moe_lora_layers(self.transformer))
+            losses["div"] = moe_diversity_loss(layers).to(device=alpha.device)
+        if compute_entropy:
+            losses["entropy"] = routing_entropy_loss(
+                alpha_router,
+                encourage_high_entropy=encourage_high,
+            )
+        if compute_balance:
+            losses["balance"] = routing_balance_loss(
+                dispatch_dense_alpha,
+                ema_dispatch_usage=self.moe_router.ema_dispatch_usage,
+            )
+        teacher_target = self._last_moe_router_output.get("teacher_target")
+        if compute_teacher and teacher_target is not None:
+            confidence = self._last_moe_router_output.get("teacher_confidence")
+            per_sample = F.kl_div(
+                dense_alpha.float().clamp_min(1e-8).log(),
+                teacher_target.float(),
+                reduction="none",
+            ).sum(dim=-1)
+            if confidence is not None:
+                confidence = confidence.float().reshape(-1).clamp(0.0, 1.0)
+                losses["teacher"] = (per_sample * confidence).sum() / confidence.sum().clamp_min(1.0)
+            else:
+                losses["teacher"] = per_sample.mean()
+        return losses
 
     def moe_log_stats(self):
         if not self.is_lora_moe_enabled() or self._last_moe_router_output is None:
             return {}
-        alpha = self._last_moe_router_output["alpha"].detach().float()
-        top1 = alpha.argmax(dim=-1)
+        alpha = self._last_moe_router_output["alpha_used"].detach().float()
+        alpha_router = self._last_moe_router_output["alpha_router"].detach().float()
+        dense_alpha = self._last_moe_router_output["clean_dense_alpha"].detach().float()
+        top1 = alpha_router.argmax(dim=-1)
         logs = {
             "router/temperature": float(self.moe_temperature),
-            "router/entropy": float(routing_entropy(alpha).item()),
+            "router/entropy": float(routing_entropy(alpha_router).item()),
+            "router/noise_std": float(self.moe_router_noise_std),
+            "router/teacher_router_mix": float(self.moe_teacher_router_mix),
         }
         for idx in range(alpha.shape[-1]):
-            logs[f"router/expert_{idx}_usage"] = float(alpha[:, idx].mean().item())
+            logs[f"router/expert_{idx}_usage"] = float(alpha_router[:, idx].mean().item())
+            logs[f"router/expert_{idx}_used"] = float(alpha[:, idx].mean().item())
+            logs[f"router/expert_{idx}_dense"] = float(dense_alpha[:, idx].mean().item())
+            logs[f"router/expert_{idx}_ema"] = float(self.moe_router.ema_dispatch_usage[idx].item())
             logs[f"router/top1_expert_{idx}"] = float((top1 == idx).float().mean().item())
         return logs
 
-    def initialize_moe_from_single_lora(self, checkpoint_dir, perturb_scale=0.01):
+    def initialize_moe_from_single_lora(self, checkpoint_dir, perturb_scale=0.3):
         if not self.is_lora_moe_enabled():
             raise RuntimeError("initialize_moe_from_single_lora requires model.lora_backend: moe")
         checkpoint_dir = Path(checkpoint_dir)
@@ -779,6 +889,9 @@ class Flux2KleinSRArtist(nn.Module):
         z_lr=None,
         dino_tokens=None,
         lr_cond_mode=None,
+        router_condition=None,
+        router_condition_mask=None,
+        router_condition_confidence=None,
     ):
         lr_cond_mode = lr_cond_mode or self.lr_cond_mode
         bsz, channels, height, width = z_t.shape
@@ -832,21 +945,99 @@ class Flux2KleinSRArtist(nn.Module):
         routing_context = contextlib.nullcontext()
         self._last_moe_router_output = None
         if self.is_lora_moe_enabled():
-            if z_lr is None:
-                raise ValueError("z_lr is required when model.lora_backend='moe'")
-            router_logits, router_alpha, router_features = self.moe_router(
+            router_output = self.moe_router(
                 prompt_embeds=prompt_embeds,
-                z_lr=z_lr.to(prompt_embeds.device),
+                z_lr=None if z_lr is None else z_lr.to(prompt_embeds.device),
+                router_condition=None
+                if router_condition is None
+                else router_condition.to(prompt_embeds.device),
+                router_condition_mask=None
+                if router_condition_mask is None
+                else router_condition_mask.to(prompt_embeds.device),
+                router_condition_confidence=None
+                if router_condition_confidence is None
+                else router_condition_confidence.to(prompt_embeds.device),
+                timestep=timestep.to(prompt_embeds.device),
                 routing_mode=self.moe_routing_mode,
                 top_k=self.moe_top_k,
                 temperature=self.moe_temperature,
+                noise_std=self.moe_router_noise_std,
+                update_ema=False,
+                return_details=True,
             )
+            router_alpha = router_output["alpha"]
+            teacher_target = None
+            teacher_condition = None
+            if router_condition is not None:
+                teacher_condition = router_condition.to(
+                    device=router_alpha.device,
+                    dtype=router_alpha.dtype,
+                )
+                if router_condition_mask is not None:
+                    teacher_condition = teacher_condition * router_condition_mask.to(
+                        device=router_alpha.device,
+                        dtype=router_alpha.dtype,
+                    )
+            if (
+                self.training
+                and bool(_cfg(self.config, "model.lora_moe.teacher_routing_enabled", False))
+                and teacher_condition is not None
+            ):
+                teacher_target = condition_to_expert_target(
+                    teacher_condition,
+                    temperature=float(
+                        _cfg(self.config, "model.lora_moe.teacher_target_temperature", 0.7)
+                    ),
+                    score_matrix=_cfg(
+                        self.config,
+                        "model.lora_moe.teacher_expert_score_matrix",
+                        None,
+                    ),
+                )
+            teacher_confidence = None
+            if teacher_target is not None:
+                if router_condition_confidence is not None:
+                    teacher_confidence = router_condition_confidence.to(
+                        device=router_alpha.device,
+                        dtype=router_alpha.dtype,
+                    ).reshape(-1)
+                elif router_condition_mask is not None:
+                    teacher_confidence = router_condition_mask.to(
+                        device=router_alpha.device,
+                        dtype=router_alpha.dtype,
+                    ).float().mean(dim=-1)
+                else:
+                    teacher_confidence = torch.ones(
+                        router_alpha.shape[0],
+                        device=router_alpha.device,
+                        dtype=router_alpha.dtype,
+                    )
+            if teacher_target is not None and self.moe_teacher_router_mix < 1.0:
+                # Any sample with recognized condition evidence follows q exactly
+                # during the pure-teacher phase. Confidence weights the KL quality,
+                # but must not dilute the expert assignment; all-missing samples
+                # explicitly fall back to the learned router.
+                effective_mask = router_condition_mask
+                if effective_mask is None:
+                    effective_mask = (teacher_confidence > 0).to(router_alpha.dtype).unsqueeze(-1)
+                router_alpha_used = blend_teacher_routing(
+                    router_alpha,
+                    teacher_target,
+                    router_mix=self.moe_teacher_router_mix,
+                    valid_mask=effective_mask,
+                )
+            else:
+                router_alpha_used = router_alpha
+            if self.training:
+                self.moe_router.update_ema_usage(router_alpha_used)
             self._last_moe_router_output = {
-                "logits": router_logits,
-                "alpha": router_alpha,
-                "features": router_features,
+                **router_output,
+                "alpha_router": router_alpha,
+                "alpha_used": router_alpha_used,
+                "teacher_target": teacher_target,
+                "teacher_confidence": teacher_confidence,
             }
-            routing_context = moe_routing(self.transformer, router_alpha)
+            routing_context = moe_routing(self.transformer, router_alpha_used)
         with routing_context:
             model_out = self.transformer(
                 hidden_states=hidden_states,
@@ -876,7 +1067,38 @@ class Flux2KleinSRArtist(nn.Module):
                 "num_routed_experts": int(moe_cfg.get("num_routed_experts", 4)),
                 "top_k": int(moe_cfg.get("top_k", 2)),
                 "latent_branch": str(moe_cfg.get("latent_branch", "stat_conv")),
+                "router_input_mode": str(moe_cfg.get("router_input_mode", "prompt_lr")),
+                "router_condition_version": str(
+                    moe_cfg.get("router_condition_version", ROUTER_CONDITION_VERSION)
+                ),
+                "router_condition_dim": int(moe_cfg.get("router_condition_dim", 8)),
+                "router_timestep_dim": int(moe_cfg.get("router_timestep_dim", 32)),
+                "teacher_routing_enabled": bool(moe_cfg.get("teacher_routing_enabled", False)),
+                "timestep_conditioned": str(
+                    moe_cfg.get("router_input_mode", "prompt_lr")
+                )
+                == "condition8_timestep",
                 "prototype_scale": float(moe_cfg.get("prototype_scale", 1.0)),
+                "inference_routing_mode": str(
+                    moe_cfg.get("inference_routing_mode", "topk")
+                ),
+                "inference_temperature": float(
+                    moe_cfg.get(
+                        "inference_temperature",
+                        moe_cfg.get("final_temperature", 0.7),
+                    )
+                ),
+                "inference_top_k": int(
+                    moe_cfg.get("inference_top_k", moe_cfg.get("top_k", 2))
+                ),
+                "stage1_init_seed": int(_cfg(self.config, "_runtime.moe_init_seed", 42)),
+                "expert_init_seed": int(
+                    _cfg(
+                        self.config,
+                        "_runtime.moe_expert_init_seed",
+                        _cfg(self.config, "_runtime.moe_init_seed", 42),
+                    )
+                ),
             }
         if save_files:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -885,6 +1107,10 @@ class Flux2KleinSRArtist(nn.Module):
         if self.is_lora_moe_enabled():
             moe_state = _gathered_named_parameter_state(self, _moe_parameter_name, collect_state=save_files)
             if save_files:
+                # _gathered_named_parameter_state intentionally handles parameters
+                # only. Persist router EMA buffers as part of the same versioned
+                # MoE state so resumed batch-size-one training is reproducible.
+                moe_state = add_moe_persistent_buffers(self, moe_state)
                 torch.save(moe_state, output_dir / "flux2_klein_lora_moe_state.pt")
         elif self.use_lora and hasattr(self.transformer, "save_pretrained"):
             if save_files and not _has_deepspeed_partitioned_parameters(self.transformer):
@@ -914,6 +1140,44 @@ class Flux2KleinSRArtist(nn.Module):
             backend = str(metadata.get("flux_backend", "")).lower()
             if backend and backend != self.backend_name:
                 raise RuntimeError(f"Checkpoint backend '{backend}' is incompatible with '{self.backend_name}'.")
+            checkpoint_moe = metadata.get("lora_moe")
+            if self.is_lora_moe_enabled() and isinstance(checkpoint_moe, dict):
+                moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
+                expected_mode = str(moe_cfg.get("router_input_mode", "prompt_lr"))
+                # Checkpoints predating router_input_mode used prompt+LR routing.
+                checkpoint_mode = str(checkpoint_moe.get("router_input_mode", "prompt_lr"))
+                if checkpoint_mode != expected_mode:
+                    raise RuntimeError(
+                        "LoRA-MoE router input mismatch: checkpoint uses "
+                        f"{checkpoint_mode!r}, config requests {expected_mode!r}."
+                    )
+                expected_version = str(
+                    moe_cfg.get("router_condition_version", ROUTER_CONDITION_VERSION)
+                )
+                checkpoint_version = str(
+                    checkpoint_moe.get("router_condition_version", expected_version)
+                )
+                if checkpoint_version != expected_version:
+                    raise RuntimeError(
+                        "LoRA-MoE router condition extractor mismatch: checkpoint uses "
+                        f"{checkpoint_version!r}, config requests {expected_version!r}."
+                    )
+                expected_dim = int(moe_cfg.get("router_condition_dim", 8))
+                checkpoint_dim = int(checkpoint_moe.get("router_condition_dim", expected_dim))
+                if checkpoint_dim != expected_dim:
+                    raise RuntimeError(
+                        "LoRA-MoE router condition dimension mismatch: checkpoint uses "
+                        f"{checkpoint_dim}, config requests {expected_dim}."
+                    )
+                expected_timestep_dim = int(moe_cfg.get("router_timestep_dim", 32))
+                checkpoint_timestep_dim = int(
+                    checkpoint_moe.get("router_timestep_dim", expected_timestep_dim)
+                )
+                if checkpoint_timestep_dim != expected_timestep_dim:
+                    raise RuntimeError(
+                        "LoRA-MoE router timestep dimension mismatch: checkpoint uses "
+                        f"{checkpoint_timestep_dim}, config requests {expected_timestep_dim}."
+                    )
         if (checkpoint_dir / "flux_lora_state.pt").exists() and not (checkpoint_dir / "flux2_klein_lora_state.pt").exists():
             raise RuntimeError("This looks like a FLUX.1 checkpoint. Use a FLUX.2-klein adapter checkpoint instead.")
 

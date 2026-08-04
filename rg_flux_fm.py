@@ -41,6 +41,9 @@ def sample_multistep_fm(
     z_lr=None,
     dino_tokens=None,
     lr_cond_mode="latent_adapter",
+    router_condition=None,
+    router_condition_mask=None,
+    router_condition_confidence=None,
     num_steps=25,
     device=None,
     dtype=None,
@@ -64,6 +67,9 @@ def sample_multistep_fm(
             z_lr=z_lr,
             dino_tokens=dino_tokens,
             lr_cond_mode=lr_cond_mode,
+            router_condition=router_condition,
+            router_condition_mask=router_condition_mask,
+            router_condition_confidence=router_condition_confidence,
         )
         z = z - (sigma_cur - sigma_next) * v_pred
 
