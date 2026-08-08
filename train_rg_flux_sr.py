@@ -34,6 +34,7 @@ from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.prompt_builder import (
     build_sr_prompt,
     normalize_prompt_variant,
+    prompt_variant_id,
     validate_prompt_profile,
 )
 from models.router_condition import router_condition_tensors
@@ -1921,9 +1922,7 @@ def main(config_path, dry_run=False):
                 }
                 if active_prompt_condition is not None:
                     step_logs["prompt/variant_id"] = float(
-                        {"fixed": 0, "suggestion": 1, "iqa": 2, "iqa_suggestion": 3}[
-                            active_prompt_condition["variant"]
-                        ]
+                        prompt_variant_id(active_prompt_condition["variant"])
                     )
                     step_logs["prompt/caption_enabled"] = float(
                         active_prompt_condition["include_caption"]

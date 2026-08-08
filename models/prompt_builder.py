@@ -22,6 +22,9 @@ PROMPT_VARIANTS = (
     "iqa_suggestion",
     "condition8_text",
 )
+PROMPT_VARIANT_IDS = {
+    variant: index for index, variant in enumerate(PROMPT_VARIANTS)
+}
 IQA_FIELDS = (
     "distortion_location",
     "distortion_severity",
@@ -81,6 +84,13 @@ def normalize_prompt_variant(prompt_variant):
             f"Unsupported prompt_variant '{prompt_variant}'. Expected one of: {', '.join(PROMPT_VARIANTS)}"
         )
     return normalized
+
+
+def prompt_variant_id(prompt_variant):
+    normalized = normalize_prompt_variant(prompt_variant)
+    if normalized is None:
+        raise ValueError("prompt_variant must be set when requesting its numeric id")
+    return PROMPT_VARIANT_IDS[normalized]
 
 
 def normalize_bounded_text(value, max_words):

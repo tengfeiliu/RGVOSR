@@ -176,6 +176,14 @@ class PromptAblationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported prompt_variant"):
             build_sr_prompt(self.profile, prompt_variant="unknown")
 
+    def test_condition8_text_has_a_stable_logging_id(self):
+        from models.prompt_builder import PROMPT_VARIANT_IDS, prompt_variant_id
+
+        self.assertEqual(
+            prompt_variant_id("condition8_text"),
+            PROMPT_VARIANT_IDS["condition8_text"],
+        )
+
 
 class PromptAblationPipelineTests(unittest.TestCase):
     def test_ablation_suite_defaults_include_fixed_prompt_baseline(self):
