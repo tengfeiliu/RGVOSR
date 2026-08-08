@@ -55,6 +55,10 @@ _CONDITION8_PHRASES = {
     "structure_risk": "risk to text, faces, thin lines, repeated patterns, and geometry",
     "hallucination_risk": "risk of hallucinated or false details",
 }
+CONDITION8_NEUTRAL_TEXT = (
+    "No specific degradation condition was recognized; apply balanced restoration "
+    "while preserving structure, color, identity, and natural detail."
+)
 
 
 def _safe_text(value, default=""):
@@ -126,9 +130,7 @@ def condition8_to_canonical_text(condition) -> str:
         level = _condition8_level(value)
         clauses.append(f"{level} {_CONDITION8_PHRASES[key]}")
     if not clauses:
-        raise ValueError(
-            "condition8_text requires at least one recognized IQA/Suggestion condition"
-        )
+        return CONDITION8_NEUTRAL_TEXT
     return "; ".join(clauses) + "."
 
 
@@ -179,11 +181,6 @@ def validate_prompt_profile(profile, prompt_variant, include_caption=False):
         )
     if prompt_variant in {"suggestion", "iqa_suggestion"} and not normalized["suggestion"]:
         missing.append("suggestion")
-    if prompt_variant == "condition8_text":
-        try:
-            build_condition8_text(profile)
-        except ValueError as exc:
-            missing.append(str(exc))
     if missing:
         raise ValueError(
             f"Profile is missing fields required by prompt variant '{prompt_variant}': "

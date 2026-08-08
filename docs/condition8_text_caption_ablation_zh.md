@@ -13,6 +13,8 @@
 
 `condition8_text` 使用固定规则把 `text8_v1` 的八维数值量化为 `no visible/subtle/mild/moderate/severe/extreme`，再送入原有 Text Encoder。它不会把原始 IQA/Suggestion 文本附加到 Prompt。
 
+如果某个样本的 IQA/Suggestion 措辞没有命中 `text8_v1` 的任何维度，则保留该样本和 Caption，并使用固定中性条件文本执行均衡、保真恢复；MoE Router 对同一情况继续使用现有的 learned-router fallback。该情况不会中止训练或推理。
+
 为了控制初始化，C 从 A 的 checkpoint-24000 初始化；D 必须从 B 的 checkpoint-24000 初始化。
 
 ## 公共服务器路径

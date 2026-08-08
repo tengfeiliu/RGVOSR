@@ -126,6 +126,22 @@ class PromptAblationTests(unittest.TestCase):
         self.assertIn("moderate noise", text)
         self.assertNotIn("compression", text)
 
+    def test_condition8_text_uses_neutral_fallback_when_nothing_is_recognized(self):
+        from models.prompt_builder import CONDITION8_NEUTRAL_TEXT, build_sr_prompt
+
+        prompt = build_sr_prompt(
+            {
+                "caption": "A landscape with distant buildings.",
+                "iqa": {"overall_quality": "The image quality requires improvement."},
+                "suggestion": "Improve the image carefully.",
+            },
+            prompt_variant="condition8_text",
+            include_caption=True,
+        )
+
+        self.assertIn("A landscape with distant buildings.", prompt)
+        self.assertIn(CONDITION8_NEUTRAL_TEXT, prompt)
+
     def test_fixed_caption_and_missing_explicit_fields_are_rejected(self):
         from models.prompt_builder import build_sr_prompt
 
