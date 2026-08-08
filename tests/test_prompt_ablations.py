@@ -93,6 +93,39 @@ class PromptAblationTests(unittest.TestCase):
                     positions = [prompt.index(heading) for heading in headings]
                     self.assertEqual(positions, sorted(positions))
 
+    def test_condition8_text_uses_canonical_condition_and_keeps_caption(self):
+        from models.prompt_builder import build_sr_prompt
+
+        profile = dict(self.profile)
+        profile["caption"] = "A person stands beside a bicycle on a street."
+        prompt = build_sr_prompt(
+            profile,
+            prompt_variant="condition8_text",
+            include_caption=True,
+        )
+
+        self.assertIn("Image description:", prompt)
+        self.assertIn(profile["caption"], prompt)
+        self.assertIn("Canonical degradation and fidelity condition:", prompt)
+        self.assertIn("moderate blur", prompt)
+        self.assertNotIn("IQA profile:", prompt)
+        self.assertNotIn("Restoration suggestion:", prompt)
+        self.assertNotIn(self.profile["suggestion"], prompt)
+
+    def test_condition8_text_distinguishes_unknown_from_explicit_absence(self):
+        from models.prompt_builder import build_condition8_text
+
+        text = build_condition8_text(
+            {
+                "iqa": {"overall_quality": "No visible blur. Moderate noise."},
+                "suggestion": "",
+            }
+        )
+
+        self.assertIn("no visible blur", text)
+        self.assertIn("moderate noise", text)
+        self.assertNotIn("compression", text)
+
     def test_fixed_caption_and_missing_explicit_fields_are_rejected(self):
         from models.prompt_builder import build_sr_prompt
 
@@ -314,6 +347,96 @@ class PromptAblationPipelineTests(unittest.TestCase):
         self.assertTrue(condition["use_prompt"])
         self.assertTrue(condition["use_suggestions"])
         self.assertIn("prompt_iqa_suggestion", run_dir.name)
+
+    def test_condition8_text_runtime_and_inference_keep_caption(self):
+        from tools.run_rg_flux_pipeline import (
+            build_inference_command,
+            create_runtime_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "train.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"flux_backend": "flux2_klein"},
+                        "text_encoding": {"mode": "online"},
+                        "data": {"crop_size": 512},
+                        "condition": {
+                            "lr_cond_mode": "flux2_image_concat",
+                            "prompt_variant": "iqa_suggestion",
+                            "include_caption": True,
+                            "prompt_schedule": {
+                                "enabled": True,
+                                "switch_step": 0,
+                                "before_variant": "fixed",
+                                "before_include_caption": False,
+                                "after_variant": "iqa_suggestion",
+                                "after_include_caption": True,
+                            },
+                        },
+                        "training": {
+                            "stage": "0B",
+                            "output_dir": str(root / "exp"),
+                            "add_datetime_suffix": False,
+                            "suffix": "_condition8_text",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime_config, run_dir, runtime_path = create_runtime_config(
+                config_path,
+                prompt_variant="condition8_text",
+                include_caption=True,
+            )
+
+            self.assertEqual(
+                runtime_config["condition"]["prompt_variant"],
+                "condition8_text",
+            )
+            self.assertTrue(runtime_config["condition"]["include_caption"])
+            self.assertEqual(
+                runtime_config["condition"]["prompt_schedule"]["after_variant"],
+                "condition8_text",
+            )
+
+            args = argparse.Namespace(
+                dataset_dirs=["eval=/data/eval"],
+                inference_output_root=None,
+                text_encoding_mode="online",
+                text_embedding_cache=None,
+                jsonl_path="datasets/inference_cleaned.jsonl",
+                num_inference_steps=25,
+                upscale=4,
+                dtype="bf16",
+                device=None,
+                lr_cond_mode=None,
+                min_size=None,
+                full_frame_inference=True,
+                use_prompt=True,
+                use_suggestions=True,
+                include_caption=True,
+                use_degradation_vector=False,
+                prompt_variant="condition8_text",
+                restore_input_size=True,
+                seed=42,
+            )
+            command, _ = build_inference_command(
+                args,
+                run_dir,
+                run_dir / "checkpoints" / "checkpoint-00020000",
+                runtime_path,
+            )
+
+        self.assertIn("--prompt_variant", command)
+        self.assertEqual(
+            command[command.index("--prompt_variant") + 1],
+            "condition8_text",
+        )
+        self.assertIn("--include_caption", command)
+        self.assertIn("--full_frame_inference", command)
 
 
 if __name__ == "__main__":

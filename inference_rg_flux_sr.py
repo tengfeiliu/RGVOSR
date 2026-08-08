@@ -28,9 +28,13 @@ from rg_flux_fm import sample_multistep_fm
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 SUGGESTION_PAIRINGS = ("matched", "shuffled")
-SUGGESTION_PROMPT_VARIANTS = {"suggestion", "iqa_suggestion"}
+SUGGESTION_PROMPT_VARIANTS = {
+    "suggestion",
+    "iqa_suggestion",
+    "condition8_text",
+}
 IQA_PAIRINGS = ("matched", "shuffled")
-IQA_PROMPT_VARIANTS = {"iqa", "iqa_suggestion"}
+IQA_PROMPT_VARIANTS = {"iqa", "iqa_suggestion", "condition8_text"}
 
 
 def cfg(config, path, default=None):
@@ -648,7 +652,7 @@ def run_inference_dataset(
             raise ValueError("--suggestion_pairing shuffled requires --jsonl_path.")
         if not uses_suggestion:
             raise ValueError(
-                "--suggestion_pairing shuffled requires prompt_variant suggestion/iqa_suggestion "
+                "--suggestion_pairing shuffled requires prompt_variant suggestion/iqa_suggestion/condition8_text "
                 "or legacy prompt settings that include suggestions."
             )
         missing_suggestions = [
@@ -667,7 +671,7 @@ def run_inference_dataset(
             raise ValueError("--iqa_pairing requires --jsonl_path.")
         if not uses_iqa:
             raise ValueError(
-                "--iqa_pairing requires prompt_variant iqa/iqa_suggestion "
+                "--iqa_pairing requires prompt_variant iqa/iqa_suggestion/condition8_text "
                 "or legacy prompt settings that include IQA."
             )
         missing_iqa = [
@@ -869,6 +873,8 @@ def run_inference_dataset(
         "same_iqa_profile_count": sum(row["same_iqa_profile"] for row in pairing_rows),
         "missing_router_condition_count": missing_router_condition_count,
         "router_missing_condition_policy": "learned_router_fallback",
+        "prompt_variant": args.prompt_variant,
+        "include_caption": bool(args.include_caption),
     }
     return metadata
 
@@ -1024,7 +1030,7 @@ def build_arg_parser():
     )
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--prompt_variant", choices=("fixed", "suggestion", "iqa", "iqa_suggestion"), default=None)
+    parser.add_argument("--prompt_variant", choices=PROMPT_VARIANTS, default=None)
     parser.add_argument(
         "--include_caption",
         action=argparse.BooleanOptionalAction,

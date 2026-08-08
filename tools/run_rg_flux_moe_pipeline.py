@@ -68,7 +68,11 @@ def _sync_text_and_condition_overrides(config, args):
     if prompt_variant is not None:
         condition["prompt_variant"] = prompt_variant
         condition["use_prompt"] = prompt_variant != "fixed"
-        condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
+        condition["use_suggestions"] = prompt_variant in {
+            "suggestion",
+            "iqa_suggestion",
+            "condition8_text",
+        }
         prompt_schedule = condition.get("prompt_schedule")
         if isinstance(prompt_schedule, dict) and cfg_bool(config, "condition.prompt_schedule.enabled", False):
             prompt_schedule["after_variant"] = prompt_variant
@@ -76,6 +80,13 @@ def _sync_text_and_condition_overrides(config, args):
         condition["use_prompt"] = bool(args.use_prompt)
     if args.use_suggestions is not None:
         condition["use_suggestions"] = bool(args.use_suggestions)
+    if getattr(args, "include_caption", None) is not None:
+        condition["include_caption"] = bool(args.include_caption)
+        prompt_schedule = condition.get("prompt_schedule")
+        if isinstance(prompt_schedule, dict) and cfg_bool(
+            config, "condition.prompt_schedule.enabled", False
+        ):
+            prompt_schedule["after_include_caption"] = bool(args.include_caption)
     if args.use_degradation_vector is not None:
         condition["use_degradation_vector"] = bool(args.use_degradation_vector)
     moe = config.setdefault("model", {}).setdefault("lora_moe", {})
@@ -114,6 +125,8 @@ def create_moe_runtime_config(moe_config_path, args, now=None):
     runtime_config["_runtime"]["moe_expert_init_seed"] = int(expert_init_seed)
 
     runtime_config.setdefault("training", {})
+    if getattr(args, "exp_name", None) is not None:
+        runtime_config["training"]["exp_name"] = str(args.exp_name)
     output_root = Path(cfg(runtime_config, "training.output_dir", "exp_rg_flux_sr"))
     exp_name, run_id = resolve_experiment_name(runtime_config, output_root=output_root, now=now)
     runtime_config["training"]["exp_name"] = exp_name
@@ -277,6 +290,11 @@ def build_arg_parser():
         default=None,
         help="Override training suffix so staged runs are easy to distinguish.",
     )
+    parser.add_argument(
+        "--exp_name",
+        default=None,
+        help="Optional deterministic experiment directory name under training.output_dir.",
+    )
     parser.add_argument("--init_device", default="cuda")
     parser.add_argument(
         "--init_seed",
@@ -307,6 +325,12 @@ def build_arg_parser():
     )
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--include_caption",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include the profile caption in both training and inference prompts.",
+    )
     parser.add_argument("--prompt_variant", choices=PROMPT_VARIANTS, default=None)
     parser.add_argument("--use_degradation_vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)

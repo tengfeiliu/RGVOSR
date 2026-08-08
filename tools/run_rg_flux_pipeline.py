@@ -10,7 +10,13 @@ import yaml
 
 
 DEFAULT_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"]
-PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
+PROMPT_VARIANTS = (
+    "fixed",
+    "suggestion",
+    "iqa",
+    "iqa_suggestion",
+    "condition8_text",
+)
 SUGGESTION_PAIRINGS = ("matched", "shuffled")
 IQA_PAIRINGS = ("matched", "shuffled")
 
@@ -94,7 +100,11 @@ def apply_prompt_variant(config, prompt_variant):
     condition = config.setdefault("condition", {})
     condition["prompt_variant"] = prompt_variant
     condition["use_prompt"] = prompt_variant != "fixed"
-    condition["use_suggestions"] = prompt_variant in {"suggestion", "iqa_suggestion"}
+    condition["use_suggestions"] = prompt_variant in {
+        "suggestion",
+        "iqa_suggestion",
+        "condition8_text",
+    }
     if prompt_variant == "fixed":
         condition["include_caption"] = False
     prompt_schedule = condition.get("prompt_schedule")
@@ -115,11 +125,25 @@ def create_runtime_config(
     grad_accum_steps=None,
     image_loss_crop_size=None,
     stage_label=None,
+    include_caption=None,
+    exp_name=None,
 ):
     source_config = load_yaml(train_config_path)
     runtime_config = copy.deepcopy(source_config)
     apply_prompt_variant(runtime_config, prompt_variant)
+    if include_caption is not None:
+        condition = runtime_config.setdefault("condition", {})
+        condition["include_caption"] = bool(include_caption)
+        prompt_schedule = condition.get("prompt_schedule")
+        if isinstance(prompt_schedule, dict) and cfg_bool(
+            runtime_config, "condition.prompt_schedule.enabled", False
+        ):
+            prompt_schedule["after_include_caption"] = bool(include_caption)
+        if cfg(runtime_config, "condition.prompt_variant", None) == "fixed" and include_caption:
+            raise ValueError("prompt_variant=fixed cannot be combined with include_caption=true")
     runtime_config.setdefault("training", {})
+    if exp_name is not None:
+        runtime_config["training"]["exp_name"] = str(exp_name)
     if resume_checkpoint is not None:
         runtime_config["training"]["resume_ckpt"] = str(resume_checkpoint)
         runtime_config["training"]["resume_training_state"] = bool(resume_training_state)
@@ -416,6 +440,12 @@ def build_inference_command(
     _append_optional(cmd, "--iqa_shuffle_seed", iqa_shuffle_seed)
     _append_optional_bool(cmd, "--use_prompt", "--no-use_prompt", args.use_prompt)
     _append_optional_bool(cmd, "--use_suggestions", "--no-use_suggestions", args.use_suggestions)
+    _append_optional_bool(
+        cmd,
+        "--include_caption",
+        "--no-include_caption",
+        getattr(args, "include_caption", None),
+    )
     _append_optional_bool(cmd, "--use_degradation_vector", "--no-use_degradation_vector", args.use_degradation_vector)
     if args.restore_input_size:
         cmd.append("--restore_input_size")
@@ -498,6 +528,12 @@ def build_bad_case_command(args, metrics_dir, bad_cases_dir, inference_manifest=
         "--no-use_suggestions",
         getattr(args, "use_suggestions", None),
     )
+    _append_optional_bool(
+        cmd,
+        "--include_caption",
+        "--no-include_caption",
+        getattr(args, "include_caption", None),
+    )
     return cmd
 
 
@@ -544,6 +580,8 @@ def apply_config_prompt_defaults(args, config):
         args.use_prompt = bool(condition["use_prompt"])
     if args.use_suggestions is None and "use_suggestions" in condition:
         args.use_suggestions = bool(condition["use_suggestions"])
+    if getattr(args, "include_caption", None) is None and "include_caption" in condition:
+        args.include_caption = bool(condition["include_caption"])
     if args.use_degradation_vector is None and "use_degradation_vector" in condition:
         args.use_degradation_vector = bool(condition["use_degradation_vector"])
 
@@ -607,6 +645,11 @@ def build_arg_parser():
         help="Override loss.image_loss_crop_size for a fair control.",
     )
     parser.add_argument("--stage_label", default=None, help="Override training suffix.")
+    parser.add_argument(
+        "--exp_name",
+        default=None,
+        help="Optional deterministic experiment directory name under training.output_dir.",
+    )
     parser.add_argument("--skip_train", action="store_true", help="Skip training and use --run_dir checkpoints.")
     parser.add_argument("--run_dir", default=None, help="Existing run directory, required with --skip_train.")
     parser.add_argument("--checkpoint_steps", nargs="+", required=True, help="Checkpoint steps, e.g. 20000 40000 latest.")
@@ -637,6 +680,12 @@ def build_arg_parser():
     parser.add_argument("--seed", type=int, default=42, help="Inference seed shared by all comparison runs.")
     parser.add_argument("--use_prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--include_caption",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include the profile caption in both training and inference prompts.",
+    )
     parser.add_argument(
         "--prompt_variant",
         choices=PROMPT_VARIANTS,
@@ -715,6 +764,8 @@ def main(argv=None):
             grad_accum_steps=args.grad_accum_steps,
             image_loss_crop_size=args.image_loss_crop_size,
             stage_label=args.stage_label,
+            include_caption=args.include_caption,
+            exp_name=args.exp_name,
         )
         train_cmd = build_train_command(args, runtime_config_path)
         if args.dry_run_pipeline:
@@ -732,9 +783,14 @@ def main(argv=None):
     if args.compare_suggestion_pairing:
         if not args.jsonl_path:
             raise ValueError("--compare_suggestion_pairing requires --jsonl_path.")
-        if args.prompt_variant not in {"suggestion", "iqa_suggestion"}:
+        if args.prompt_variant not in {
+            "suggestion",
+            "iqa_suggestion",
+            "condition8_text",
+        }:
             raise ValueError(
-                "--compare_suggestion_pairing requires --prompt_variant suggestion or iqa_suggestion "
+                "--compare_suggestion_pairing requires --prompt_variant suggestion, iqa_suggestion, "
+                "or condition8_text "
                 "so that changing the suggestion is the intended intervention."
             )
         if args.text_encoding_mode != "online":
@@ -745,9 +801,14 @@ def main(argv=None):
     if args.compare_iqa_pairing:
         if not args.jsonl_path:
             raise ValueError("--compare_iqa_pairing requires --jsonl_path.")
-        if args.prompt_variant not in {"iqa", "iqa_suggestion"}:
+        if args.prompt_variant not in {
+            "iqa",
+            "iqa_suggestion",
+            "condition8_text",
+        }:
             raise ValueError(
-                "--compare_iqa_pairing requires --prompt_variant iqa or iqa_suggestion "
+                "--compare_iqa_pairing requires --prompt_variant iqa, iqa_suggestion, "
+                "or condition8_text "
                 "so that changing the IQA profile is the intended intervention."
             )
         if args.text_encoding_mode != "online":

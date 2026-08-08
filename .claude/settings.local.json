@@ -7,7 +7,9 @@
       "Read(//d/work/code/Z-Image-main/Z-Image-main/**)",
       "Read(//d/work/code/Z-Image-main/Z-Image-main/src/**)",
       "Bash(ls -la /data/code/OMGSR-main/ | head -20)",
-      "Read(//data/code/OMGSR-main/**)"
+      "Read(//data/code/OMGSR-main/**)",
+      "Bash(grep -n \"^#\\\\{1,3\\\\} \" docs/DDA_MoLE_design.md)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

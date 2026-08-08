@@ -32,3 +32,5 @@ eval/
 *.png
 .claude/settings.local.json
 RG-FLUX-SR-MS
+tmp/
+settings.local.json

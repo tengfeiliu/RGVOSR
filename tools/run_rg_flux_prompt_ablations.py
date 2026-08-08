@@ -6,13 +6,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
+SUPPORTED_VARIANTS = (*DEFAULT_VARIANTS, "condition8_text")
 
 
 def normalize_variant(variant):
     normalized = str(variant).strip().lower().replace("-", "_")
-    if normalized not in DEFAULT_VARIANTS:
+    if normalized not in SUPPORTED_VARIANTS:
         raise ValueError(
-            f"Unsupported ablation variant '{variant}'. Expected one of: {', '.join(DEFAULT_VARIANTS)}"
+            f"Unsupported ablation variant '{variant}'. Expected one of: {', '.join(SUPPORTED_VARIANTS)}"
         )
     return normalized
 
@@ -35,7 +36,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run fixed, suggestion, IQA, and IQA+suggestion RG-FLUX-SR ablations sequentially."
     )
-    parser.add_argument("--variants", nargs="+", choices=DEFAULT_VARIANTS, default=list(DEFAULT_VARIANTS))
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=SUPPORTED_VARIANTS,
+        default=list(DEFAULT_VARIANTS),
+    )
     parser.add_argument(
         "pipeline_args",
         nargs=argparse.REMAINDER,

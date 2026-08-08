@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metrics.rg_sr_metrics import IMAGE_EXTENSIONS, LOWER_BETTER_FALLBACKS, parse_name_path
-from models.prompt_builder import DEFAULT_SR_PROMPT, build_sr_prompt
+from models.prompt_builder import DEFAULT_SR_PROMPT, PROMPT_VARIANTS, build_sr_prompt
 
 
 def load_metric_rows(metrics_csv):
@@ -248,6 +248,7 @@ def build_prompt_context(
     use_prompt=True,
     use_suggestions=True,
     prompt_variant=None,
+    include_caption=False,
     case_rows=None,
     lq_indexes=None,
 ):
@@ -275,6 +276,7 @@ def build_prompt_context(
         "use_prompt": bool(use_prompt),
         "use_suggestions": bool(use_suggestions),
         "prompt_variant": prompt_variant,
+        "include_caption": bool(include_caption),
     }
 
 
@@ -307,6 +309,7 @@ def resolve_case_prompt(row, lq_path, prompt_context):
     prompt_variant = prompt_context["prompt_variant"]
     use_prompt = prompt_context["use_prompt"]
     use_suggestions = prompt_context["use_suggestions"]
+    include_caption = prompt_context["include_caption"]
     if profile is None:
         if prompt_variant == "fixed" or not use_prompt:
             return DEFAULT_SR_PROMPT
@@ -321,6 +324,7 @@ def resolve_case_prompt(row, lq_path, prompt_context):
         use_prompt=use_prompt,
         use_suggestions=use_suggestions,
         prompt_variant=prompt_variant,
+        include_caption=include_caption,
     )
 
 
@@ -600,6 +604,7 @@ def run_analysis(
     use_prompt=True,
     use_suggestions=True,
     prompt_variant=None,
+    include_caption=False,
     font_size=40,
 ):
     if not metrics:
@@ -636,6 +641,7 @@ def run_analysis(
         use_prompt=use_prompt,
         use_suggestions=use_suggestions,
         prompt_variant=prompt_variant,
+        include_caption=include_caption,
         case_rows=case_rows,
         lq_indexes=lq_indexes,
     )
@@ -693,8 +699,13 @@ def build_arg_parser():
     parser.add_argument("--use_suggestions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--prompt_variant",
-        choices=("fixed", "suggestion", "iqa", "iqa_suggestion"),
+        choices=PROMPT_VARIANTS,
         default=None,
+    )
+    parser.add_argument(
+        "--include_caption",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument(
         "--font_size",
@@ -723,6 +734,7 @@ def main(argv=None):
         use_prompt=args.use_prompt,
         use_suggestions=args.use_suggestions,
         prompt_variant=args.prompt_variant,
+        include_caption=args.include_caption,
         font_size=args.font_size,
     )
     print(f"Saved bad case analysis to: {args.output_dir}")

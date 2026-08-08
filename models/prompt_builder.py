@@ -1,6 +1,12 @@
 import json
 import re
 
+from models.router_condition import (
+    ROUTER_CONDITION_KEYS,
+    ROUTER_CONDITION_VERSION,
+    extract_router_condition,
+)
+
 
 DEFAULT_SR_PROMPT = (
     "Super-resolve this low-quality image into a high-quality realistic image.\n\n"
@@ -9,7 +15,13 @@ DEFAULT_SR_PROMPT = (
     "Avoid hallucinated details, over-sharpening, and semantic changes."
 )
 
-PROMPT_VARIANTS = ("fixed", "suggestion", "iqa", "iqa_suggestion")
+PROMPT_VARIANTS = (
+    "fixed",
+    "suggestion",
+    "iqa",
+    "iqa_suggestion",
+    "condition8_text",
+)
 IQA_FIELDS = (
     "distortion_location",
     "distortion_severity",
@@ -23,6 +35,25 @@ PROFILE_WORD_LIMITS = {
     "distortion_type": 30,
     "overall_quality": 80,
     "suggestion": 100,
+}
+
+_CONDITION8_LEVELS = (
+    (0.0, "no visible"),
+    (0.1, "subtle"),
+    (0.25, "mild"),
+    (0.5, "moderate"),
+    (0.75, "severe"),
+    (1.0, "extreme"),
+)
+_CONDITION8_PHRASES = {
+    "blur": "blur",
+    "noise": "noise",
+    "compression": "compression artifacts",
+    "ringing_aliasing": "ringing and aliasing artifacts",
+    "texture_loss": "texture loss and detail loss",
+    "photometric": "color distortion and exposure inconsistency",
+    "structure_risk": "risk to text, faces, thin lines, repeated patterns, and geometry",
+    "hallucination_risk": "risk of hallucinated or false details",
 }
 
 
@@ -72,6 +103,43 @@ def normalize_bounded_text(value, max_words):
     return text
 
 
+def _condition8_level(value):
+    value = max(0.0, min(1.0, float(value)))
+    return min(_CONDITION8_LEVELS, key=lambda item: abs(item[0] - value))[1]
+
+
+def condition8_to_canonical_text(condition) -> str:
+    """Convert text8_v1 values into deterministic Text-Encoder input text."""
+    if str(condition.version) != ROUTER_CONDITION_VERSION:
+        raise ValueError(
+            f"Unsupported condition8 version '{condition.version}'; "
+            f"expected {ROUTER_CONDITION_VERSION}"
+        )
+    clauses = []
+    for key, value, valid in zip(
+        ROUTER_CONDITION_KEYS,
+        condition.values,
+        condition.valid_mask,
+    ):
+        if not bool(valid):
+            continue
+        level = _condition8_level(value)
+        clauses.append(f"{level} {_CONDITION8_PHRASES[key]}")
+    if not clauses:
+        raise ValueError(
+            "condition8_text requires at least one recognized IQA/Suggestion condition"
+        )
+    return "; ".join(clauses) + "."
+
+
+def build_condition8_text(profile: dict) -> str:
+    condition = extract_router_condition(
+        profile,
+        version=ROUTER_CONDITION_VERSION,
+    )
+    return condition8_to_canonical_text(condition)
+
+
 def normalized_prompt_profile(profile):
     profile = profile if isinstance(profile, dict) else {}
     source_iqa = profile.get("iqa")
@@ -111,6 +179,11 @@ def validate_prompt_profile(profile, prompt_variant, include_caption=False):
         )
     if prompt_variant in {"suggestion", "iqa_suggestion"} and not normalized["suggestion"]:
         missing.append("suggestion")
+    if prompt_variant == "condition8_text":
+        try:
+            build_condition8_text(profile)
+        except ValueError as exc:
+            missing.append(str(exc))
     if missing:
         raise ValueError(
             f"Profile is missing fields required by prompt variant '{prompt_variant}': "
@@ -155,6 +228,14 @@ def build_sr_prompt(
         parts = [DEFAULT_SR_PROMPT]
         if include_caption:
             parts.extend(["", "Image description:", normalized["caption"]])
+        if prompt_variant == "condition8_text":
+            parts.extend(
+                [
+                    "",
+                    "Canonical degradation and fidelity condition:",
+                    build_condition8_text(profile),
+                ]
+            )
         if prompt_variant in {"iqa", "iqa_suggestion"}:
             _append_iqa(parts, normalized["iqa"])
         if prompt_variant in {"suggestion", "iqa_suggestion"}:

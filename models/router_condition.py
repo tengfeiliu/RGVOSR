@@ -4,9 +4,6 @@ import math
 import re
 from dataclasses import dataclass
 
-import torch
-
-
 ROUTER_CONDITION_VERSION = "text8_v1"
 ROUTER_CONDITION_KEYS = (
     "blur",
@@ -338,9 +335,12 @@ def extract_router_condition(profile, version=ROUTER_CONDITION_VERSION):
 def router_condition_tensors(
     profile,
     device=None,
-    dtype=torch.float32,
+    dtype=None,
     version=ROUTER_CONDITION_VERSION,
 ):
+    import torch
+
+    dtype = torch.float32 if dtype is None else dtype
     condition = extract_router_condition(profile, version=version)
     values = torch.tensor(condition.values, device=device, dtype=dtype)
     valid_mask = torch.tensor(condition.valid_mask, device=device, dtype=dtype)
@@ -349,6 +349,8 @@ def router_condition_tensors(
 
 
 def condition_to_expert_scores(condition, score_matrix=None):
+    import torch
+
     if condition.shape[-1] != len(ROUTER_CONDITION_KEYS):
         raise ValueError(
             f"Expected router condition dimension {len(ROUTER_CONDITION_KEYS)}, "
@@ -365,6 +367,8 @@ def condition_to_expert_scores(condition, score_matrix=None):
 
 
 def condition_to_expert_target(condition, temperature=0.7, score_matrix=None):
+    import torch
+
     temperature = max(float(temperature), 1e-6)
     scores = condition_to_expert_scores(condition.float(), score_matrix=score_matrix)
     return torch.softmax(scores / temperature, dim=-1).to(dtype=condition.dtype)
