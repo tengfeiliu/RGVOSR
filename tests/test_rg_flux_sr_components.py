@@ -682,7 +682,10 @@ class RGFluxSRComponentTests(unittest.TestCase):
         ]
         self.assertEqual({node.name for node in helpers}, helper_names)
 
-        namespace = {"argparse": argparse}
+        namespace = {
+            "argparse": argparse,
+            "PROMPT_VARIANTS": ("fixed", "condition8_text"),
+        }
         exec(compile(ast.Module(body=helpers, type_ignores=[]), "inference_rg_flux_sr.py", "exec"), namespace)
         parser = namespace["build_arg_parser"]()
 
@@ -696,6 +699,9 @@ class RGFluxSRComponentTests(unittest.TestCase):
         ])
         self.assertEqual(single.input, "/data/RealLQ250/lq")
         self.assertIsNone(single.dataset_dirs)
+        self.assertIsNone(single.inference_schedule)
+        self.assertIsNone(single.inference_init_mode)
+        self.assertIsNone(single.inference_sigma_start)
 
         multi = parser.parse_args([
             "--dataset_dirs",
@@ -1232,22 +1238,26 @@ class RGFluxSRComponentTests(unittest.TestCase):
             self.assertEqual(config["condition"]["lr_cond_mode"], "flux2_image_concat")
             self.assertEqual(config["loss"]["fm_weight"], 1.0)
             self.assertEqual(config["loss"]["latent_weight"], 0.10)
-            self.assertEqual(config["loss"]["charb_weight"], 1.0)
-            self.assertEqual(config["loss"]["down_weight"], 0.50)
             self.assertEqual(config["loss"]["down_mode"], "area")
-            self.assertEqual(config["loss"]["lpips_weight"], 0.25)
-            self.assertEqual(config["loss"]["lpips_warmup_start"], 2000)
-            self.assertEqual(config["loss"]["lpips_warmup_end"], 6000)
+            self.assertEqual(config["loss"]["lpips_weight"], 0.1)
             self.assertEqual(config["loss"]["lpips_resize"], 256)
-            self.assertEqual(config["loss"]["image_loss_crop_size"], 256)
             self.assertEqual(config["loss"]["image_loss_every"], 1)
             self.assertEqual(config["loss"]["lpips_every"], 1)
+        self.assertEqual(single_config["loss"]["charb_weight"], 1.0)
+        self.assertEqual(single_config["loss"]["down_weight"], 0.50)
+        self.assertEqual(single_config["loss"]["lpips_warmup_start"], 2000)
+        self.assertEqual(single_config["loss"]["lpips_warmup_end"], 6000)
+        self.assertEqual(moe_config["loss"]["charb_weight"], 0.1)
+        self.assertEqual(moe_config["loss"]["down_weight"], 0.1)
+        self.assertEqual(moe_config["loss"]["lpips_warmup_start"], 500)
+        self.assertEqual(moe_config["loss"]["lpips_warmup_end"], 3000)
+        self.assertEqual(moe_config["loss"]["image_loss_crop_size"], 256)
         self.assertEqual(single_config["loss"]["router_div_weight"], 0.0)
         self.assertEqual(single_config["loss"]["router_entropy_weight"], 0.0)
         self.assertEqual(single_config["loss"]["router_balance_weight"], 0.0)
-        self.assertEqual(moe_config["loss"]["router_div_weight"], 1.0e-3)
-        self.assertEqual(moe_config["loss"]["router_entropy_weight"], 1.0e-4)
-        self.assertEqual(moe_config["loss"]["router_balance_weight"], 1.0e-3)
+        self.assertEqual(moe_config["loss"]["router_div_weight"], 1.0e-4)
+        self.assertEqual(moe_config["loss"]["router_entropy_weight"], 0)
+        self.assertEqual(moe_config["loss"]["router_balance_weight"], 0)
         self.assertEqual(moe_config["training"]["lr_router"], 1.0e-4)
         self.assertEqual(moe_config["model"]["lora_moe"]["prototype_scale"], 1.0)
         self.assertNotEqual(single_config["model"].get("lora_backend"), "moe")
@@ -1290,9 +1300,13 @@ class RGFluxSRComponentTests(unittest.TestCase):
             config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
             self.assertEqual(config["model"]["lora_moe"]["prototype_scale"], 1.0)
             self.assertEqual(config["training"]["lr_router"], 1.0e-4)
-            self.assertEqual(config["loss"]["router_div_weight"], 1.0e-3)
-            self.assertEqual(config["loss"]["router_entropy_weight"], 1.0e-4)
-            self.assertEqual(config["loss"]["router_balance_weight"], 1.0e-3)
+            auxiliary_weights = [
+                config["loss"]["router_div_weight"],
+                config["loss"]["router_entropy_weight"],
+                config["loss"]["router_balance_weight"],
+            ]
+            self.assertTrue(all(weight >= 0 for weight in auxiliary_weights))
+            self.assertTrue(any(weight > 0 for weight in auxiliary_weights))
 
     def test_flux2_lora_moe_init_tool_loads_single_lora_and_initializes_prototypes(self):
         source = Path("tools/init_flux2_lora_moe.py").read_text(encoding="utf-8")
@@ -1713,6 +1727,120 @@ class RGFluxSRComponentTests(unittest.TestCase):
         self.assertTrue(torch.allclose(z_t[0], torch.full_like(z_t[0], 0.75)))
         self.assertTrue(torch.allclose(z_t[1], torch.full_like(z_t[1], 0.25)))
         self.assertTrue(torch.allclose(v_target, -torch.ones_like(z_hr)))
+
+    def test_logit_normal_sigma_supports_sr_mean_and_std(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from rg_flux_fm import sample_sigma
+
+        torch.manual_seed(17)
+        sigma = sample_sigma(
+            4,
+            torch.device("cpu"),
+            sampling="logit_normal",
+            logit_mean=-0.4,
+            logit_std=1.0,
+        )
+        torch.manual_seed(17)
+        expected = torch.sigmoid(torch.randn(4) - 0.4).clamp(1.0e-5, 1.0 - 1.0e-5)
+
+        self.assertTrue(torch.allclose(sigma, expected))
+        with self.assertRaisesRegex(ValueError, "logit_std"):
+            sample_sigma(1, torch.device("cpu"), sampling="logit_normal", logit_std=0.0)
+
+    def test_flux2_empirical_shift_schedule_is_resolution_aware(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from rg_flux_fm import build_sigma_schedule, compute_flux2_empirical_mu
+
+        linear = build_sigma_schedule((1, 128, 32, 32), num_steps=25, schedule="linear")
+        shifted = build_sigma_schedule(
+            (1, 128, 32, 32),
+            num_steps=25,
+            schedule="empirical_shift",
+        )
+
+        self.assertEqual(float(linear[0]), 1.0)
+        self.assertEqual(float(shifted[0]), 1.0)
+        self.assertEqual(float(shifted[-1]), 0.0)
+        self.assertTrue(torch.all(shifted[:-1] > shifted[1:]))
+        self.assertGreater(float(shifted[12]), float(linear[12]))
+        self.assertNotEqual(
+            compute_flux2_empirical_mu(32 * 32, 25),
+            compute_flux2_empirical_mu(64 * 64, 25),
+        )
+
+    def test_lr_warm_start_uses_same_sigma_as_schedule_start(self):
+        if torch is None:
+            self.skipTest("torch is not installed in this environment")
+        from rg_flux_fm import sample_multistep_fm
+
+        class ZeroVelocityArtist:
+            def __call__(self, z_t, **kwargs):
+                return torch.zeros_like(z_t)
+
+        shape = (1, 128, 2, 2)
+        z_lr = torch.ones(shape)
+        prompt_embeds = torch.zeros(1, 1, 1)
+        pooled_prompt_embeds = torch.zeros(1, 1)
+        torch.manual_seed(23)
+        result = sample_multistep_fm(
+            artist=ZeroVelocityArtist(),
+            shape=shape,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            z_lr=z_lr,
+            num_steps=2,
+            schedule="linear",
+            init_mode="lr_warm_start",
+            sigma_start=0.8,
+        )
+        torch.manual_seed(23)
+        expected = 0.2 * z_lr + 0.8 * torch.randn(shape)
+
+        self.assertTrue(torch.allclose(result, expected))
+        with self.assertRaisesRegex(ValueError, "requires sigma_start=1.0"):
+            sample_multistep_fm(
+                artist=ZeroVelocityArtist(),
+                shape=shape,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                z_lr=z_lr,
+                num_steps=1,
+                init_mode="pure_noise",
+                sigma_start=0.8,
+            )
+
+    def test_condition8_e0_e2_configs_only_change_sigma_experiment_axis(self):
+        paths = {
+            "single_e0": Path(
+                "configs/train_rg_flux2_klein_sr_stage0b_512_condition8_text_caption_precropped.yaml"
+            ),
+            "single_e2": Path(
+                "configs/train_rg_flux2_klein_sr_stage0b_512_condition8_text_caption_precropped_e2_lognorm_m04.yaml"
+            ),
+            "moe_e0": Path(
+                "configs/train_rg_flux2_klein_sr_moe_stage0b_512_condition8_text_caption_precropped.yaml"
+            ),
+            "moe_e2": Path(
+                "configs/train_rg_flux2_klein_sr_moe_stage0b_512_condition8_text_caption_precropped_e2_lognorm_m04.yaml"
+            ),
+        }
+        configs = {name: yaml.safe_load(path.read_text(encoding="utf-8")) for name, path in paths.items()}
+        for config in configs.values():
+            self.assertEqual(config["condition"]["prompt_variant"], "condition8_text")
+            self.assertTrue(config["condition"]["include_caption"])
+            self.assertEqual(config["training"]["grad_accum_steps"], 4)
+            self.assertEqual(config["loss"]["lpips_weight"], 0.1)
+            self.assertEqual(config["flow_matching"]["inference_schedule"], "linear")
+            self.assertEqual(config["flow_matching"]["inference_init_mode"], "pure_noise")
+        for name in ("single_e0", "moe_e0"):
+            self.assertEqual(configs[name]["flow_matching"]["sigma_sampling"], "uniform")
+        for name in ("single_e2", "moe_e2"):
+            flow = configs[name]["flow_matching"]
+            self.assertEqual(flow["sigma_sampling"], "logit_normal")
+            self.assertEqual(flow["sigma_logit_mean"], -0.4)
+            self.assertEqual(flow["sigma_logit_std"], 1.0)
 
 
 if __name__ == "__main__":

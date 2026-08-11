@@ -111,10 +111,12 @@ training:
   lr_num_cycles: 1
   resume_ckpt: null
   auto_resume: false
-  suffix: "_flux2_klein_lora_moe_stage0b512_condition8_text_caption_precropped_e0_uniform"
+  suffix: "_flux2_klein_lora_moe_stage0b512_condition8_text_caption_precropped_e2_lognorm_m04"
 
 flow_matching:
-  sigma_sampling: uniform
+  sigma_sampling: logit_normal
+  sigma_logit_mean: -0.4
+  sigma_logit_std: 1.0
   prediction_type: velocity
   timestep_conversion: sigma
   num_inference_steps: 25

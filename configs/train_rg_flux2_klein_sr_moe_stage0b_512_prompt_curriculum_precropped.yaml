@@ -90,9 +90,9 @@ training:
   lr_lora: 1.0e-4
   lr_router: 1.0e-4
   weight_decay: 0.01
-  grad_accum_steps: 1
-  save_every: 1000
-  log_every: 1000
+  grad_accum_steps: 4
+  save_every: 4000
+  log_every: 4000
   loss_record_every: 1
   loss_record_formats: [jsonl, csv]
   output_dir: exp_rg_flux_sr
@@ -135,11 +135,11 @@ loss:
   charb_weight: 0.10
   down_weight: 0.10
   down_mode: area
-  lpips_weight: 0
-  lpips_warmup_start: 2000
-  lpips_warmup_end: 6000
+  lpips_weight: 0.1
+  lpips_warmup_start: 500
+  lpips_warmup_end: 3000
   lpips_resize: 256
-  image_loss_crop_size: 256
+  image_loss_crop_size: 512
   image_loss_every: 1
   lpips_every: 1
   router_div_weight: 0

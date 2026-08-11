@@ -227,6 +227,7 @@ def write_inference_manifest(
     iqa_shuffle_seed=None,
     dataset_metadata=None,
     moe_routing=None,
+    sampling=None,
 ):
     manifest_path = Path(manifest_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +255,8 @@ def write_inference_manifest(
         payload["iqa_shuffle_seed"] = iqa_shuffle_seed
     if moe_routing is not None:
         payload["moe_routing"] = moe_routing
+    if sampling is not None:
+        payload["sampling"] = sampling
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     return payload
@@ -843,6 +846,9 @@ def run_inference_dataset(
                 router_condition_mask=router_condition_mask,
                 router_condition_confidence=router_condition_confidence,
                 num_steps=args.num_inference_steps,
+                schedule=args.inference_schedule,
+                init_mode=args.inference_init_mode,
+                sigma_start=args.inference_sigma_start,
                 device=device,
                 dtype=dtype,
             )
@@ -885,6 +891,18 @@ def main(args):
     config.setdefault("data", {})
     config.setdefault("condition", {})
     config.setdefault("text_encoding", {})
+    args.inference_schedule = args.inference_schedule or cfg(
+        config, "flow_matching.inference_schedule", "linear"
+    )
+    args.inference_init_mode = args.inference_init_mode or cfg(
+        config, "flow_matching.inference_init_mode", "pure_noise"
+    )
+    if args.inference_sigma_start is None:
+        args.inference_sigma_start = float(
+            cfg(config, "flow_matching.inference_sigma_start", 1.0)
+        )
+    if args.inference_init_mode == "pure_noise" and args.inference_sigma_start != 1.0:
+        raise ValueError("--inference_init_mode pure_noise requires --inference_sigma_start 1.0.")
     if getattr(args, "full_frame_inference", False):
         config["data"]["pre_cropped"] = False
     config["condition"]["lr_cond_mode"] = args.lr_cond_mode or cfg(config, "condition.lr_cond_mode", "latent_adapter")
@@ -988,6 +1006,13 @@ def main(args):
         iqa_shuffle_seed=(args.iqa_shuffle_seed if args.iqa_pairing == "shuffled" else None),
         dataset_metadata=dataset_metadata,
         moe_routing=moe_inference_schedule,
+        sampling={
+            "num_inference_steps": args.num_inference_steps,
+            "schedule": args.inference_schedule,
+            "init_mode": args.inference_init_mode,
+            "sigma_start": args.inference_sigma_start,
+            "seed": args.seed,
+        },
     )
 
 
@@ -1023,6 +1048,24 @@ def build_arg_parser():
     parser.add_argument("--text_encoding_mode", choices=["online", "cached", "auto"], default=None)
     parser.add_argument("--text_embedding_cache", default=None)
     parser.add_argument("--num_inference_steps", type=int, default=25)
+    parser.add_argument(
+        "--inference_schedule",
+        choices=["linear", "empirical_shift"],
+        default=None,
+        help="Euler sigma schedule; empirical_shift uses FLUX.2 Klein's resolution-aware dynamic shift.",
+    )
+    parser.add_argument(
+        "--inference_init_mode",
+        choices=["pure_noise", "lr_warm_start"],
+        default=None,
+        help="Initialize from pure noise or from a noise-mixed LR latent prior.",
+    )
+    parser.add_argument(
+        "--inference_sigma_start",
+        type=float,
+        default=None,
+        help="Starting sigma. Use 1.0 for pure noise and a value below 1 for LR warm-start.",
+    )
     parser.add_argument(
         "--lr_cond_mode",
         choices=["latent_adapter", "latent_concat", "flux2_image_concat"],

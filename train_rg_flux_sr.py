@@ -1266,6 +1266,23 @@ def run_rg_flux_evaluation(
     router_input_mode = str(cfg(config, "model.lora_moe.router_input_mode", "prompt_lr"))
     use_router_condition = router_input_mode in {"condition8", "condition8_timestep"}
     num_inference_steps = int(cfg(config, "evaluation.num_inference_steps", cfg(config, "flow_matching.num_inference_steps", 25)))
+    inference_schedule = cfg(
+        config,
+        "evaluation.inference_schedule",
+        cfg(config, "flow_matching.inference_schedule", "linear"),
+    )
+    inference_init_mode = cfg(
+        config,
+        "evaluation.inference_init_mode",
+        cfg(config, "flow_matching.inference_init_mode", "pure_noise"),
+    )
+    inference_sigma_start = float(
+        cfg(
+            config,
+            "evaluation.inference_sigma_start",
+            cfg(config, "flow_matching.inference_sigma_start", 1.0),
+        )
+    )
     eval_seed = int(cfg(config, "evaluation.seed", cfg(config, "training.seed", 42) or 42))
     eval_prompt_schedule = resolve_prompt_schedule(config)
     eval_prompt_condition = prompt_variant_for_step(
@@ -1363,6 +1380,9 @@ def run_rg_flux_evaluation(
                         router_condition_mask=router_condition_mask,
                         router_condition_confidence=router_condition_confidence,
                         num_steps=num_inference_steps,
+                        schedule=inference_schedule,
+                        init_mode=inference_init_mode,
+                        sigma_start=inference_sigma_start,
                         device=accelerator.device,
                         dtype=weight_dtype,
                     )
@@ -1745,6 +1765,8 @@ def main(config_path, dry_run=False):
         else None
     )
     sigma_sampling = cfg(config, "flow_matching.sigma_sampling", "uniform")
+    sigma_logit_mean = float(cfg(config, "flow_matching.sigma_logit_mean", 0.0))
+    sigma_logit_std = float(cfg(config, "flow_matching.sigma_logit_std", 1.0))
     lr_cond_mode = cfg(config, "condition.lr_cond_mode", "latent_adapter")
     text_encoding_mode = normalize_text_encoding_mode(config)
     fixed_prompt_embedding_cache = {}
@@ -1825,7 +1847,13 @@ def main(config_path, dry_run=False):
                 else:
                     prompt_embeds, pooled_prompt_embeds, text_ids = cached_fixed_state
                 dino_tokens = unwrapped_artist.extract_visual_tokens(lq_up)
-                sigma = sample_sigma(z_hr.shape[0], z_hr.device, sampling=sigma_sampling).to(dtype=weight_dtype)
+                sigma = sample_sigma(
+                    z_hr.shape[0],
+                    z_hr.device,
+                    sampling=sigma_sampling,
+                    logit_mean=sigma_logit_mean,
+                    logit_std=sigma_logit_std,
+                ).to(dtype=weight_dtype)
                 eps = torch.randn_like(z_hr)
                 z_t, v_target = build_flow_matching_inputs(z_hr, eps=eps, sigma=sigma)
 
