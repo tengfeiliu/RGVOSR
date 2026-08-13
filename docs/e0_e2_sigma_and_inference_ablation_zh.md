@@ -16,10 +16,14 @@ INFERENCE_JSONL=datasets/inference.iqa_caption_suggestion.jsonl
 ACCELERATE_CONFIG=configs/accelerate/zero3_bf16_param_offload.yaml
 ```
 
+所有任务均通过 `nohup + conda run -n sr-flux2` 在后台运行。单卡环境不要同时启动多条训练或推理命令；等待上一条释放显存后再启动下一条。
+
 ## 1. Single E0
 
 ```bash
-python tools/run_rg_flux_pipeline.py \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python tools/run_rg_flux_pipeline.py \
   --train_config configs/train_rg_flux2_klein_sr_stage0b_512_condition8_text_caption_precropped.yaml \
   --exp_name rgflux_c8_single_e0_uniform_seed42 \
   --accelerate_config "$ACCELERATE_CONFIG" --num_processes 1 \
@@ -31,13 +35,16 @@ python tools/run_rg_flux_pipeline.py \
   --num_inference_steps 25 --inference_schedule linear \
   --inference_init_mode pure_noise --inference_sigma_start 1.0 \
   --upscale 4 --dtype bf16 --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda \
+  > /root/autodl-tmp/rgflux_c8_single_e0_uniform_seed42.log 2>&1 < /dev/null &
 ```
 
 ## 2. Single E2
 
 ```bash
-python tools/run_rg_flux_pipeline.py \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python tools/run_rg_flux_pipeline.py \
   --train_config configs/train_rg_flux2_klein_sr_stage0b_512_condition8_text_caption_precropped_e2_lognorm_m04.yaml \
   --exp_name rgflux_c8_single_e2_lognorm_m04_seed42 \
   --accelerate_config "$ACCELERATE_CONFIG" --num_processes 1 \
@@ -49,7 +56,8 @@ python tools/run_rg_flux_pipeline.py \
   --num_inference_steps 25 --inference_schedule linear \
   --inference_init_mode pure_noise --inference_sigma_start 1.0 \
   --upscale 4 --dtype bf16 --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda \
+  > /root/autodl-tmp/rgflux_c8_single_e2_lognorm_m04_seed42.log 2>&1 < /dev/null &
 ```
 
 ## 3. MoE E0
@@ -57,7 +65,9 @@ python tools/run_rg_flux_pipeline.py \
 此命令使用对应的 Single E0 最终 checkpoint 初始化 MoE。
 
 ```bash
-python tools/run_rg_flux_moe_pipeline.py \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python tools/run_rg_flux_moe_pipeline.py \
   --moe_config configs/train_rg_flux2_klein_sr_moe_stage0b_512_condition8_text_caption_precropped.yaml \
   --exp_name rgflux_c8_moe_e0_uniform_seed42 \
   --single_lora_run_dir exp_rg_flux_sr/rgflux_c8_single_e0_uniform_seed42 \
@@ -73,7 +83,8 @@ python tools/run_rg_flux_moe_pipeline.py \
   --num_inference_steps 25 --inference_schedule linear \
   --inference_init_mode pure_noise --inference_sigma_start 1.0 \
   --upscale 4 --dtype bf16 --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda \
+  > /root/autodl-tmp/rgflux_c8_moe_e0_uniform_seed42.log 2>&1 < /dev/null &
 ```
 
 ## 4. MoE E2
@@ -81,7 +92,9 @@ python tools/run_rg_flux_moe_pipeline.py \
 此命令使用对应的 Single E2 最终 checkpoint 初始化 MoE，因此衡量的是 E2 在完整 Single→MoE 链路上的累计效果。
 
 ```bash
-python tools/run_rg_flux_moe_pipeline.py \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python tools/run_rg_flux_moe_pipeline.py \
   --moe_config configs/train_rg_flux2_klein_sr_moe_stage0b_512_condition8_text_caption_precropped_e2_lognorm_m04.yaml \
   --exp_name rgflux_c8_moe_e2_lognorm_m04_seed42 \
   --single_lora_run_dir exp_rg_flux_sr/rgflux_c8_single_e2_lognorm_m04_seed42 \
@@ -97,7 +110,8 @@ python tools/run_rg_flux_moe_pipeline.py \
   --num_inference_steps 25 --inference_schedule linear \
   --inference_init_mode pure_noise --inference_sigma_start 1.0 \
   --upscale 4 --dtype bf16 --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal --metric_device cuda \
+  > /root/autodl-tmp/rgflux_c8_moe_e2_lognorm_m04_seed42.log 2>&1 < /dev/null &
 ```
 
 若要只隔离“MoE 阶段 sigma 采样”的影响，应让 MoE E0/E2 都从同一个 Single checkpoint 初始化；将两条 MoE 命令的 `--single_lora_run_dir` 和 `--single_lora_checkpoint_step` 设成相同值即可。
@@ -124,33 +138,54 @@ COMMON_INFER_ARGS=(
 Linear + pure noise（基线）：
 
 ```bash
-python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
   --output_dir "$RUN_DIR/inference_ablation/linear_pure_noise" \
-  --inference_schedule linear --inference_init_mode pure_noise --inference_sigma_start 1.0
+  --inference_schedule linear --inference_init_mode pure_noise --inference_sigma_start 1.0 \
+  > /root/autodl-tmp/infer_linear_pure_noise.log 2>&1 < /dev/null &
 ```
 
 Empirical shift + pure noise（与上一条隔离 schedule）：
 
 ```bash
-python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
   --output_dir "$RUN_DIR/inference_ablation/empirical_shift_pure_noise" \
-  --inference_schedule empirical_shift --inference_init_mode pure_noise --inference_sigma_start 1.0
+  --inference_schedule empirical_shift --inference_init_mode pure_noise --inference_sigma_start 1.0 \
+  > /root/autodl-tmp/infer_empirical_shift_pure_noise.log 2>&1 < /dev/null &
 ```
 
 Linear + LR warm-start：
 
 ```bash
-python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
   --output_dir "$RUN_DIR/inference_ablation/linear_lr_warm_start_s08" \
-  --inference_schedule linear --inference_init_mode lr_warm_start --inference_sigma_start 0.8
+  --inference_schedule linear --inference_init_mode lr_warm_start --inference_sigma_start 0.8 \
+  > /root/autodl-tmp/infer_linear_lr_warm_start_s08.log 2>&1 < /dev/null &
 ```
 
 Empirical shift + LR warm-start：
 
 ```bash
-python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
+nohup env HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  conda run -n sr-flux2 --no-capture-output \
+  python inference_rg_flux_sr.py "${COMMON_INFER_ARGS[@]}" \
   --output_dir "$RUN_DIR/inference_ablation/empirical_shift_lr_warm_start_s08" \
-  --inference_schedule empirical_shift --inference_init_mode lr_warm_start --inference_sigma_start 0.8
+  --inference_schedule empirical_shift --inference_init_mode lr_warm_start --inference_sigma_start 0.8 \
+  > /root/autodl-tmp/infer_empirical_shift_lr_warm_start_s08.log 2>&1 < /dev/null &
 ```
 
 `sigma_start=0.8` 是首轮实验点，不应直接视作最优值。如果 warm-start 胜出，再固定 checkpoint、schedule 和 seed，小范围测试 `0.7/0.8/0.9`。每个 `inference_manifest.json` 都会记录 schedule、init mode、sigma start、步数和 seed。
+
+## 查看后台日志
+
+```bash
+tail -f /root/autodl-tmp/rgflux_c8_single_e0_uniform_seed42.log
+tail -f /root/autodl-tmp/rgflux_c8_single_e2_lognorm_m04_seed42.log
+tail -f /root/autodl-tmp/rgflux_c8_moe_e0_uniform_seed42.log
+tail -f /root/autodl-tmp/rgflux_c8_moe_e2_lognorm_m04_seed42.log
+```
