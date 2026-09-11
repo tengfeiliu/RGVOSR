@@ -518,6 +518,8 @@ def run_inference_dataset(
     device,
     dtype,
     lr_cond_mode,
+    anchor_path_resolver=None,
+    refinement_round=None,
 ):
     image_paths = list_images(input_path)
     if not image_paths:
@@ -803,6 +805,25 @@ def run_inference_dataset(
                 lq_up,
                 sample=lr_cond_mode != "flux2_image_concat",
             ).to(device=device, dtype=dtype)
+            z_anchor_lr = None
+            if anchor_path_resolver is not None:
+                anchor_path = anchor_path_resolver(image_path, dataset_name, condition)
+                if anchor_path is None:
+                    raise ValueError(
+                        "Refinement inference requires an original-LR anchor for every image; "
+                        f"missing anchor for {image_path}"
+                    )
+                anchor_up_pil, _, anchor_up = prepare_lq_up(
+                    anchor_path,
+                    upscale=1 if pre_cropped else args.upscale,
+                    align=int(cfg(config, "data.vae_align", 16)),
+                    min_size=args.min_size,
+                )
+                del anchor_up_pil
+                z_anchor_lr = artist.encode_images(
+                    anchor_up.to(device=device, dtype=dtype),
+                    sample=lr_cond_mode != "flux2_image_concat",
+                ).to(device=device, dtype=dtype)
             cache_image_key = str(image_path)
             if isinstance(condition, dict):
                 record = condition.get("record")
@@ -840,8 +861,10 @@ def run_inference_dataset(
                 text_ids=text_ids,
                 degradation_vector=degradation_vector,
                 z_lr=z_lr,
+                z_anchor_lr=z_anchor_lr,
                 dino_tokens=dino_tokens,
                 lr_cond_mode=lr_cond_mode,
+                refinement_round=refinement_round,
                 router_condition=router_condition,
                 router_condition_mask=router_condition_mask,
                 router_condition_confidence=router_condition_confidence,

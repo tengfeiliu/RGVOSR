@@ -106,7 +106,15 @@ def _lora_parameter_name(name):
 
 
 def _adapter_parameter_name(name):
-    return any(key in name for key in ("degradation_encoder", "lr_condition_encoder", "visual_condition_adapter"))
+    return any(
+        key in name
+        for key in (
+            "degradation_encoder",
+            "lr_condition_encoder",
+            "visual_condition_adapter",
+            "refinement_condition_adapter",
+        )
+    )
 
 
 def _maybe_gathered_parameters(parameters):

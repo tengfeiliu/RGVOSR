@@ -345,6 +345,17 @@ def run_iterative_inference(args):
         "metric_trends": str(trend_path),
         "rounds": [],
     }
+    if args.refiner_checkpoint:
+        if not bool(cfg(config, "condition.refinement.enabled", False)):
+            raise ValueError(
+                "--refiner_checkpoint requires condition.refinement.enabled: true in --config. "
+                "Use configs/rl_sr_refinement_flux2_klein_moe.yaml after setting its runtime paths."
+            )
+        manifest["refinement"] = {
+            "checkpoint": str(Path(args.refiner_checkpoint)),
+            "start_round": int(args.refiner_start_round),
+            "state": "current SR y_k plus original LR anchor x",
+        }
     _write_json_atomic(manifest_path, manifest)
 
     artist = None
@@ -366,6 +377,18 @@ def run_iterative_inference(args):
         base_condition_index = load_jsonl_conditions(args.jsonl_path)
         current_inputs = {name: Path(path) for name, path in source_datasets}
         lr_cond_mode = config["condition"]["lr_cond_mode"]
+        refiner_loaded = False
+
+        def original_anchor_for(image_path, dataset_name, _condition):
+            matches = [
+                row for row in lineage
+                if row["dataset"] == dataset_name and row["sample_id"] == Path(image_path).stem
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Cannot resolve unique original LR anchor for dataset={dataset_name}, image={image_path}"
+                )
+            return Path(matches[0]["source_path"])
 
         for round_number in range(1, args.iterations + 1):
             round_name = f"round_{round_number:02d}"
@@ -378,6 +401,15 @@ def run_iterative_inference(args):
             _set_seed(round_seed)
             round_args = copy.copy(args)
             round_args.upscale = int(args.upscale) if round_number == 1 else 1
+            use_refinement = bool(
+                args.refiner_checkpoint and round_number >= int(args.refiner_start_round)
+            )
+            if use_refinement and not refiner_loaded:
+                artist.load_trainable(args.refiner_checkpoint, is_trainable=False)
+                if hasattr(artist, "align_inference_dtype"):
+                    artist.align_inference_dtype(dtype=dtype)
+                artist.eval()
+                refiner_loaded = True
             condition_index = _build_round_condition_index(
                 base_condition_index,
                 lineage,
@@ -400,6 +432,8 @@ def run_iterative_inference(args):
                     device=device,
                     dtype=dtype,
                     lr_cond_mode=lr_cond_mode,
+                    anchor_path_resolver=original_anchor_for if use_refinement else None,
+                    refinement_round=round_number if use_refinement else None,
                 )
                 round_datasets.append((dataset_name, input_path, dataset_output_dir))
 
@@ -440,6 +474,7 @@ def run_iterative_inference(args):
                     "sigma_start": round_args.inference_sigma_start,
                     "seed": round_seed,
                     "input_upscale": round_args.upscale,
+                    "uses_refinement_adapter": use_refinement,
                 },
             )
 
@@ -472,6 +507,7 @@ def run_iterative_inference(args):
                 {
                     "round": round_number,
                     "input_upscale": round_args.upscale,
+                    "uses_refinement_adapter": use_refinement,
                     "seed": round_seed,
                     "input_dirs": {
                         name: str(path) for name, path in current_inputs.items()
@@ -509,6 +545,20 @@ def build_arg_parser():
         type=int,
         default=3,
         help="Total number of complete inference rounds (default: 3).",
+    )
+    parser.add_argument(
+        "--refiner_checkpoint",
+        default=None,
+        help=(
+            "Optional shared G_phi refinement adapter. Round 1 uses --checkpoint/F0; "
+            "later rounds use this adapter with current SR plus the original-LR anchor."
+        ),
+    )
+    parser.add_argument(
+        "--refiner_start_round",
+        type=int,
+        default=2,
+        help="First round that loads --refiner_checkpoint (default: 2).",
     )
     parser.add_argument(
         "--round_seed_mode",

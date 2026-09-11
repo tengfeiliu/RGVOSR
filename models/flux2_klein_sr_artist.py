@@ -39,6 +39,7 @@ from models.router_condition import (
     ROUTER_CONDITION_VERSION,
     condition_to_expert_target,
 )
+from models.sr_refinement_condition import SRRefinementConditionAdapter
 from models.text_embedding_cache import normalize_text_encoding_mode, text_encoder_should_load
 from models.visual_condition_adapter import VisualConditionAdapter
 from rg_flux_fm import convert_sigma_to_flux_timestep
@@ -166,6 +167,7 @@ class Flux2KleinSRArtist(nn.Module):
         self.latent_mean = None
         self.latent_std = None
         self.moe_router = None
+        self.refinement_condition_adapter = None
         self.moe_routing_mode = "soft"
         self.moe_temperature = float(_cfg(config, "model.lora_moe.init_temperature", 2.0))
         self.moe_top_k = int(_cfg(config, "model.lora_moe.top_k", 2))
@@ -200,7 +202,12 @@ class Flux2KleinSRArtist(nn.Module):
         if self.transformer is not None:
             self.transformer.to(dtype=dtype)
             device = _module_device(self.transformer)
-        for module in (self.degradation_encoder, self.lr_condition_encoder, self.visual_condition_adapter):
+        for module in (
+            self.degradation_encoder,
+            self.lr_condition_encoder,
+            self.visual_condition_adapter,
+            self.refinement_condition_adapter,
+        ):
             if module is not None:
                 module.to(device=device, dtype=dtype)
         if self.moe_router is not None:
@@ -312,6 +319,14 @@ class Flux2KleinSRArtist(nn.Module):
             num_tokens=int(_cfg(self.config, "condition.visual_token_count", 64)),
             dropout=condition_dropout,
         )
+        if bool(_cfg(self.config, "condition.refinement.enabled", False)):
+            self.refinement_condition_adapter = SRRefinementConditionAdapter(
+                latent_channels=self.latent_channels,
+                context_dim=self.context_dim,
+                anchor_tokens=int(_cfg(self.config, "condition.refinement.anchor_tokens", 8)),
+                dropout=float(_cfg(self.config, "condition.refinement.dropout", condition_dropout)),
+                max_round=int(_cfg(self.config, "condition.refinement.max_round", 16)),
+            )
 
     def _resolve_lora_targets(self):
         configured = _cfg(self.config, "model.lora_target_modules", None)
@@ -638,7 +653,14 @@ class Flux2KleinSRArtist(nn.Module):
             self.transformer.requires_grad_(True)
         self._apply_lora()
 
-        for module in (self.degradation_encoder, self.lr_condition_encoder, self.visual_condition_adapter):
+        for module in (
+            self.degradation_encoder,
+            self.lr_condition_encoder,
+            self.visual_condition_adapter,
+            self.refinement_condition_adapter,
+        ):
+            if module is None:
+                continue
             module.train()
             module.requires_grad_(True)
         if self.moe_router is not None:
@@ -825,7 +847,15 @@ class Flux2KleinSRArtist(nn.Module):
         z_lr=None,
         dino_tokens=None,
         lr_cond_mode="latent_adapter",
+        z_anchor_lr=None,
+        refinement_round=None,
     ):
+        if self.refinement_condition_adapter is not None:
+            prompt_embeds = self.refinement_condition_adapter(
+                prompt_embeds,
+                z_anchor_lr=z_anchor_lr,
+                refinement_round=refinement_round,
+            )
         batch_size = prompt_embeds.shape[0]
         context = [prompt_embeds]
         ids = [
@@ -889,6 +919,8 @@ class Flux2KleinSRArtist(nn.Module):
         z_lr=None,
         dino_tokens=None,
         lr_cond_mode=None,
+        z_anchor_lr=None,
+        refinement_round=None,
         router_condition=None,
         router_condition_mask=None,
         router_condition_confidence=None,
@@ -903,6 +935,8 @@ class Flux2KleinSRArtist(nn.Module):
             z_lr=z_lr,
             dino_tokens=dino_tokens,
             lr_cond_mode=lr_cond_mode,
+            z_anchor_lr=z_anchor_lr,
+            refinement_round=refinement_round,
         )
 
         img_ids = _latent_image_ids(bsz, height, width, z_t.device, hidden_states.dtype)

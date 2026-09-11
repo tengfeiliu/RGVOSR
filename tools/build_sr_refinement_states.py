@@ -1,0 +1,221 @@
+"""Build portable (x, y_k) refinement states from iterative-inference lineage.
+
+Example (the three roots only supply portable keys; they do not enter hashes):
+
+python tools/build_sr_refinement_states.py \
+  --lineage_jsonl runs/iterative/sample_lineage.jsonl \
+  --source_jsonl datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl \
+  --dataset_id lsdir_precrop512_v1 --lr_root datasets/LSDIR_precrop512 \
+  --hr_root datasets/LSDIR_precrop512 --artifact_root runs/iterative \
+  --producer_adapter artifacts/f0/rg_flux_adapters --output_jsonl artifacts/states.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from models.prompt_builder import build_sr_prompt
+from models.router_condition import ROUTER_CONDITION_VERSION, extract_router_condition
+from rl_sr.artifact_store import read_jsonl, write_jsonl_atomic
+from rl_sr.schema import (
+    RuntimePaths,
+    StateRecord,
+    build_sample_key,
+    canonical_json,
+    content_sha256,
+    adapter_content_sha256,
+    identity_sha256,
+    normalize_relative_key,
+)
+
+
+def _absolute(path):
+    return Path(path).expanduser().resolve()
+
+
+def _portable_key(path, roots):
+    path = _absolute(path)
+    for namespace, root in roots:
+        try:
+            return normalize_relative_key(Path(namespace) / path.relative_to(root))
+        except ValueError:
+            continue
+    configured = ", ".join(f"{name}={root}" for name, root in roots)
+    raise ValueError(
+        f"Artifact {path} is outside the registered roots ({configured}). "
+        "Add its mount with --lr_root, --hr_root, or --artifact_root; do not use an absolute path as identity."
+    )
+
+
+def _geometry_sha256(path):
+    with Image.open(path) as image:
+        image.load()
+        payload = {"mode": image.mode, "width": image.width, "height": image.height}
+    return identity_sha256(payload)
+
+
+def _index_source_rows(source_jsonl):
+    index = {}
+    for row in read_jsonl(source_jsonl):
+        lq_path = row.get("lq_path")
+        if not lq_path:
+            continue
+        resolved = str(_absolute(lq_path))
+        if resolved in index:
+            raise ValueError(f"Duplicate lq_path in source JSONL: {lq_path}")
+        index[resolved] = row
+    return index
+
+
+def _prompt_for_row(row, args):
+    raw = row.get("unipercept_raw") if isinstance(row.get("unipercept_raw"), dict) else {}
+    profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
+    return build_sr_prompt(
+        profile,
+        use_prompt=not args.no_prompt,
+        use_suggestions=not args.no_suggestions,
+        prompt_variant=args.prompt_variant,
+        include_caption=args.include_caption,
+    )
+
+
+def build_states(args):
+    source_index = _index_source_rows(args.source_jsonl)
+    lr_root = _absolute(args.lr_root)
+    hr_root = _absolute(args.hr_root)
+    artifact_root = _absolute(args.artifact_root)
+    roots = (("lr", lr_root), ("hr", hr_root), ("artifact", artifact_root))
+    producer_hash = adapter_content_sha256(args.producer_adapter)
+    sampler_payload = json.loads(args.sampler_json) if args.sampler_json else {
+        "num_steps": args.num_inference_steps,
+        "schedule": args.inference_schedule,
+        "init_mode": args.inference_init_mode,
+        "sigma_start": args.inference_sigma_start,
+    }
+    sampler_hash = identity_sha256(sampler_payload)
+    records = []
+    for lineage in read_jsonl(args.lineage_jsonl):
+        source_path = lineage.get("source_path")
+        if not source_path:
+            raise ValueError(f"Lineage row lacks source_path: {lineage}")
+        source_path = _absolute(source_path)
+        source = source_index.get(str(source_path))
+        if source is None:
+            raise ValueError(
+                f"No paired source JSONL record matches lineage source {source_path}. "
+                "Use the same pre-cropped manifest that created the iterative run."
+            )
+        hr_path = source.get("hq_path")
+        if not hr_path or not Path(hr_path).is_file():
+            raise FileNotFoundError(f"Missing paired HR image for {source_path}: {hr_path}")
+        rounds = lineage.get("rounds") or []
+        original_hash = content_sha256(source_path)
+        sample_key = build_sample_key(args.dataset_id, _portable_key(source_path, roots), original_hash)
+        raw_profile = source.get("unipercept_raw") if isinstance(source.get("unipercept_raw"), dict) else {}
+        profile = raw_profile.get("profile") if isinstance(raw_profile.get("profile"), dict) else {}
+        router_condition = extract_router_condition(profile, version=args.router_condition_version)
+        for position, round_output in enumerate(rounds):
+            target_round = position + 2
+            if target_round > args.max_round:
+                break
+            current_path = round_output.get("path")
+            if not round_output.get("exists") or not current_path or not Path(current_path).is_file():
+                continue
+            current_path = _absolute(current_path)
+            if target_round == 2:
+                parent_state_id = None
+            else:
+                previous_path = rounds[position - 1].get("path")
+                previous_id = next(
+                    (item.state_id for item in records if item.runtime.current_sr == str(_absolute(previous_path))),
+                    None,
+                )
+                if previous_id is None:
+                    raise ValueError(
+                        f"Cannot build round-{target_round} state for {source_path}: "
+                        "the previous generated round is absent from the lineage."
+                    )
+                parent_state_id = previous_id
+            records.append(
+                StateRecord(
+                    dataset_id=args.dataset_id,
+                    sample_key=sample_key,
+                    original_lr_key=_portable_key(source_path, roots),
+                    original_lr_sha256=original_hash,
+                    current_output_key=_portable_key(current_path, roots),
+                    current_output_sha256=content_sha256(current_path),
+                    round_index=target_round,
+                    parent_state_id=parent_state_id,
+                    geometry_sha256=_geometry_sha256(current_path),
+                    producer_adapter_sha256=producer_hash,
+                    sampler_sha256=sampler_hash,
+                    hr_key=_portable_key(hr_path, roots),
+                    hr_sha256=content_sha256(hr_path),
+                    prompt=_prompt_for_row(source, args),
+                    router_condition_sha256=router_condition.source_hash,
+                    metadata={
+                        "lineage_dataset": str(lineage.get("dataset") or ""),
+                        "source_sample_id": str(source.get("sample_id") or lineage.get("sample_id") or ""),
+                        "router_condition": router_condition.as_dict(),
+                    },
+                    runtime=RuntimePaths(
+                        original_lr=str(source_path), current_sr=str(current_path), hr=str(_absolute(hr_path))
+                    ),
+                )
+            )
+    if not records:
+        raise RuntimeError("No usable refinement states were built; check lineage output files and --max_round.")
+    write_jsonl_atomic(args.output_jsonl, records)
+    manifest = {
+        "schema_version": "rl_sr_v1",
+        "dataset_id": args.dataset_id,
+        "state_count": len(records),
+        "round_counts": {str(r): sum(item.round_index == r for item in records) for r in range(2, args.max_round + 1)},
+        "producer_adapter_sha256": producer_hash,
+        "sampler_sha256": sampler_hash,
+        "sampler": sampler_payload,
+        # This is documentation only. It is intentionally excluded from all IDs.
+        "runtime_roots": {"lr_root": str(lr_root), "hr_root": str(hr_root), "artifact_root": str(artifact_root)},
+    }
+    Path(args.output_jsonl).with_suffix(".manifest.json").write_text(
+        canonical_json(manifest) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lineage_jsonl", required=True)
+    parser.add_argument("--source_jsonl", required=True)
+    parser.add_argument("--dataset_id", required=True)
+    parser.add_argument("--lr_root", required=True)
+    parser.add_argument("--hr_root", required=True)
+    parser.add_argument("--artifact_root", required=True)
+    parser.add_argument("--producer_adapter", required=True)
+    parser.add_argument("--output_jsonl", required=True)
+    parser.add_argument("--max_round", type=int, default=4)
+    parser.add_argument("--sampler_json", default=None, help="Canonical sampler JSON; overrides individual sampler flags.")
+    parser.add_argument("--num_inference_steps", type=int, default=25)
+    parser.add_argument("--inference_schedule", default="linear")
+    parser.add_argument("--inference_init_mode", default="pure_noise")
+    parser.add_argument("--inference_sigma_start", type=float, default=1.0)
+    parser.add_argument("--prompt_variant", default="iqa_suggestion")
+    parser.add_argument("--include_caption", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--no_prompt", action="store_true")
+    parser.add_argument("--no_suggestions", action="store_true")
+    parser.add_argument("--router_condition_version", default=ROUTER_CONDITION_VERSION)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    summary = build_states(parse_args())
+    print(json.dumps(summary, ensure_ascii=False, indent=2))

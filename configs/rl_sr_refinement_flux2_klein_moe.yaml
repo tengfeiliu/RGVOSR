@@ -1,0 +1,136 @@
+# Stages C/E configuration. Runtime paths may change across servers; artifact
+# IDs use content hashes plus relative keys and never include these paths.
+model:
+  flux_backend: flux2_klein
+  flux_model_path: /root/autodl-tmp/models/FLUX.2-klein-base-4B/
+  dtype: bf16
+  text_encoder_device: cuda
+  text_encoder_dtype: fp32
+  vae_device: cuda
+  vae_dtype: fp32
+  max_prompt_sequence_length: 512
+  use_lora: true
+  lora_backend: moe
+  lora_rank: 32
+  lora_alpha: 32
+  gradient_checkpointing: false
+  guidance_scale: 1.0
+  latent_channels: 128
+  context_dim: 15360
+  lora_moe:
+    num_routed_experts: 4
+    top_k: 2
+    router_input_mode: condition8
+    router_condition_version: text8_v1
+    router_condition_dim: 8
+    router_timestep_dim: 32
+    latent_branch: stat_conv
+    router_hidden_dim: 1024
+    prototype_scale: 1.0
+    router_ema_decay: 0.99
+    router_noise_std: 0.10
+    router_noise_end_ratio: 0.30
+    warmup_ratio: 0.30
+    init_temperature: 2.0
+    final_temperature: 0.7
+    inference_routing_mode: topk
+    inference_temperature: 0.7
+    inference_top_k: 2
+    teacher_routing_enabled: false
+    semantic_prototype_init: false
+    teacher_start_ratio: 0.15
+    teacher_end_ratio: 0.35
+    teacher_target_temperature: 0.7
+    shared_always_active: true
+    freeze_shared_during_warmup: true
+    init_from_single_lora: null
+
+text_encoding:
+  mode: online
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+
+data:
+  # Used only to derive defaults. C/E read rl_sr.state_jsonl instead.
+  jsonl_path: datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl
+  crop_size: 512
+  pre_cropped: true
+  scale: 4
+  batch_size: 1
+  num_workers: 2
+  vae_align: 16
+
+condition:
+  use_prompt: true
+  use_suggestions: true
+  # Must match checkpoint-00036000. condition8 is the frozen router input,
+  # whereas iqa_suggestion is the generator's text prompt construction.
+  prompt_variant: iqa_suggestion
+  include_caption: true
+  prompt_schedule:
+    enabled: true
+    switch_step: 0
+    before_variant: fixed
+    before_include_caption: false
+    after_variant: iqa_suggestion
+    after_include_caption: true
+  use_degradation_vector: false
+  use_visual_semantic_tokens: false
+  deg_vector_dim: 8
+  deg_token_count: 0
+  deg_hidden_dim: 512
+  lr_cond_mode: flux2_image_concat
+  lr_token_count: 1024
+  condition_dropout: 0.0
+  visual_feature_dim: 768
+  visual_token_count: 64
+  refinement:
+    enabled: true
+    anchor_tokens: 8
+    dropout: 0.0
+    max_round: 16
+
+training:
+  # This is asserted by the C/E entrypoints. It must never be changed for RL-SR.
+  freeze_flux_transformer: true
+  seed: 42
+  lr_adapter: 1.0e-4
+  weight_decay: 0.01
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+
+flow_matching:
+  # Must match checkpoint-00036000 for stage-C supervised refinement.
+  sigma_sampling: uniform
+  timestep_conversion: sigma
+  num_inference_steps: 25
+  inference_schedule: linear
+  inference_init_mode: pure_noise
+  inference_sigma_start: 1.0
+
+rl_sr:
+  # Replace only runtime paths below. They do not participate in artifact IDs.
+  state_jsonl: null
+  init_adapter: null          # Stage-0/F0 adapter used to initialize stage C
+  sft_output_dir: exp_rg_flux_refiner_sft
+  rl_output_dir: exp_rg_flux_output_rl
+  batch_size: 1
+  rl_batch_size: 1
+  sft_replay_batch_size: 1
+  num_workers: 2
+  grad_accum_steps: 1
+  sft_max_steps: 1000
+  sft_lr: 1.0e-4
+  sft_fm_weight: 1.0
+  sft_latent_weight: 0.10
+  rl_max_steps: 250
+  rl_lr: 2.0e-5
+  nft_beta: 1.0
+  nft_weight: 1.0
+  reference_weight: 0.10
+  sft_replay_weight: 0.25
+  sft_replay_latent_weight: 0.05
+  min_reward_confidence: 0.15
+  max_grad_norm: 1.0
+  log_every: 10

@@ -111,8 +111,10 @@ def sample_multistep_fm(
     text_ids=None,
     degradation_vector=None,
     z_lr=None,
+    z_anchor_lr=None,
     dino_tokens=None,
     lr_cond_mode="latent_adapter",
+    refinement_round=None,
     router_condition=None,
     router_condition_mask=None,
     router_condition_confidence=None,
@@ -157,7 +159,7 @@ def sample_multistep_fm(
         sigma_cur = sigma_seq[i]
         sigma_next = sigma_seq[i + 1]
         sigma_batch = sigma_cur.expand(shape[0])
-        v_pred = artist(
+        model_kwargs = dict(
             z_t=z,
             timestep=sigma_batch,
             prompt_embeds=prompt_embeds,
@@ -171,6 +173,13 @@ def sample_multistep_fm(
             router_condition_mask=router_condition_mask,
             router_condition_confidence=router_condition_confidence,
         )
+        # Keep the established FLUX.1 sampler ABI unchanged.  FLUX.2 receives
+        # refinement-only kwargs only when the feature is actively used.
+        if z_anchor_lr is not None:
+            model_kwargs["z_anchor_lr"] = z_anchor_lr
+        if refinement_round is not None:
+            model_kwargs["refinement_round"] = refinement_round
+        v_pred = artist(**model_kwargs)
         z = z - (sigma_cur - sigma_next) * v_pred
 
     return z
