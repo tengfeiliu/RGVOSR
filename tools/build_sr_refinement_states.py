@@ -1,12 +1,13 @@
 """Build portable (x, y_k) refinement states from iterative-inference lineage.
 
-Example (the three roots only supply portable keys; they do not enter hashes):
+Example (the optional roots only supply human-readable portable keys; they do
+not enter hashes).  When the roots are omitted, content-addressed relative keys
+are generated automatically, so a run can move between servers unchanged:
 
 python tools/build_sr_refinement_states.py \
   --lineage_jsonl runs/iterative/sample_lineage.jsonl \
   --source_jsonl datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl \
-  --dataset_id lsdir_precrop512_v1 --lr_root datasets/LSDIR_precrop512 \
-  --hr_root datasets/LSDIR_precrop512 --artifact_root runs/iterative \
+  --dataset_id lsdir_precrop512_v1 --artifact_root runs/iterative \
   --producer_adapter artifacts/f0/rg_flux_adapters --output_jsonl artifacts/states.jsonl
 """
 
@@ -42,18 +43,22 @@ def _absolute(path):
     return Path(path).expanduser().resolve()
 
 
-def _portable_key(path, roots):
+def _portable_key(path, roots, namespace, content_hash=None):
+    """Return a portable key without ever placing an absolute path in identity.
+
+    A configured dataset/artifact root gives the most legible key.  The one-click
+    runner intentionally has no dataset-root argument; in that case, use the
+    file content hash as a synthetic *relative* key.  It remains stable after a
+    dataset is mounted at a different server path.
+    """
     path = _absolute(path)
-    for namespace, root in roots:
+    for root_namespace, root in roots:
         try:
-            return normalize_relative_key(Path(namespace) / path.relative_to(root))
+            return normalize_relative_key(Path(root_namespace) / path.relative_to(root))
         except ValueError:
             continue
-    configured = ", ".join(f"{name}={root}" for name, root in roots)
-    raise ValueError(
-        f"Artifact {path} is outside the registered roots ({configured}). "
-        "Add its mount with --lr_root, --hr_root, or --artifact_root; do not use an absolute path as identity."
-    )
+    digest = content_hash or content_sha256(path)
+    return normalize_relative_key(Path(namespace) / "sha256" / digest)
 
 
 def _geometry_sha256(path):
@@ -88,13 +93,40 @@ def _prompt_for_row(row, args):
     )
 
 
+def _round_producer_adapters(values):
+    mapping = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ValueError(
+                "--round_producer_adapter must use GENERATED_ROUND=ADAPTER_PATH, for example 1=/models/f0"
+            )
+        raw_round, raw_path = item.split("=", 1)
+        try:
+            round_number = int(raw_round)
+        except ValueError as exc:
+            raise ValueError(f"Invalid generated round in --round_producer_adapter: {item}") from exc
+        if round_number <= 0 or not raw_path.strip():
+            raise ValueError(f"Invalid --round_producer_adapter: {item}")
+        if round_number in mapping:
+            raise ValueError(f"Duplicate producer adapter for generated round {round_number}")
+        mapping[round_number] = raw_path.strip()
+    return mapping
+
+
 def build_states(args):
     source_index = _index_source_rows(args.source_jsonl)
-    lr_root = _absolute(args.lr_root)
-    hr_root = _absolute(args.hr_root)
+    lr_root = _absolute(args.lr_root) if args.lr_root else None
+    hr_root = _absolute(args.hr_root) if args.hr_root else None
     artifact_root = _absolute(args.artifact_root)
-    roots = (("lr", lr_root), ("hr", hr_root), ("artifact", artifact_root))
-    producer_hash = adapter_content_sha256(args.producer_adapter)
+    roots = tuple(
+        (namespace, root)
+        for namespace, root in (("lr", lr_root), ("hr", hr_root), ("artifact", artifact_root))
+        if root is not None
+    )
+    producer_paths = _round_producer_adapters(args.round_producer_adapter)
+    producer_hashes = {"default": adapter_content_sha256(args.producer_adapter)}
+    for generated_round, adapter_path in producer_paths.items():
+        producer_hashes[generated_round] = adapter_content_sha256(adapter_path)
     sampler_payload = json.loads(args.sampler_json) if args.sampler_json else {
         "num_steps": args.num_inference_steps,
         "schedule": args.inference_schedule,
@@ -119,7 +151,8 @@ def build_states(args):
             raise FileNotFoundError(f"Missing paired HR image for {source_path}: {hr_path}")
         rounds = lineage.get("rounds") or []
         original_hash = content_sha256(source_path)
-        sample_key = build_sample_key(args.dataset_id, _portable_key(source_path, roots), original_hash)
+        original_lr_key = _portable_key(source_path, roots, "original_lr", original_hash)
+        sample_key = build_sample_key(args.dataset_id, original_lr_key, original_hash)
         raw_profile = source.get("unipercept_raw") if isinstance(source.get("unipercept_raw"), dict) else {}
         profile = raw_profile.get("profile") if isinstance(raw_profile.get("profile"), dict) else {}
         router_condition = extract_router_condition(profile, version=args.router_condition_version)
@@ -131,6 +164,10 @@ def build_states(args):
             if not round_output.get("exists") or not current_path or not Path(current_path).is_file():
                 continue
             current_path = _absolute(current_path)
+            generated_round = int(round_output.get("round", position + 1))
+            current_producer_hash = producer_hashes.get(
+                generated_round, producer_hashes["default"]
+            )
             if target_round == 2:
                 parent_state_id = None
             else:
@@ -145,21 +182,23 @@ def build_states(args):
                         "the previous generated round is absent from the lineage."
                     )
                 parent_state_id = previous_id
+            current_hash = content_sha256(current_path)
+            hr_hash = content_sha256(hr_path)
             records.append(
                 StateRecord(
                     dataset_id=args.dataset_id,
                     sample_key=sample_key,
-                    original_lr_key=_portable_key(source_path, roots),
+                    original_lr_key=original_lr_key,
                     original_lr_sha256=original_hash,
-                    current_output_key=_portable_key(current_path, roots),
-                    current_output_sha256=content_sha256(current_path),
+                    current_output_key=_portable_key(current_path, roots, "generated_sr", current_hash),
+                    current_output_sha256=current_hash,
                     round_index=target_round,
                     parent_state_id=parent_state_id,
                     geometry_sha256=_geometry_sha256(current_path),
-                    producer_adapter_sha256=producer_hash,
+                    producer_adapter_sha256=current_producer_hash,
                     sampler_sha256=sampler_hash,
-                    hr_key=_portable_key(hr_path, roots),
-                    hr_sha256=content_sha256(hr_path),
+                    hr_key=_portable_key(hr_path, roots, "paired_hr", hr_hash),
+                    hr_sha256=hr_hash,
                     prompt=_prompt_for_row(source, args),
                     router_condition_sha256=router_condition.source_hash,
                     metadata={
@@ -180,11 +219,20 @@ def build_states(args):
         "dataset_id": args.dataset_id,
         "state_count": len(records),
         "round_counts": {str(r): sum(item.round_index == r for item in records) for r in range(2, args.max_round + 1)},
-        "producer_adapter_sha256": producer_hash,
+        "producer_adapter_sha256": producer_hashes["default"],
+        "producer_adapter_sha256_by_generated_round": {
+            str(round_number): value
+            for round_number, value in producer_hashes.items()
+            if round_number != "default"
+        },
         "sampler_sha256": sampler_hash,
         "sampler": sampler_payload,
         # This is documentation only. It is intentionally excluded from all IDs.
-        "runtime_roots": {"lr_root": str(lr_root), "hr_root": str(hr_root), "artifact_root": str(artifact_root)},
+        "runtime_roots": {
+            "lr_root": str(lr_root) if lr_root else None,
+            "hr_root": str(hr_root) if hr_root else None,
+            "artifact_root": str(artifact_root),
+        },
     }
     Path(args.output_jsonl).with_suffix(".manifest.json").write_text(
         canonical_json(manifest) + "\n", encoding="utf-8"
@@ -197,10 +245,24 @@ def parse_args():
     parser.add_argument("--lineage_jsonl", required=True)
     parser.add_argument("--source_jsonl", required=True)
     parser.add_argument("--dataset_id", required=True)
-    parser.add_argument("--lr_root", required=True)
-    parser.add_argument("--hr_root", required=True)
+    parser.add_argument(
+        "--lr_root",
+        default=None,
+        help="Optional dataset mount used only for readable relative keys; omit for portable content-addressed keys.",
+    )
+    parser.add_argument(
+        "--hr_root",
+        default=None,
+        help="Optional dataset mount used only for readable relative keys; omit for portable content-addressed keys.",
+    )
     parser.add_argument("--artifact_root", required=True)
     parser.add_argument("--producer_adapter", required=True)
+    parser.add_argument(
+        "--round_producer_adapter",
+        action="append",
+        default=[],
+        help="Override the producer of a generated round: ROUND=ADAPTER_PATH. Can be repeated.",
+    )
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--max_round", type=int, default=4)
     parser.add_argument("--sampler_json", default=None, help="Canonical sampler JSON; overrides individual sampler flags.")

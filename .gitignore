@@ -26,6 +26,7 @@ preset/results/
 *.zip
 exp_rg_flux_sr/rg_flux_sr_ms_stageA_latent_adapter_size512/args.json
 exp_rg_flux_sr/
+exp_rg_flux_rl/
 .claude/settings.local.json
 *.json
 eval/

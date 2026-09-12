@@ -111,6 +111,18 @@ flow_matching:
 
 rl_sr:
   # Replace only runtime paths below. They do not participate in artifact IDs.
+  # The one-click launcher reads data.jsonl_path above and creates a timestamped
+  # subfolder here. Set evaluation.jsonl_path only for a held-out paired JSONL.
+  output_root: exp_rg_flux_rl
+  run_prefix: rlsr
+  dataset_id: lsdir_precrop512_v1
+  iterations: 4
+  num_candidates: 4
+  reward_device: cuda
+  evaluation:
+    jsonl_path: null
+    metric_device: cpu
+    metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq]
   state_jsonl: null
   init_adapter: null          # Stage-0/F0 adapter used to initialize stage C
   sft_output_dir: exp_rg_flux_refiner_sft

@@ -14,23 +14,28 @@
 
 ## B：生成第一轮状态及后续多轮状态
 
-先仅生成 F0 的第 1 轮输出 `y_1`。`--jsonl_path` 必须是和输入 LR 对应的配对 JSONL。
+先仅生成 F0 的第 1 轮输出 `y_1`。一键入口会从配置的
+`data.jsonl_path` 自动生成输入清单，因此不需要单独提供 `LQ_ROOT` 或
+另一份 `PAIRED_JSONL`。下面仅保留手工调试示例；其中 `<DATA_JSONL>` 就是
+配置中的 `data.jsonl_path`。
 
 ```powershell
 python tools/run_rg_flux_iterative_inference.py `
   --checkpoint <F0_ADAPTER> `
   --config configs/rl_sr_refinement_flux2_klein_moe.yaml `
-  --input <LQ_ROOT> --jsonl_path <PAIRED_JSONL> `
+  --input <LQ_INPUT_LIST> --jsonl_path <DATA_JSONL> `
   --output_dir <RUN_ROOT>/f0_round1 --iterations 1 --upscale 1
 ```
 
-把 lineage 转换为 C 所需状态。三个 root 只生成相对 key；它们可以按服务器重设。
+把 lineage 转换为 C 所需状态。`--lr_root` 和 `--hr_root` 现在是可选项：
+不提供时，工具自动使用内容哈希构造相对 key，因此数据切换到另一台服务器或
+挂载目录时，state ID 和 artifact hash 保持不变。
 
 ```powershell
 python tools/build_sr_refinement_states.py `
   --lineage_jsonl <RUN_ROOT>/f0_round1/sample_lineage.jsonl `
-  --source_jsonl <PAIRED_JSONL> --dataset_id lsdir_precrop512_v1 `
-  --lr_root <DATASET_ROOT> --hr_root <DATASET_ROOT> --artifact_root <RUN_ROOT>/f0_round1 `
+  --source_jsonl <DATA_JSONL> --dataset_id lsdir_precrop512_v1 `
+  --artifact_root <RUN_ROOT>/f0_round1 `
   --producer_adapter <F0_ADAPTER> --output_jsonl <RUN_ROOT>/states_for_c.jsonl --max_round 2
 ```
 
@@ -53,14 +58,15 @@ python train_rg_flux_refiner_sft.py `
 python tools/run_rg_flux_iterative_inference.py `
   --checkpoint <F0_ADAPTER> --refiner_checkpoint <RUN_ROOT>/g_sft/rg_flux_adapters `
   --config configs/rl_sr_refinement_flux2_klein_moe.yaml `
-  --input <LQ_ROOT> --jsonl_path <PAIRED_JSONL> `
+  --input <LQ_INPUT_LIST> --jsonl_path <DATA_JSONL> `
   --output_dir <RUN_ROOT>/sft_rounds --iterations 4 --upscale 1
 
 python tools/build_sr_refinement_states.py `
   --lineage_jsonl <RUN_ROOT>/sft_rounds/sample_lineage.jsonl `
-  --source_jsonl <PAIRED_JSONL> --dataset_id lsdir_precrop512_v1 `
-  --lr_root <DATASET_ROOT> --hr_root <DATASET_ROOT> --artifact_root <RUN_ROOT>/sft_rounds `
+  --source_jsonl <DATA_JSONL> --dataset_id lsdir_precrop512_v1 `
+  --artifact_root <RUN_ROOT>/sft_rounds `
   --producer_adapter <RUN_ROOT>/g_sft/rg_flux_adapters `
+  --round_producer_adapter 1=<F0_ADAPTER> `
   --output_jsonl <RUN_ROOT>/states_for_rl.jsonl --max_round 4
 ```
 
@@ -113,3 +119,50 @@ p || (1-beta) v_old + beta v_phi - v_target ||²
 接收正、负两侧的输出奖励信号。SFT replay 同时持续用 HR 锚定 G_phi，避免只追逐 reward 而损坏已学到的保真能力。
 
 每完成一次 E 更新，必须把新输出 adapter 作为下一轮 `G_old` 重新收集 rollout、校准/评分、再更新。不要对同一个 buffer 连续做多轮更新；这样 `G_old`、动作 latent 和奖励的对应关系始终正确。
+
+## 单卡后台运行
+
+仓库提供 [run_rl_sr_stage_ae.sh](../tools/run_rl_sr_stage_ae.sh)。它会依次完成：
+
+1. 从 `config.data.jsonl_path` 自动取出 LQ，并生成运行时输入清单；
+2. 生成 F0 的训练状态、训练共享 SFT、生成多轮训练状态；
+3. 自动采样、校准和计算 reward，再执行输出级 NFT；
+4. 对 `G_SFT` 和最终 `G_RL` 自动进行 1–`iterations` 轮推理与指标评估。
+
+它不需要 `LQ_ROOT`、`DATASET_ROOT` 或 `PAIRED_JSONL`。默认评估集也使用
+`data.jsonl_path`；如果已有独立的配对验证 JSONL，只需要在配置的
+`rl_sr.evaluation.jsonl_path` 填入它，脚本会自动生成第二份清单并在它上面评估。
+每次启动会创建唯一目录，名称包含 F0 step、FLUX 配置、prompt、condition、轮数、
+候选数、训练步数和时间，例如
+`rlsr_f0-036000_flux2-klein_flux2-image-concat_iqa-suggestion_ccondition8_s512_r4_k4_sft1000_nft250_260912-101530`。
+
+```bash
+cd <REPO_ROOT>
+chmod +x tools/run_rl_sr_stage_ae.sh
+
+export F0_CHECKPOINT=<CHECKPOINT-00036000_OR_RG_FLUX_ADAPTERS>
+export CONFIG=<REPO_ROOT>/configs/rl_sr_refinement_flux2_klein_moe.yaml
+
+nohup env CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  CONDA_ENV=sr-flux2 \
+  bash tools/run_rl_sr_stage_ae.sh all \
+  > "rlsr_launcher_$(date +%y%m%d-%H%M%S).log" 2>&1 < /dev/null &
+```
+
+启动日志的第一行会打印自动创建的 `RL-SR run directory`。详细日志保存在该目录的
+`logs/`；评估趋势在 `06_sft_multiround_eval/metric_trends.csv`（若无独立评估集，
+它链接到训练状态推理目录）和 `11_rl_multiround_eval/metric_trends.csv`。脚本还会生成
+`12_sft_to_rl_evaluation.json`，将 G_RL 相对 G_SFT 的每轮每项指标变化统一成
+“正数=变好”的 `oriented_delta`。输出目录的根路径由 `rl_sr.output_root` 控制，默认是仓库下的 `exp_rg_flux_rl/`，可用
+`RL_SR_OUTPUT_ROOT` 临时覆盖而不影响 hash。
+
+若任务中断，设置已有运行目录后只重跑未完成阶段，避免覆盖已生成的 inference：
+
+```bash
+RL_SR_RUN_DIR=<自动创建的运行目录> \
+  F0_CHECKPOINT=<CHECKPOINT-00036000_OR_RG_FLUX_ADAPTERS> \
+  CONDA_ENV=sr-flux2 bash tools/run_rl_sr_stage_ae.sh eval
+```
+
+可把 `eval` 替换成 `f0`、`c`、`multiround`、`reward` 或 `e`。这些单阶段命令仍会
+自动恢复 JSONL 输入清单；不会要求数据根目录参数。
