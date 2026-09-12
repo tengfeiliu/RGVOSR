@@ -126,9 +126,9 @@ rl_sr:
     # runtime LQ input lists from it.
     jsonl_path: datasets/inference.iqa_caption_suggestion.jsonl
     datasets:
-      - name: RealLQ259
-        dataset_filter: RealLQ259
-        expected_count: 259
+      - name: RealLQ250
+        dataset_filter: RealLQ250
+        expected_count: 250
       - name: RealLR200
         dataset_filter: RealLR200
         expected_count: 200
