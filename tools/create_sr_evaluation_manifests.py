@@ -90,12 +90,50 @@ def _dataset_specs(config: dict, repo_root: Path) -> list[dict]:
     return parsed
 
 
-def _record_dataset_name(row: dict) -> str | None:
-    for key in ("dataset_name", "dataset"):
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
+def _record_dataset_names(row: dict) -> list[str]:
+    """Return dataset labels preserved by the known inference-cache schemas."""
+    values = []
+    for source in (row, row.get("raw_degradation_params"), row.get("result")):
+        if not isinstance(source, dict):
+            continue
+        for key in ("dataset_name", "dataset"):
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                normalized = str(value).strip()
+                if normalized not in values:
+                    values.append(normalized)
+    return values
+
+
+def _matches_dataset(row: dict, dataset_filter: str | None) -> str | None:
+    """Match a configured dataset name without changing the source JSONL.
+
+    Older inference caches sometimes omit the top-level dataset label but keep
+    the original evaluation directory in ``lq_path``.  Accept that directory
+    token as a compatibility fallback.  An explicit metadata match always wins.
+    """
+    if dataset_filter is None:
+        return "unfiltered"
+    expected = str(dataset_filter).strip().casefold()
+    if any(value.casefold() == expected for value in _record_dataset_names(row)):
+        return "metadata"
+    lq_path = row.get("lq_path")
+    if isinstance(lq_path, str) and expected in lq_path.replace("\\", "/").casefold():
+        return "lq_path"
     return None
+
+
+def _selection_diagnostic(rows: list[dict]) -> dict:
+    labels = []
+    paths = []
+    for row in rows:
+        for label in _record_dataset_names(row):
+            if label not in labels:
+                labels.append(label)
+        lq_path = row.get("lq_path")
+        if isinstance(lq_path, str) and lq_path not in paths:
+            paths.append(lq_path)
+    return {"dataset_labels": labels[:20], "lq_path_examples": paths[:5]}
 
 
 def _source_path_candidates(raw_path: str, jsonl_path: Path) -> list[Path]:
@@ -116,12 +154,15 @@ def build_manifests(config_path: Path, repo_root: Path, output_dir: Path) -> dic
         source_jsonl_paths.add(str(jsonl_path))
         if not jsonl_path.is_file():
             raise FileNotFoundError(f"Evaluation JSONL does not exist for {spec['name']}: {jsonl_path}")
+        source_rows = list(_read_jsonl(jsonl_path))
         input_values, seen_inputs, matching_rows = [], set(), 0
-        for line_number, row in _read_jsonl(jsonl_path):
-            record_dataset = _record_dataset_name(row)
-            if spec["dataset_filter"] is not None and record_dataset != spec["dataset_filter"]:
+        match_sources = {"metadata": 0, "lq_path": 0, "unfiltered": 0}
+        for line_number, row in source_rows:
+            match_source = _matches_dataset(row, spec["dataset_filter"])
+            if match_source is None:
                 continue
             matching_rows += 1
+            match_sources[match_source] += 1
             lq_path = row.get("lq_path")
             if not isinstance(lq_path, str) or not lq_path.strip():
                 raise ValueError(f"Missing lq_path for {spec['name']} at {jsonl_path}:{line_number}")
@@ -145,9 +186,11 @@ def build_manifests(config_path: Path, repo_root: Path, output_dir: Path) -> dic
             input_values.append(source_value if raw_path.is_absolute() or raw_path.is_file() else dedupe_key)
         if matching_rows == 0:
             filter_text = spec["dataset_filter"]
+            diagnostic = _selection_diagnostic([row for _, row in source_rows])
             raise ValueError(
                 f"No rows for evaluation dataset '{spec['name']}' with dataset_filter='{filter_text}' in {jsonl_path}. "
-                "Check JSONL dataset_name/dataset values."
+                f"Observed dataset labels: {diagnostic['dataset_labels'] or '<none>'}; "
+                f"lq_path examples: {diagnostic['lq_path_examples'] or '<none>'}."
             )
         if spec["expected_count"] is not None and len(input_values) != spec["expected_count"]:
             raise ValueError(
@@ -161,6 +204,7 @@ def build_manifests(config_path: Path, repo_root: Path, output_dir: Path) -> dic
                 "input_list": str(input_list),
                 "jsonl_path": str(jsonl_path),
                 "dataset_filter": spec["dataset_filter"],
+                "match_sources": {key: value for key, value in match_sources.items() if value},
                 "input_count": len(input_values),
                 "expected_count": spec["expected_count"],
             }
