@@ -63,7 +63,10 @@ def build_manifest(data_jsonl_path: Path, output_path: Path, label: str) -> dict
         dedupe_key = str(existing.resolve())
         if dedupe_key not in seen:
             seen.add(dedupe_key)
-            lq_paths.append(source_value)
+            # A JSONL-relative path must become usable from the repository CWD
+            # where the inference process runs. This remains runtime-only; it
+            # never contributes to RL artifact identity.
+            lq_paths.append(source_value if source_path.is_absolute() or source_path.is_file() else dedupe_key)
 
     if missing:
         preview = ", ".join(missing[:5])

@@ -127,14 +127,23 @@ p || (1-beta) v_old + beta v_phi - v_target ||²
 1. 从 `config.data.jsonl_path` 自动取出 LQ，并生成运行时输入清单；
 2. 生成 F0 的训练状态、训练共享 SFT、生成多轮训练状态；
 3. 自动采样、校准和计算 reward，再执行输出级 NFT；
-4. 对 `G_SFT` 和最终 `G_RL` 自动进行 1–`iterations` 轮推理与指标评估。
+4. 对 `G_SFT` 和最终 `G_RL` 自动在 `RealLQ259`、`RealLR200` 进行 1–`iterations` 轮推理与指标评估。
 
-它不需要 `LQ_ROOT`、`DATASET_ROOT` 或 `PAIRED_JSONL`。默认评估集也使用
-`data.jsonl_path`；如果已有独立的配对验证 JSONL，只需要在配置的
-`rl_sr.evaluation.jsonl_path` 填入它，脚本会自动生成第二份清单并在它上面评估。
+它不需要 `LQ_ROOT`、`DATASET_ROOT` 或 `PAIRED_JSONL`。训练仍读取
+`data.jsonl_path`；评估读取原始的 `rl_sr.evaluation.jsonl_path`
+（默认 `datasets/inference.iqa_caption_suggestion.jsonl`）。该 JSONL 不会被
+拆分、修改或复制为条件文件：脚本只按 `dataset_filter` 生成运行时 LQ 输入列表，
+再把原始 JSONL 直接传给推理器。配置中的 `expected_count: 259/200` 会在开始推理前
+验证两套数据是否完整。
 每次启动会创建唯一目录，名称包含 F0 step、FLUX 配置、prompt、condition、轮数、
 候选数、训练步数和时间，例如
-`rlsr_f0-036000_flux2-klein_flux2-image-concat_iqa-suggestion_ccondition8_s512_r4_k4_sft1000_nft250_260912-101530`。
+`rlsr_f0-036000_flux2-klein_flux2-image-concat_iqa-suggestion_ccondition8_s512_r4_k4_sft1000_nft250_eval-reallq259-reallr200_260912-101530`。
+
+评估 JSONL 每条记录必须有可访问的 `lq_path`，以及与当前 `iqa_suggestion + caption`
+设置匹配的 `unipercept_raw.profile`。记录还应以 `dataset` 或 `dataset_name` 标记为
+`RealLQ259`、`RealLR200`，供脚本精确分组。当前评估是 NR-IQA，因此不需要 HR、
+`HQ_ROOT` 或额外的评估根目录；如果以后加入 PSNR/SSIM 等全参考指标，才需要在 JSONL
+中保留可访问的 `hq_path` 并扩展评估器。
 
 ```bash
 cd <REPO_ROOT>
@@ -150,8 +159,10 @@ nohup env CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
 ```
 
 启动日志的第一行会打印自动创建的 `RL-SR run directory`。详细日志保存在该目录的
-`logs/`；评估趋势在 `06_sft_multiround_eval/metric_trends.csv`（若无独立评估集，
-它链接到训练状态推理目录）和 `11_rl_multiround_eval/metric_trends.csv`。脚本还会生成
+`logs/`；评估趋势在 `06_sft_multiround_evaluation/metric_trends.csv` 和
+`11_rl_multiround_evaluation/metric_trends.csv`。每轮目录保持现有格式：
+`round_01/RealLQ259/`、`round_01/RealLR200/`，其下的 `metrics/` 保存逐图和汇总
+NR-IQA。脚本还会生成
 `12_sft_to_rl_evaluation.json`，将 G_RL 相对 G_SFT 的每轮每项指标变化统一成
 “正数=变好”的 `oriented_delta`。输出目录的根路径由 `rl_sr.output_root` 控制，默认是仓库下的 `exp_rg_flux_rl/`，可用
 `RL_SR_OUTPUT_ROOT` 临时覆盖而不影响 hash。

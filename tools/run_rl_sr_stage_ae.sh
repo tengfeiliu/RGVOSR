@@ -53,8 +53,12 @@ REWARD_DEVICE="${REWARD_DEVICE:-$(config_field reward_device)}"
 DATASET_ID="${DATASET_ID:-$(config_field dataset_id)}"
 read -r -a ITER_METRICS <<< "$(config_field metrics)"
 
-require_file "${TRAIN_JSONL}"
-require_file "${EVAL_JSONL}"
+case "${STAGE}" in
+  all|f0|c|multiround) require_file "${TRAIN_JSONL}" ;;
+esac
+case "${STAGE}" in
+  all|multiround|eval) require_file "${EVAL_JSONL}" ;;
+esac
 if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
   RUN_ROOT="${RL_SR_RUN_DIR}"
   require_file "${RUN_ROOT}"
@@ -73,7 +77,8 @@ INPUT_DIR="${RUN_ROOT}/00_inputs"
 mkdir -p "${LOG_DIR}" "${INPUT_DIR}"
 
 TRAIN_INPUT="${INPUT_DIR}/train_lq_inputs.txt"
-EVAL_INPUT="${INPUT_DIR}/evaluation_lq_inputs.txt"
+EVAL_MANIFEST_DIR="${INPUT_DIR}/evaluation"
+EVAL_DATASET_DIRS=()
 
 echo "RL-SR run directory: ${RUN_ROOT}"
 echo "Training data JSONL (config.data.jsonl_path): ${TRAIN_JSONL}"
@@ -101,14 +106,24 @@ run_stage() {
 }
 
 prepare_inputs() {
-  run_stage "00_create_train_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
-    --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training
-  if [[ "${EVAL_JSONL}" == "${TRAIN_JSONL}" ]]; then
-    EVAL_INPUT="${TRAIN_INPUT}"
-  else
-    run_stage "00_create_evaluation_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
-      --data_jsonl_path "${EVAL_JSONL}" --output "${EVAL_INPUT}" --label evaluation
-  fi
+  case "${STAGE}" in
+    all|f0|multiround)
+      run_stage "00_create_train_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
+        --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training
+      ;;
+  esac
+  case "${STAGE}" in
+    all|multiround|eval)
+      run_stage "00_create_evaluation_input_manifests" "${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
+        --config "${CONFIG}" --repo_root "${REPO_ROOT}" --output_dir "${EVAL_MANIFEST_DIR}"
+      mapfile -t EVAL_DATASET_DIRS < <("${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
+        --config "${CONFIG}" --repo_root "${REPO_ROOT}" --output_dir "${EVAL_MANIFEST_DIR}" --print_dataset_dirs)
+      if [[ "${#EVAL_DATASET_DIRS[@]}" -eq 0 ]]; then
+        echo "No evaluation dataset manifests were generated." >&2
+        exit 2
+      fi
+      ;;
+  esac
 }
 
 run_f0() {
@@ -150,18 +165,12 @@ run_multiround() {
     --round_producer_adapter "1=${F0_ADAPTER}" \
     --output_jsonl "${RUN_ROOT}/05_states_for_rl.jsonl" --max_round "${ITERATIONS}"
 
-  # SFT evaluation is generated before reward/NFT. If evaluation.jsonl_path is
-  # omitted, it is the training manifest, whose multiround metrics already exist.
-  if [[ "${EVAL_INPUT}" == "${TRAIN_INPUT}" && "${EVAL_JSONL}" == "${TRAIN_JSONL}" ]]; then
-    ln -sfn "04_sft_multiround_train_state" "${RUN_ROOT}/06_sft_multiround_eval"
-  else
-    run_stage "06_sft_multiround_eval" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
-      --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
-      --config "${CONFIG}" --input "${EVAL_INPUT}" --jsonl_path "${EVAL_JSONL}" \
-      --output_dir "${RUN_ROOT}/06_sft_multiround_eval" \
-      --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
-      --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
-  fi
+  run_stage "06_sft_multiround_evaluation" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+    --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
+    --config "${CONFIG}" --dataset_dirs "${EVAL_DATASET_DIRS[@]}" --jsonl_path "${EVAL_JSONL}" \
+    --output_dir "${RUN_ROOT}/06_sft_multiround_evaluation" \
+    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
+    --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
 }
 
 run_reward() {
@@ -199,16 +208,16 @@ run_e() {
 run_eval() {
   local g_rl_adapter="${RUN_ROOT}/10_g_rl_01/rg_flux_adapters"
   require_file "${g_rl_adapter}"
-  run_stage "11_rl_multiround_eval" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+  run_stage "11_rl_multiround_evaluation" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
     --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_rl_adapter}" \
-    --config "${CONFIG}" --input "${EVAL_INPUT}" --jsonl_path "${EVAL_JSONL}" \
-    --output_dir "${RUN_ROOT}/11_rl_multiround_eval" \
+    --config "${CONFIG}" --dataset_dirs "${EVAL_DATASET_DIRS[@]}" --jsonl_path "${EVAL_JSONL}" \
+    --output_dir "${RUN_ROOT}/11_rl_multiround_evaluation" \
     --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
 
   run_stage "12_summarize_sft_vs_rl" "${PYTHON_CMD[@]}" tools/summarize_rl_sr_evaluation.py \
-    --sft_metric_trends "${RUN_ROOT}/06_sft_multiround_eval/metric_trends.csv" \
-    --rl_metric_trends "${RUN_ROOT}/11_rl_multiround_eval/metric_trends.csv" \
+    --sft_metric_trends "${RUN_ROOT}/06_sft_multiround_evaluation/metric_trends.csv" \
+    --rl_metric_trends "${RUN_ROOT}/11_rl_multiround_evaluation/metric_trends.csv" \
     --output_json "${RUN_ROOT}/12_sft_to_rl_evaluation.json"
 }
 

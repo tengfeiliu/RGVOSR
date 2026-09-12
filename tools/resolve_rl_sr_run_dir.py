@@ -65,6 +65,17 @@ def load_context(config_path: Path, f0_checkpoint: str, repo_root: Path, output_
     metrics = _get(config, "rl_sr", "evaluation", "metrics", default=["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq"])
     if not isinstance(metrics, list) or not all(isinstance(item, str) for item in metrics):
         raise ValueError("rl_sr.evaluation.metrics must be a list of metric names")
+    raw_evaluation_datasets = _get(config, "rl_sr", "evaluation", "datasets", default=[])
+    if raw_evaluation_datasets is None:
+        raw_evaluation_datasets = []
+    if not isinstance(raw_evaluation_datasets, list):
+        raise ValueError("rl_sr.evaluation.datasets must be a list when provided")
+    evaluation_dataset_names = [
+        str(item.get("name") or "").strip()
+        for item in raw_evaluation_datasets
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    evaluation_tag = "-".join(_slug(name) for name in evaluation_dataset_names) or "evaluation"
 
     name_parts = [
         _slug(_get(config, "rl_sr", "run_prefix", default="rlsr")),
@@ -78,6 +89,7 @@ def load_context(config_path: Path, f0_checkpoint: str, repo_root: Path, output_
         f"k{candidates}",
         f"sft{int(_get(config, 'rl_sr', 'sft_max_steps', default=0))}",
         f"nft{int(_get(config, 'rl_sr', 'rl_max_steps', default=0))}",
+        f"eval-{evaluation_tag}",
         datetime.now().strftime("%y%m%d-%H%M%S"),
     ]
     run_name = "_".join(name_parts)
@@ -95,6 +107,7 @@ def load_context(config_path: Path, f0_checkpoint: str, repo_root: Path, output_
         "metric_device": str(_get(config, "rl_sr", "evaluation", "metric_device", default="cpu")),
         "reward_device": str(_get(config, "rl_sr", "reward_device", default="cuda")),
         "dataset_id": str(_get(config, "rl_sr", "dataset_id", default="paired_sr_v1")),
+        "evaluation_datasets": evaluation_dataset_names,
         "metrics": metrics,
     }
 

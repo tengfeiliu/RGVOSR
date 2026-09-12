@@ -112,7 +112,8 @@ flow_matching:
 rl_sr:
   # Replace only runtime paths below. They do not participate in artifact IDs.
   # The one-click launcher reads data.jsonl_path above and creates a timestamped
-  # subfolder here. Set evaluation.jsonl_path only for a held-out paired JSONL.
+  # subfolder here. Evaluation keeps the source JSONL intact and derives only
+  # runtime LQ input lists for its named datasets.
   output_root: exp_rg_flux_rl
   run_prefix: rlsr
   dataset_id: lsdir_precrop512_v1
@@ -120,7 +121,17 @@ rl_sr:
   num_candidates: 4
   reward_device: cuda
   evaluation:
-    jsonl_path: null
+    # Keep this original JSONL intact. It supplies the caption/IQA/suggestion
+    # conditions for both named evaluation datasets; the launcher only creates
+    # runtime LQ input lists from it.
+    jsonl_path: datasets/inference.iqa_caption_suggestion.jsonl
+    datasets:
+      - name: RealLQ259
+        dataset_filter: RealLQ259
+        expected_count: 259
+      - name: RealLR200
+        dataset_filter: RealLR200
+        expected_count: 200
     metric_device: cpu
     metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq]
   state_jsonl: null
