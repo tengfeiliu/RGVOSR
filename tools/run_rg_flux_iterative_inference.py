@@ -320,6 +320,32 @@ def run_iterative_inference(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     source_datasets = _resolve_source_datasets(args)
     lineage = _build_lineage(source_datasets)
+    f0_cache = None
+    if args.reuse_f0_dir:
+        from tools.reuse_sr_f0_outputs import validate_f0_cache
+
+        if args.refiner_checkpoint and args.refiner_start_round <= 1:
+            raise ValueError("--reuse_f0_dir requires F0, not the refiner, in round 1")
+        if args.suggestion_pairing != "matched" or args.iqa_pairing not in (None, "matched"):
+            raise ValueError("--reuse_f0_dir requires matched prompt conditions")
+        f0_cache = validate_f0_cache(
+            args.reuse_f0_dir, lineage, resolved_run["checkpoint"],
+            {
+                "num_inference_steps": args.num_inference_steps,
+                "schedule": args.inference_schedule,
+                "init_mode": args.inference_init_mode,
+                "sigma_start": args.inference_sigma_start,
+                "seed": args.seed,
+                "input_upscale": args.upscale,
+                "uses_refinement_adapter": False,
+            },
+            {
+                "prompt_variant": args.prompt_variant,
+                "include_caption": args.include_caption,
+                "pre_cropped_input": bool(cfg(config, "data.pre_cropped", True)),
+                "restore_input_size": bool(args.restore_input_size),
+            },
+        )
     lineage_path = output_root / "sample_lineage.jsonl"
     _write_lineage(lineage_path, lineage)
 
@@ -345,6 +371,9 @@ def run_iterative_inference(args):
         "metric_trends": str(trend_path),
         "rounds": [],
     }
+    if f0_cache is not None:
+        manifest["f0_reuse"] = f0_cache["provenance"]
+        _write_json_atomic(output_root / "f0_reuse_manifest.json", f0_cache["provenance"])
     if args.refiner_checkpoint:
         if not bool(cfg(config, "condition.refinement.enabled", False)):
             raise ValueError(
@@ -418,23 +447,29 @@ def run_iterative_inference(args):
 
             dataset_metadata = {}
             round_datasets = []
+            reuse_round = round_number == 1 and f0_cache is not None
+            if reuse_round:
+                from tools.reuse_sr_f0_outputs import copy_cached_round
+
+                dataset_metadata = copy_cached_round(f0_cache, lineage, output_dirs)
             for dataset_name, input_path in current_inputs.items():
                 dataset_output_dir = output_dirs[dataset_name]
-                dataset_metadata[dataset_name] = run_inference_dataset(
-                    dataset_name=dataset_name,
-                    input_path=input_path,
-                    output_dir=dataset_output_dir,
-                    artist=artist,
-                    config=config,
-                    args=round_args,
-                    condition_index=condition_index,
-                    text_embedding_cache=text_embedding_cache,
-                    device=device,
-                    dtype=dtype,
-                    lr_cond_mode=lr_cond_mode,
-                    anchor_path_resolver=original_anchor_for if use_refinement else None,
-                    refinement_round=round_number if use_refinement else None,
-                )
+                if not reuse_round:
+                    dataset_metadata[dataset_name] = run_inference_dataset(
+                        dataset_name=dataset_name,
+                        input_path=input_path,
+                        output_dir=dataset_output_dir,
+                        artist=artist,
+                        config=config,
+                        args=round_args,
+                        condition_index=condition_index,
+                        text_embedding_cache=text_embedding_cache,
+                        device=device,
+                        dtype=dtype,
+                        lr_cond_mode=lr_cond_mode,
+                        anchor_path_resolver=original_anchor_for if use_refinement else None,
+                        refinement_round=round_number if use_refinement else None,
+                    )
                 round_datasets.append((dataset_name, input_path, dataset_output_dir))
 
             _record_round_outputs(lineage, round_number, output_dirs)
@@ -519,6 +554,7 @@ def run_iterative_inference(args):
                     "metrics_dir": str(metrics_dir),
                     "metric_summary": str(metrics_dir / "summary_scores.json"),
                     "missing_output_count": missing_outputs,
+                    "reused_f0": reuse_round,
                 }
             )
             _write_json_atomic(manifest_path, manifest)
@@ -552,6 +588,14 @@ def build_arg_parser():
         help=(
             "Optional shared G_phi refinement adapter. Round 1 uses --checkpoint/F0; "
             "later rounds use this adapter with current SR plus the original-LR anchor."
+        ),
+    )
+    parser.add_argument(
+        "--reuse_f0_dir",
+        default=None,
+        help=(
+            "Reuse validated round-1 F0 images from an existing iterative directory. "
+            "Only selected inputs are copied; round-1 IQA and later rounds still run."
         ),
     )
     parser.add_argument(

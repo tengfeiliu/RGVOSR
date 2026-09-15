@@ -33,9 +33,19 @@ require_file() {
 }
 
 config_field() {
+  local subset_args=()
+  if [[ -n "${TRAIN_MAX_SAMPLES:-}" ]]; then
+    subset_args+=(--train_max_samples "${TRAIN_MAX_SAMPLES}")
+  fi
+  if [[ -n "${TRAIN_SUBSET_SEED:-}" ]]; then
+    subset_args+=(--train_subset_seed "${TRAIN_SUBSET_SEED}")
+  fi
+  if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
+    subset_args+=(--existing_run_dir "${RL_SR_RUN_DIR}")
+  fi
   "${PYTHON_CMD[@]}" tools/resolve_rl_sr_run_dir.py \
     --config "${CONFIG}" --f0_checkpoint "${F0_CHECKPOINT}" --repo_root "${REPO_ROOT}" \
-    --field "$1"
+    "${subset_args[@]}" --field "$1"
 }
 
 require_file "${CONFIG}"
@@ -43,6 +53,8 @@ require_file "${F0_ADAPTER}"
 
 TRAIN_JSONL="$(config_field data_jsonl_path)"
 EVAL_JSONL="$(config_field evaluation_jsonl_path)"
+TRAIN_MAX_SAMPLES="$(config_field train_max_samples)"
+TRAIN_SUBSET_SEED="$(config_field train_subset_seed)"
 ITERATIONS="${ITERATIONS:-$(config_field iterations)}"
 NUM_CANDIDATES="${NUM_CANDIDATES:-$(config_field num_candidates)}"
 SFT_MAX_STEPS="${SFT_MAX_STEPS:-$(config_field sft_max_steps)}"
@@ -65,6 +77,7 @@ if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
 else
   RUN_DIR_ARGS=(
     --config "${CONFIG}" --f0_checkpoint "${F0_CHECKPOINT}" --repo_root "${REPO_ROOT}"
+    --train_max_samples "${TRAIN_MAX_SAMPLES}" --train_subset_seed "${TRAIN_SUBSET_SEED}"
   )
   if [[ -n "${RL_SR_OUTPUT_ROOT:-}" ]]; then
     RUN_DIR_ARGS+=(--output_root "${RL_SR_OUTPUT_ROOT}")
@@ -82,6 +95,7 @@ EVAL_DATASET_DIRS=()
 
 echo "RL-SR run directory: ${RUN_ROOT}"
 echo "Training data JSONL (config.data.jsonl_path): ${TRAIN_JSONL}"
+echo "Training sample limit: ${TRAIN_MAX_SAMPLES} (0=all); subset seed: ${TRAIN_SUBSET_SEED}"
 echo "Evaluation data JSONL: ${EVAL_JSONL}"
 
 run_stage() {
@@ -107,9 +121,10 @@ run_stage() {
 
 prepare_inputs() {
   case "${STAGE}" in
-    all|f0|multiround)
+    all|f0|c|multiround)
       run_stage "00_create_train_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
-        --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training
+        --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training \
+        --max_samples "${TRAIN_MAX_SAMPLES}" --subset_seed "${TRAIN_SUBSET_SEED}" --reuse_existing
       ;;
   esac
   case "${STAGE}" in
@@ -127,16 +142,24 @@ prepare_inputs() {
 }
 
 run_f0() {
-  run_stage "01_f0_round1_train_state" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
-    --checkpoint "${F0_ADAPTER}" --config "${CONFIG}" --input "${TRAIN_INPUT}" \
-    --jsonl_path "${TRAIN_JSONL}" --output_dir "${RUN_ROOT}/01_f0_round1_train_state" \
-    --iterations 1 --upscale 1 --seed "${SEED}" \
-    --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+  if [[ -n "${F0_REUSE_DIR:-}" ]]; then
+    run_stage "01_reuse_f0_round1_train_state" "${PYTHON_CMD[@]}" tools/reuse_sr_f0_outputs.py \
+      --source_dir "${F0_REUSE_DIR}" --checkpoint "${F0_ADAPTER}" --config "${CONFIG}" \
+      --input "${TRAIN_INPUT}" --seed "${SEED}" \
+      --output_dir "${RUN_ROOT}/01_f0_round1_train_state"
+  else
+    run_stage "01_f0_round1_train_state" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+      --checkpoint "${F0_ADAPTER}" --config "${CONFIG}" --input "${TRAIN_INPUT}" \
+      --jsonl_path "${TRAIN_JSONL}" --output_dir "${RUN_ROOT}/01_f0_round1_train_state" \
+      --iterations 1 --upscale 1 --seed "${SEED}" \
+      --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+  fi
 
   run_stage "02_build_states_for_c" "${PYTHON_CMD[@]}" tools/build_sr_refinement_states.py \
     --lineage_jsonl "${RUN_ROOT}/01_f0_round1_train_state/sample_lineage.jsonl" \
     --source_jsonl "${TRAIN_JSONL}" --dataset_id "${DATASET_ID}" \
     --artifact_root "${RUN_ROOT}/01_f0_round1_train_state" --producer_adapter "${F0_ADAPTER}" \
+    --sampler_manifest "${RUN_ROOT}/01_f0_round1_train_state/round_01/inference_manifest.json" \
     --output_jsonl "${RUN_ROOT}/02_states_for_c.jsonl" --max_round 2
 }
 
@@ -151,10 +174,17 @@ run_c() {
 run_multiround() {
   local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
   require_file "${g_sft_adapter}"
+  local f0_reuse_args=()
+  # A reused 01 is carried into 04 so the same y_1 is not generated again.
+  # An ordinary run retains the previous inference path.
+  if [[ -f "${RUN_ROOT}/01_f0_round1_train_state/f0_reuse_manifest.json" ]]; then
+    f0_reuse_args+=(--reuse_f0_dir "${RUN_ROOT}/01_f0_round1_train_state")
+  fi
   run_stage "04_sft_multiround_train_state" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
     --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
     --config "${CONFIG}" --input "${TRAIN_INPUT}" --jsonl_path "${TRAIN_JSONL}" \
     --output_dir "${RUN_ROOT}/04_sft_multiround_train_state" \
+    "${f0_reuse_args[@]}" \
     --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
 
@@ -163,6 +193,7 @@ run_multiround() {
     --source_jsonl "${TRAIN_JSONL}" --dataset_id "${DATASET_ID}" \
     --artifact_root "${RUN_ROOT}/04_sft_multiround_train_state" --producer_adapter "${g_sft_adapter}" \
     --round_producer_adapter "1=${F0_ADAPTER}" \
+    --sampler_manifest "${RUN_ROOT}/04_sft_multiround_train_state/round_01/inference_manifest.json" \
     --output_jsonl "${RUN_ROOT}/05_states_for_rl.jsonl" --max_round "${ITERATIONS}"
 
   run_stage "06_sft_multiround_evaluation" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \

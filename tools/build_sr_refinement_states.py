@@ -133,6 +133,14 @@ def build_states(args):
         "init_mode": args.inference_init_mode,
         "sigma_start": args.inference_sigma_start,
     }
+    if args.sampler_manifest:
+        sampling = json.loads(Path(args.sampler_manifest).read_text(encoding="utf-8"))["sampling"]
+        sampler_payload = {
+            "num_steps": sampling["num_inference_steps"],
+            "schedule": sampling["schedule"],
+            "init_mode": sampling["init_mode"],
+            "sigma_start": sampling["sigma_start"],
+        }
     sampler_hash = identity_sha256(sampler_payload)
     records = []
     for lineage in read_jsonl(args.lineage_jsonl):
@@ -265,7 +273,9 @@ def parse_args():
     )
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--max_round", type=int, default=4)
-    parser.add_argument("--sampler_json", default=None, help="Canonical sampler JSON; overrides individual sampler flags.")
+    sampler_source = parser.add_mutually_exclusive_group()
+    sampler_source.add_argument("--sampler_json", default=None, help="Canonical sampler JSON; overrides individual sampler flags.")
+    sampler_source.add_argument("--sampler_manifest", default=None, help="Read actual sampling parameters from a round's inference_manifest.json.")
     parser.add_argument("--num_inference_steps", type=int, default=25)
     parser.add_argument("--inference_schedule", default="linear")
     parser.add_argument("--inference_init_mode", default="pure_noise")

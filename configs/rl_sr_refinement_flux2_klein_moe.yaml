@@ -117,6 +117,10 @@ rl_sr:
   output_root: exp_rg_flux_rl
   run_prefix: rlsr
   dataset_id: lsdir_precrop512_v1
+  # Maximum unique training LQ images across A-E (0 = all). Evaluation stays full.
+  # Override with TRAIN_MAX_SAMPLES=4000 for a smaller one-click experiment.
+  train_max_samples: 0
+  train_subset_seed: 42
   iterations: 4
   num_candidates: 4
   reward_device: cuda

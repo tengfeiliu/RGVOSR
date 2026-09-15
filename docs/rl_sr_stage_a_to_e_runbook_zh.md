@@ -177,3 +177,105 @@ RL_SR_RUN_DIR=<自动创建的运行目录> \
 
 可把 `eval` 替换成 `f0`、`c`、`multiround`、`reward` 或 `e`。这些单阶段命令仍会
 自动恢复 JSONL 输入清单；不会要求数据根目录参数。
+
+## 小规模快速验证：限制训练图片数
+
+使用 `TRAIN_MAX_SAMPLES=4000` 将训练输入限制为最多 4000 张不同的原始 LQ。
+默认 `0`（或旧配置未填写）仍使用全量。也可以在原配置的 `rl_sr` 下设置：
+
+```yaml
+rl_sr:
+  train_max_samples: 4000
+  train_subset_seed: 42
+```
+
+环境变量 `TRAIN_MAX_SAMPLES`、`TRAIN_SUBSET_SEED` 优先于新实验的 YAML 配置。
+抽样在去重后进行，使用固定种子、无放回随机选择，并保持所选图片的 JSONL 顺序。
+相同源记录顺序和种子在不同服务器上选择同一批样本；绝对挂载路径不参与抽样排序或
+任何新哈希。实际图片不足上限时使用全部可用图片，负数及非整数会报错。
+源 JSONL 不会被裁剪、修改或另存为条件 JSONL，原有 caption/IQA/suggestion 仍从原文件读取。
+
+从仓库根目录运行（保留原来的 `F0_CHECKPOINT`、`CONFIG` 等设置）：
+
+```bash
+nohup env -u RL_SR_RUN_DIR \
+  TRAIN_MAX_SAMPLES=4000 TRAIN_SUBSET_SEED=42 \
+  CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  CONDA_ENV=sr-flux2 \
+  bash tools/run_rl_sr_stage_ae.sh all \
+  > "rlsr_n4000_$(date +%y%m%d-%H%M%S).log" 2>&1 < /dev/null &
+```
+
+该限制会沿整个训练链路生效：01 的 F0 推理和 IQA 只处理所选图片，02/C 使用这些
+图片对应的精修状态，04/05 使用同一批图片生成多轮状态，D/E 的候选采样、奖励评分和
+SFT replay 从这些状态读取。RealLQ250、RealLR200 的推理和评估保持完整，并自动执行。
+训练最大步数仍由 `SFT_MAX_STEPS` 和 `RL_MAX_STEPS` 控制，不随图片数自动改变。
+
+4000 是原始训练图片数量，不是所有阶段输出图片的总数。例如 `iterations=4`、
+`num_candidates=4` 时，D 阶段约有 `4000 × 3 × 4 = 48000` 个候选；C/多轮推理
+和两个完整评估集还会产生各自的输出，因此总耗时不会严格缩短到原来的十分之一。
+
+新运行目录名称会增加 `n4000-ss42`，并保留配置标签和时间。抽样参数记录于
+`run_context.json`；完整输入数和实际抽样数记录于
+`00_inputs/train_lq_inputs.manifest.json`，实际图片列表在 `00_inputs/train_lq_inputs.txt`。
+
+运行中的旧进程不会因修改 YAML 或环境变量自动缩小输入。已有全量运行不能通过
+`RL_SR_RUN_DIR=<旧目录> TRAIN_MAX_SAMPLES=4000` 改为子集：启动器会在修改输出前拒绝，
+防止 C 使用全量旧状态、后续却使用子集。请启动新实验；已有图片和模型保持不变。
+如果已经生成了全量 F0 图片，可以使用下面的 `F0_REUSE_DIR` 在新实验中复用所选图片。
+继续一个已经建立的子集实验时，指定其 `RL_SR_RUN_DIR` 即可自动恢复原抽样规模和种子，
+无须再次填写；显式传入不同规模或种子会报错。
+
+## 已生成全量 y_1：复用 01，自动继续到 E 和评估
+
+将本次代码同步到服务器后，在仓库根目录执行。`F0_CHECKPOINT`、`CONFIG` 继续沿用原实验的
+设置；只需增加 `F0_REUSE_DIR`，指向旧实验的 `01_f0_round1_train_state`，也可指向其父运行目录。
+不要将 `RL_SR_RUN_DIR` 指向旧全量实验，因为新实验需要自己的 4000 张输入清单和输出目录。
+
+```bash
+export F0_REUSE_DIR="exp_rg_flux_rl/旧实验目录/01_f0_round1_train_state"
+
+nohup env -u RL_SR_RUN_DIR \
+  F0_REUSE_DIR="$F0_REUSE_DIR" \
+  TRAIN_MAX_SAMPLES=4000 TRAIN_SUBSET_SEED=42 \
+  CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
+  CONDA_ENV=sr-flux2 \
+  bash tools/run_rl_sr_stage_ae.sh all \
+  > "rlsr_reuse_f0_n4000_$(date +%y%m%d-%H%M%S).log" 2>&1 < /dev/null &
+```
+
+自动执行的顺序如下：
+
+1. 从原 `data.jsonl_path` 中确定最多 4000 张 LQ，保留原条件 JSONL。
+2. `01_reuse_f0_round1_train_state` 根据旧 `sample_lineage.jsonl` 的原始 LQ 路径匹配对应
+   `y_1`，只复制所选 PNG 到新 `01_f0_round1_train_state/round_01/default/`。
+   此步骤不加载 F0、不重新进行 25-step 推理，也不计算 01 的 IQA。
+3. `02_build_states_for_c` 使用这些 `y_1`、原始 LQ 和真实配对 HR 构建 C 的训练状态，
+   实际采样设置从 `round_01/inference_manifest.json` 读取，然后自动运行 03 的共享 SFT。
+4. 04 自动检测新 01 的复用记录，直接复制这些 `y_1` 作为第一轮结果，从第二轮起使用
+   SFT 精修器生成输出；原始 LR 锚点和 JSONL 条件仍指向原输入。04 仍为选中的 4000 张
+   图片计算逐轮 IQA，以便观察各轮变化，不使用旧全量数据的指标均值。
+5. 自动继续 D/E、RealLQ250 和 RealLR200 的完整推理/评估，输出 SFT 与 RL 对比结果。
+
+新目录名仍包含 `n4000-ss42`、配置标签和时间；启动日志的 `RL-SR run directory` 行给出实际位置。
+新 01 的 `f0_reuse_manifest.json` 记录来源目录、复用数量、权重内容哈希和采样参数；
+`sample_lineage.jsonl` 指向新目录中复制后的图片。复制完成后，新训练不依赖旧输出目录，
+原始 LR/HR 和 F0 checkpoint 仍须可访问。工具不会修改旧实验图片或旧日志；不传复用参数时，
+原有的完整推理流程仍可运行。
+
+旧 01 必须保留 `sample_lineage.jsonl`、`iterative_manifest.json`、
+`round_01/inference_manifest.json` 及所选样本对应的 PNG。图片生成结束后，这些清单会在
+IQA 之前写入，因此旧任务仍显示 `running` 或在 IQA 阶段失败，并不影响复用；但仅有 PNG、
+缺少来源/采样清单时不会猜测匹配。所选图片缺失、损坏、重复，或已记录的 F0 权重、采样步数、
+种子、输入尺度、prompt 模式等不匹配时，导入会报错，不会悄悄减少训练规模。
+
+旧版本没有保存生成当时的权重哈希，因此首次导入需要旧清单中的 checkpoint 路径仍可访问，
+并比较其当前内容与本次 F0。此检查不能追溯检测“旧 checkpoint 文件已被原地改写”，也无法
+检测旧清单未记录的配置/原 JSONL 文本变更；应保持原 F0、原配对数据及条件设置不变。
+权重哈希只使用内容与相对文件名，不包含绝对挂载目录；运行时图片路径用于定位文件，
+在迁移服务器后仍需有效。复用的是旧全量推理实际生成的图片，不承诺与重新对 4000 张
+子集推理的结果逐像素相同，因为原推理的随机数消耗还受样本顺序影响。
+
+复用节省的是 01 的生成/IQA，以及 04 的第一轮生成；C/E 训练、第二轮之后的生成、
+候选采样和正式评估仍需要运行。若旧全量任务仍在继续计算 IQA，它不会因为新任务启动而
+自动结束；确认图片与清单完整后，可以自行停止旧任务，避免两项任务争用资源。
