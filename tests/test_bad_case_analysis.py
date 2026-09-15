@@ -40,18 +40,18 @@ class BadCaseAnalysisTests(unittest.TestCase):
             write_scores(
                 scores,
                 [
-                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa": 0.9},
-                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa": 0.1},
-                    {"dataset": "RealLQ250", "filename": "c.png", "path": sr_dir / "c.png", "width": 16, "height": 16, "maniqa": 0.3},
+                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa-pipal": 0.9},
+                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa-pipal": 0.1},
+                    {"dataset": "RealLQ250", "filename": "c.png", "path": sr_dir / "c.png", "width": 16, "height": 16, "maniqa-pipal": 0.3},
                 ],
-                ["maniqa"],
+                ["maniqa-pipal"],
             )
 
-            output = root / "bad_maniqa"
+            output = root / "bad_maniqa-pipal"
             run_analysis(
                 metrics_csv=scores,
                 summary_json=None,
-                metrics=["maniqa"],
+                metrics=["maniqa-pipal"],
                 mode="separate",
                 worst_k=2,
                 lq_dirs={"RealLQ250": lq_dir},
@@ -113,24 +113,24 @@ class BadCaseAnalysisTests(unittest.TestCase):
             write_scores(
                 scores,
                 [
-                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa": 0.1, "niqe": 2.0},
-                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa": 0.9, "niqe": 8.0},
+                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa-pipal": 0.1, "niqe": 2.0},
+                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa-pipal": 0.9, "niqe": 8.0},
                 ],
-                ["maniqa", "niqe"],
+                ["maniqa-pipal", "niqe"],
             )
 
             output = root / "bad"
             run_analysis(
                 metrics_csv=scores,
                 summary_json=None,
-                metrics=["maniqa", "niqe"],
+                metrics=["maniqa-pipal", "niqe"],
                 mode="separate",
                 worst_k=1,
                 lq_dirs={"RealLQ250": lq_dir},
                 output_dir=output,
             )
 
-            self.assertEqual(read_worst_cases(output / "maniqa" / "worst_cases.csv")[0]["filename"], "a.png")
+            self.assertEqual(read_worst_cases(output / "maniqa-pipal" / "worst_cases.csv")[0]["filename"], "a.png")
             self.assertEqual(read_worst_cases(output / "niqe" / "worst_cases.csv")[0]["filename"], "b.png")
 
     def test_joint_mean_normalizes_metric_badness_and_averages(self):
@@ -148,14 +148,14 @@ class BadCaseAnalysisTests(unittest.TestCase):
             write_scores(
                 scores,
                 [
-                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa": 1.0, "niqe": 1.0},
-                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa": 0.0, "niqe": 10.0},
-                    {"dataset": "RealLQ250", "filename": "c.png", "path": sr_dir / "c.png", "width": 16, "height": 16, "maniqa": 0.5, "niqe": 5.5},
+                    {"dataset": "RealLQ250", "filename": "a.png", "path": sr_dir / "a.png", "width": 16, "height": 16, "maniqa-pipal": 1.0, "niqe": 1.0},
+                    {"dataset": "RealLQ250", "filename": "b.png", "path": sr_dir / "b.png", "width": 16, "height": 16, "maniqa-pipal": 0.0, "niqe": 10.0},
+                    {"dataset": "RealLQ250", "filename": "c.png", "path": sr_dir / "c.png", "width": 16, "height": 16, "maniqa-pipal": 0.5, "niqe": 5.5},
                 ],
-                ["maniqa", "niqe"],
+                ["maniqa-pipal", "niqe"],
             )
             summary.write_text(
-                json.dumps({"metric_directions": {"maniqa": "higher_better", "niqe": "lower_better"}}),
+                json.dumps({"metric_directions": {"maniqa-pipal": "higher_better", "niqe": "lower_better"}}),
                 encoding="utf-8",
             )
 
@@ -163,14 +163,14 @@ class BadCaseAnalysisTests(unittest.TestCase):
             run_analysis(
                 metrics_csv=scores,
                 summary_json=summary,
-                metrics=["maniqa", "niqe"],
+                metrics=["maniqa-pipal", "niqe"],
                 mode="joint_mean",
                 worst_k=2,
                 lq_dirs={"RealLQ250": lq_dir},
                 output_dir=output,
             )
 
-            rows = read_worst_cases(output / "joint_mean_maniqa_niqe" / "worst_cases.csv")
+            rows = read_worst_cases(output / "joint_mean_maniqa-pipal_niqe" / "worst_cases.csv")
             self.assertEqual([row["filename"] for row in rows], ["b.png", "c.png"])
             self.assertAlmostEqual(float(rows[0]["joint_badness"]), 1.0)
             self.assertAlmostEqual(float(rows[1]["joint_badness"]), 0.5)
@@ -187,16 +187,16 @@ class BadCaseAnalysisTests(unittest.TestCase):
             write_scores(
                 scores,
                 [
-                    {"dataset": "RealLQ250", "filename": "missing.png", "path": sr_dir / "missing.png", "width": 16, "height": 16, "maniqa": 0.1},
+                    {"dataset": "RealLQ250", "filename": "missing.png", "path": sr_dir / "missing.png", "width": 16, "height": 16, "maniqa-pipal": 0.1},
                 ],
-                ["maniqa"],
+                ["maniqa-pipal"],
             )
 
             output = root / "bad"
             run_analysis(
                 metrics_csv=scores,
                 summary_json=None,
-                metrics=["maniqa"],
+                metrics=["maniqa-pipal"],
                 mode="separate",
                 worst_k=1,
                 lq_dirs={"RealLQ250": lq_dir},
@@ -229,10 +229,10 @@ class BadCaseAnalysisTests(unittest.TestCase):
                         "path": sr_path,
                         "width": 64,
                         "height": 64,
-                        "maniqa": 0.1,
+                        "maniqa-pipal": 0.1,
                     }
                 ],
-                ["maniqa"],
+                ["maniqa-pipal"],
             )
             conditions = root / "conditions.jsonl"
             conditions.write_text(
@@ -284,7 +284,7 @@ class BadCaseAnalysisTests(unittest.TestCase):
             run_analysis(
                 metrics_csv=scores,
                 summary_json=None,
-                metrics=["maniqa"],
+                metrics=["maniqa-pipal"],
                 mode="separate",
                 worst_k=1,
                 lq_dirs={"RealLQ250": lq_dir},
@@ -315,7 +315,7 @@ class BadCaseAnalysisTests(unittest.TestCase):
                 "rank": 1,
                 "dataset": "RealLQ250",
                 "filename": "sr.png",
-                "maniqa": 0.1,
+                "maniqa-pipal": 0.1,
             }
 
             font = load_report_font(40)
@@ -324,7 +324,7 @@ class BadCaseAnalysisTests(unittest.TestCase):
                 row,
                 lq_path,
                 output_path,
-                ["maniqa"],
+                ["maniqa-pipal"],
                 prompt="A readable prompt rendered at forty pixels.",
                 font_size=40,
             )
@@ -351,10 +351,10 @@ class BadCaseAnalysisTests(unittest.TestCase):
                         "path": sr_dir / "sample.png",
                         "width": 16,
                         "height": 16,
-                        "maniqa": 0.1,
+                        "maniqa-pipal": 0.1,
                     }
                 ],
-                ["maniqa"],
+                ["maniqa-pipal"],
             )
             pairing = root / "inference" / "RealLQ250" / "suggestion_pairing.jsonl"
             pairing.parent.mkdir(parents=True)
@@ -389,7 +389,7 @@ class BadCaseAnalysisTests(unittest.TestCase):
             run_analysis(
                 metrics_csv=scores,
                 summary_json=None,
-                metrics=["maniqa"],
+                metrics=["maniqa-pipal"],
                 mode="separate",
                 worst_k=1,
                 lq_dirs={"RealLQ250": lq_dir},

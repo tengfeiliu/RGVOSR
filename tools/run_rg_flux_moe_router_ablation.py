@@ -228,7 +228,7 @@ def build_arg_parser():
     parser.add_argument("--metric_device", default="cpu")
     parser.add_argument("--skip_eval", action="store_true")
     parser.add_argument("--run_bad_cases", action="store_true")
-    parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa", "musiq"])
+    parser.add_argument("--bad_case_metrics", nargs="+", default=["clipiqa", "maniqa-pipal", "musiq"])
     parser.add_argument("--bad_case_mode", choices=("separate", "joint_mean"), default="separate")
     parser.add_argument("--bad_case_worst_k", type=int, default=50)
     parser.add_argument("--bad_case_font_size", type=int, default=40)

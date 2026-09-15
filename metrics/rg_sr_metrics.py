@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 
-DEFAULT_OMGSR_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"]
+DEFAULT_OMGSR_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa-pipal"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 LOWER_BETTER_FALLBACKS = {"niqe", "brisque", "piqe", "ilniqe"}
 

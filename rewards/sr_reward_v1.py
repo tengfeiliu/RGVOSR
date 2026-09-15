@@ -129,7 +129,7 @@ class RewardCalibration:
 class PyIQAMetricEnsemble:
     """Lazy PyIQA wrapper; absence of PyIQA is reported, never silently faked."""
 
-    def __init__(self, metrics=("clipiqa", "musiq", "maniqa"), device="cuda"):
+    def __init__(self, metrics=("clipiqa", "musiq", "maniqa-pipal"), device="cuda"):
         self.metric_names = tuple(str(metric) for metric in metrics)
         self.device = str(device)
         self._metrics = None
@@ -198,7 +198,7 @@ class AutoSRRewardV1:
     def __init__(
         self,
         calibration: RewardCalibration | None = None,
-        quality_metrics=("clipiqa", "musiq", "maniqa"),
+        quality_metrics=("clipiqa", "musiq", "maniqa-pipal"),
         quality_device="cuda",
         weights: Mapping[str, float] | None = None,
         enable_quality: bool = True,

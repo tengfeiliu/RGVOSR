@@ -16,7 +16,7 @@ class RGSrMetricsTests(unittest.TestCase):
 
         self.assertEqual(
             DEFAULT_OMGSR_METRICS,
-            ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"],
+            ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa-pipal"],
         )
 
     def test_metric_direction_uses_lower_better_fallback_for_niqe(self):
@@ -142,7 +142,7 @@ class RGSrMetricsTests(unittest.TestCase):
             self.assertEqual(evaluation["eval_every"], 500)
             self.assertEqual(evaluation["num_samples"], 8)
             self.assertEqual(evaluation["output_dir"], "eval")
-            self.assertEqual(evaluation["metrics"], ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa"])
+            self.assertEqual(evaluation["metrics"], ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa-pipal"])
 
     def test_train_script_wires_periodic_rg_flux_evaluation(self):
         source = Path("train_rg_flux_sr.py").read_text(encoding="utf-8")

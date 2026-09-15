@@ -34,10 +34,10 @@ CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_pip
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda \
   --run_bad_cases \
-  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_metrics clipiqa maniqa-pipal musiq \
   --bad_case_mode separate \
   --bad_case_worst_k 50
 ```
@@ -59,10 +59,10 @@ CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_pip
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda \
   --run_bad_cases \
-  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_metrics clipiqa maniqa-pipal musiq \
   --bad_case_mode separate \
   --bad_case_worst_k 50
 ```
@@ -95,10 +95,10 @@ CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_moe
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda \
   --run_bad_cases \
-  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_metrics clipiqa maniqa-pipal musiq \
   --bad_case_mode separate \
   --bad_case_worst_k 50
 ```
@@ -121,15 +121,15 @@ CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false python tools/run_rg_flux_moe
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda \
   --run_bad_cases \
-  --bad_case_metrics clipiqa maniqa musiq \
+  --bad_case_metrics clipiqa maniqa-pipal musiq \
   --bad_case_mode separate \
   --bad_case_worst_k 50
 ```
 
-`--bad_case_mode separate` 会分别输出 `clipiqa/maniqa/musiq` 三组 bad cases；如果想看多指标联合排序，可以改成：
+`--bad_case_mode separate` 会分别输出 `clipiqa/maniqa-pipal/musiq` 三组 bad cases；如果想看多指标联合排序，可以改成：
 
 ```bash
 --bad_case_mode joint_mean
@@ -425,7 +425,7 @@ python tools/run_rg_flux_moe_pipeline.py \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda
 ```
 
@@ -471,7 +471,7 @@ python tools/run_rg_flux_moe_pipeline.py \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda
 ```
 
@@ -729,7 +729,7 @@ eval/inference/rg_flux2_cached_fixed_prompt/
 python eval_rg_flux_sr_metrics.py \
   --inference_manifest eval/inference/rg_flux2_cached_fixed_prompt/rg_flux2_klein_sr_ms_stageA_flux2_image_concat_size512_flux2_klein_smoke256_v0621_26062810/checkpoint-00032000/inference_manifest.json \
   --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal
 ```
 
 旧的 `--checkpoint ... --output_dir ...` 方式仍然兼容。使用旧方式时，不要把 `--output_dir` 写成 `.../RealLQ250` 这类单个数据集目录；多数据集模式会自动追加 `dataset_name`，否则路径会变成 `.../RealLQ250/realLQ250` 和 `.../RealLQ250/realLR200`。
@@ -755,7 +755,7 @@ python tools/run_rg_flux_pipeline.py \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda
 ```
 
@@ -804,7 +804,7 @@ python tools/run_rg_flux_pipeline.py \
   --num_inference_steps 25 \
   --upscale 4 \
   --dtype bf16 \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa \
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal \
   --metric_device cuda
 ```
 
@@ -881,7 +881,7 @@ python eval_rg_flux_sr_metrics.py \
   --dataset_dirs smoke=outputs/rg_flux_sr \
   --output_dir eval/rg_flux_sr_smoke \
   --device cuda \
-  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa
+  --metrics clipiqa clipiqa+ nima niqe liqe musiq maniqa-pipal
 ```
 
 输出文件：
@@ -901,7 +901,7 @@ eval/rg_flux_sr_smoke/
 - `niqe`
 - `liqe`
 - `musiq`
-- `maniqa`
+- `maniqa-pipal`
 
 其中 `niqe` 是 lower better，其余通常是 higher better。
 
@@ -926,7 +926,7 @@ evaluation:
   eval_every: 500
   num_samples: 8
   num_inference_steps: 25
-  metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa]
+  metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa-pipal]
   jsonl_path: null
   output_dir: eval
   device: cpu

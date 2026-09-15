@@ -678,7 +678,7 @@ def build_arg_parser():
     )
     parser.add_argument("--metrics_csv", type=Path, required=True, help="metrics/per_image_scores.csv")
     parser.add_argument("--summary_json", type=Path, default=None, help="metrics/summary_scores.json")
-    parser.add_argument("--metric", default=None, help="Single metric to analyze, e.g. maniqa")
+    parser.add_argument("--metric", default=None, help="Single metric to analyze, e.g. maniqa-pipal")
     parser.add_argument("--metrics", nargs="+", default=None, help="Multiple metrics to analyze")
     parser.add_argument("--mode", choices=["separate", "joint_mean"], default="separate")
     parser.add_argument("--worst_k", type=int, default=50)

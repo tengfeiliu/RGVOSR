@@ -58,7 +58,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollout_jsonl", required=True)
     parser.add_argument("--output_json", required=True)
-    parser.add_argument("--metrics", nargs="+", default=["clipiqa", "musiq", "maniqa"])
+    parser.add_argument("--metrics", nargs="+", default=["clipiqa", "musiq", "maniqa-pipal"])
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 

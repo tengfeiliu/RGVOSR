@@ -176,7 +176,7 @@ class RGFluxPipelineCliTests(unittest.TestCase):
 
             class RunContainedArgs(Args):
                 inference_output_root = None
-                bad_case_metrics = ["clipiqa", "maniqa"]
+                bad_case_metrics = ["clipiqa", "maniqa-pipal"]
                 bad_case_mode = "joint_mean"
                 bad_case_worst_k = 25
 

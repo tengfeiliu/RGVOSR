@@ -844,7 +844,7 @@ loss:
 - [ ] 第 1000 step：`g_d` entropy / log(K_d) ∈ [0.5, 0.95]（不 collapse 也不 uniform）。
 - [ ] `g_s` 的 top-1 distribution 在 K_s 上不 collapse（每个 expert 使用率 ≥ 5%）。
 - [ ] LoRA delta L2 norm 随训练单调上升，但不爆炸。
-- [ ] 与 baseline 在 LSDIR val 上的 CLIPIQA / MUSIQ / MANIQA 比较：MoLE ≥ baseline。
+- [ ] 与 baseline 在 LSDIR val 上的 CLIPIQA / MUSIQ / maniqa-pipal 比较：MoLE ≥ baseline。
 - [ ] Routing 可视化：每个 expert 激活样本 IQA 关键词分布有显著差异（χ² test p < 0.01）。
 - [ ] Scene cluster 代表样本人工 inspect 后能看出语义/场景差异。
 

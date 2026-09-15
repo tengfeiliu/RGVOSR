@@ -111,7 +111,7 @@ def parse_args():
     parser.add_argument("--rollout_jsonl", required=True)
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--calibration_json", default=None)
-    parser.add_argument("--quality_metrics", nargs="+", default=["clipiqa", "musiq", "maniqa"])
+    parser.add_argument("--quality_metrics", nargs="+", default=["clipiqa", "musiq", "maniqa-pipal"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no_quality", action="store_true", help="Diagnostic only; does not replace a calibrated quality run.")
     return parser.parse_args()
