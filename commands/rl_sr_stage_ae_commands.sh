@@ -57,7 +57,7 @@ Usage:
   F0_CHECKPOINT=<checkpoint> \
     bash commands/rl_sr_stage_ae_commands.sh fresh-all
 
-  F0_CHECKPOINT=<checkpoint> RL_SR_RUN_DIR=<existing-run-dir> \
+  RL_SR_RUN_DIR=<existing-run-dir> [F0_CHECKPOINT=<checkpoint>] \
     bash commands/rl_sr_stage_ae_commands.sh \
     {resume-from04|resume-from05|resume-c|resume-multiround|resume-reward|resume-e|resume-eval}
 
@@ -81,6 +81,8 @@ Optional environment variables:
   reuse-all/fresh-all 会创建新实验，因此忽略 RL_SR_RUN_DIR。
   resume-* 必须提供 RL_SR_RUN_DIR，并继承该实验保存的样本数量与抽样种子。
   inspect 只检查文件，不需要 F0_CHECKPOINT，也不会启动训练或评估。
+  resume-* 会优先验证 F0_CHECKPOINT；无效或未设置时，从现有04的
+  iterative_manifest.json 自动恢复实际 checkpoint_path。
 EOF
 }
 
@@ -102,6 +104,36 @@ require_path() {
     echo "${name} does not exist: ${value}" >&2
     exit 2
   fi
+}
+
+is_f0_adapter() {
+  local candidate="$1"
+  [[ -f "${candidate}/flux2_klein_lora_moe_state.pt" ]] || \
+    [[ -f "${candidate}/rg_flux_adapters/flux2_klein_lora_moe_state.pt" ]]
+}
+
+resolve_resume_f0_checkpoint() {
+  if [[ -n "${F0_CHECKPOINT:-}" ]] && is_f0_adapter "${F0_CHECKPOINT}"; then
+    return
+  fi
+
+  local manifest="${RL_SR_RUN_DIR}/04_sft_multiround_train_state/iterative_manifest.json"
+  if [[ -f "${manifest}" ]]; then
+    local discovered
+    discovered="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("checkpoint_path", ""))' "${manifest}")"
+    if [[ -n "${discovered}" ]] && is_f0_adapter "${discovered}"; then
+      if [[ -n "${F0_CHECKPOINT:-}" ]]; then
+        printf 'Ignoring invalid F0_CHECKPOINT=%s\n' "${F0_CHECKPOINT}" >&2
+      fi
+      F0_CHECKPOINT="${discovered}"
+      export F0_CHECKPOINT
+      printf 'Recovered F0 checkpoint from 04 manifest: %s\n' "${F0_CHECKPOINT}"
+      return
+    fi
+  fi
+
+  echo "Cannot resolve a valid F0 adapter. Set F0_CHECKPOINT to checkpoint-00036000 (not 01_f0_round1_train_state)." >&2
+  exit 2
 }
 
 launch_new() {
@@ -218,38 +250,38 @@ case "${ACTION}" in
     launch_new "fresh_f0" ""
     ;;
   resume-from04)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "from04" "resume_from04_to_final"
     ;;
   resume-from05)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "from05" "resume_from05_to_final"
     ;;
   resume-c)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "c" "resume_c"
     ;;
   resume-multiround)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "multiround" "resume_multiround"
     ;;
   resume-reward)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "reward" "resume_reward"
     ;;
   resume-e)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "e" "resume_e"
     ;;
   resume-eval)
-    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
     launch_resume "eval" "resume_eval"
     ;;
   inspect)
