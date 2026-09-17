@@ -1,5 +1,6 @@
 import csv
 import contextlib
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -60,6 +61,31 @@ def collect_images(dataset_dirs):
             raise FileNotFoundError(f"No images found for '{dataset}' under {directory}")
         images_by_dataset[dataset] = images
     return images_by_dataset
+
+
+def sample_images(images_by_dataset, max_samples_per_dataset=None, sample_seed=42):
+    """Select a portable deterministic metric subset for each dataset.
+
+    Selection depends on dataset name, image filename and the explicit seed;
+    absolute server paths never affect which images are chosen.  ``None`` means
+    all images.  Expected dataset counts must be checked before calling this.
+    """
+    if max_samples_per_dataset is None:
+        return {name: list(images) for name, images in images_by_dataset.items()}
+    limit = int(max_samples_per_dataset)
+    if limit <= 0:
+        raise ValueError("max_samples_per_dataset must be positive or None")
+    selected = {}
+    for dataset, images in images_by_dataset.items():
+        ranked = sorted(
+            images,
+            key=lambda path: hashlib.sha256(
+                f"{int(sample_seed)}:{dataset}:{Path(path).name}".encode("utf-8")
+            ).hexdigest(),
+        )
+        chosen = set(ranked[:limit])
+        selected[dataset] = [path for path in images if path in chosen]
+    return selected
 
 
 def validate_expected_counts(images_by_dataset, expected_counts):
@@ -178,7 +204,7 @@ def write_csv(path, rows, fieldnames):
         writer.writerows(rows)
 
 
-def write_outputs(output_dir, rows, summary_rows, metrics, directions):
+def write_outputs(output_dir, rows, summary_rows, metrics, directions, metadata=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(output_dir / "per_image_scores.csv", rows, ["dataset", "filename", "path", "width", "height", *metrics])
@@ -188,18 +214,47 @@ def write_outputs(output_dir, rows, summary_rows, metrics, directions):
         "metrics": list(metrics),
         "metric_directions": directions,
         "summary": summary_rows,
+        **dict(metadata or {}),
     }
     with (output_dir / "summary_scores.json").open("w", encoding="utf-8") as handle:
         json.dump(summary_json, handle, indent=2)
     return summary_json
 
 
-def evaluate_dataset_dirs(dataset_dirs, output_dir, metrics=None, device="cpu", expected_counts=None):
+def evaluate_dataset_dirs(
+    dataset_dirs,
+    output_dir,
+    metrics=None,
+    device="cpu",
+    expected_counts=None,
+    max_samples_per_dataset=None,
+    sample_seed=42,
+):
     metrics = list(metrics or DEFAULT_OMGSR_METRICS)
     expected_counts = expected_counts or {}
     images_by_dataset = collect_images(dataset_dirs)
     validate_expected_counts(images_by_dataset, expected_counts)
-    rows = build_rows(images_by_dataset)
+    total_counts = {name: len(images) for name, images in images_by_dataset.items()}
+    evaluated_images = sample_images(
+        images_by_dataset,
+        max_samples_per_dataset=max_samples_per_dataset,
+        sample_seed=sample_seed,
+    )
+    rows = build_rows(evaluated_images)
     directions = evaluate_metrics(rows, metrics, device)
     summary_rows = build_summary(rows, list(images_by_dataset.keys()), metrics)
-    return write_outputs(output_dir, rows, summary_rows, metrics, directions)
+    return write_outputs(
+        output_dir,
+        rows,
+        summary_rows,
+        metrics,
+        directions,
+        metadata={
+            "total_image_counts": total_counts,
+            "evaluated_image_counts": {
+                name: len(images) for name, images in evaluated_images.items()
+            },
+            "max_samples_per_dataset": max_samples_per_dataset,
+            "sample_seed": int(sample_seed) if max_samples_per_dataset is not None else None,
+        },
+    )

@@ -124,6 +124,11 @@ p || (1-beta) v_old + beta v_phi - v_target ||²
 
 仓库提供 [run_rl_sr_stage_ae.sh](../tools/run_rl_sr_stage_ae.sh)。它会依次完成：
 
+所有可直接复制或执行的后台命令统一保存在
+[rl_sr_stage_ae_commands.sh](../commands/rl_sr_stage_ae_commands.sh)。该文件包含复用已有
+`y_1`、重新生成 F0、以及从 C、多轮状态、D、E、最终评估分别续跑的入口；文件头标注了
+每个命令覆盖的阶段编号和输出。下面的命令片段保留用于解释，一键运行时优先使用该命令文件。
+
 1. 从 `config.data.jsonl_path` 自动取出 LQ，并生成运行时输入清单；
 2. 生成 F0 的训练状态、训练共享 SFT、生成多轮训练状态；
 3. 自动采样、校准和计算 reward，再执行输出级 NFT；
@@ -233,16 +238,68 @@ SFT replay 从这些状态读取。RealLQ250、RealLR200 的推理和评估保�
 不要将 `RL_SR_RUN_DIR` 指向旧全量实验，因为新实验需要自己的 4000 张输入清单和输出目录。
 
 ```bash
-export F0_REUSE_DIR="exp_rg_flux_rl/旧实验目录/01_f0_round1_train_state"
-
-nohup env -u RL_SR_RUN_DIR \
-  F0_REUSE_DIR="$F0_REUSE_DIR" \
-  TRAIN_MAX_SAMPLES=4000 TRAIN_SUBSET_SEED=42 \
-  CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 \
-  CONDA_ENV=sr-flux2 \
-  bash tools/run_rl_sr_stage_ae.sh all \
-  > "rlsr_reuse_f0_n4000_$(date +%y%m%d-%H%M%S).log" 2>&1 < /dev/null &
+F0_CHECKPOINT=<CHECKPOINT-00036000_OR_RG_FLUX_ADAPTERS> \
+F0_REUSE_DIR=exp_rg_flux_rl/旧实验目录/01_f0_round1_train_state \
+TRAIN_MAX_SAMPLES=4000 TRAIN_SUBSET_SEED=42 \
+bash commands/rl_sr_stage_ae_commands.sh reuse-all
 ```
+
+命令文件自身负责 `nohup`、时间戳日志和后台运行。它会输出进程 PID 与 launcher 日志路径，
+因此外层不要再套一层 `nohup`。服务器上模型路径与 Conda 环境不同时，可同时传入
+`CONFIG=<配置路径>`、`CONDA_ENV=<环境名>`；数据 JSONL 仍由配置读取。
+
+检查某个实验已经产生了哪些状态、模型和性能指标时，运行：
+
+```bash
+RL_SR_RUN_DIR=<自动创建的运行目录> \
+bash commands/rl_sr_stage_ae_commands.sh inspect
+```
+
+该命令只读检查，不启动模型。它会用 `[READY]`/`[MISSING]` 列出 01--12 的关键产物，
+并打印当前已经完成的逐轮 `summary_scores.csv`。复用 F0 时 01 不重新计算 IQA；正式的
+SFT 基线评估在 06，RL 策略评估在 11，二者的最终逐轮对比在 12。
+
+### 快速验证：控制01/04训练集IQA
+
+01和04的训练集IQA仅用于诊断，不参与状态构建、reward或NFT训练。命令文件支持分别控制：
+
+```text
+F0_TRAIN_IQA_SAMPLES=-1          01全量训练集IQA
+F0_TRAIN_IQA_SAMPLES=0           01跳过IQA（快速验证默认）
+F0_TRAIN_IQA_SAMPLES=200         01固定抽样200张
+
+MULTIROUND_TRAIN_IQA_SAMPLES=-1  04每轮全量训练集IQA
+MULTIROUND_TRAIN_IQA_SAMPLES=0   04每轮跳过IQA（快速验证默认）
+MULTIROUND_TRAIN_IQA_SAMPLES=200 04每轮固定抽样200张
+```
+
+正整数抽样按数据集名称、文件名和 `TRAIN_SUBSET_SEED` 确定，不受服务器绝对路径影响。
+06和11不会读取这两个限制，始终完整评估 RealLQ250 和 RealLR200。
+
+例如保留04每轮200张诊断、跳过01 IQA：
+
+```bash
+F0_CHECKPOINT=<CHECKPOINT-00036000_OR_RG_FLUX_ADAPTERS> \
+F0_REUSE_DIR=<旧实验的01目录> \
+F0_TRAIN_IQA_SAMPLES=0 MULTIROUND_TRAIN_IQA_SAMPLES=200 \
+bash commands/rl_sr_stage_ae_commands.sh reuse-all
+```
+
+### 已运行到04全量IQA：复用现有图片继续05--12
+
+先停止仍在运行的旧04进程，确认没有进程继续写入同一个实验目录。恢复命令不会自动结束旧进程，
+也不会覆盖已有图片。然后运行：
+
+```bash
+F0_CHECKPOINT=<CHECKPOINT-00036000_OR_RG_FLUX_ADAPTERS> \
+RL_SR_RUN_DIR=<当前实验目录> \
+bash commands/rl_sr_stage_ae_commands.sh resume-from04
+```
+
+恢复入口会校验原训练输入集合、迭代轮数和种子，并检查 `sample_lineage.jsonl` 中每轮的所有
+图片确实存在。已经完整生成的轮次不会重新推理；如果当前只完成第1轮图片并进入第1轮IQA，
+则从第2轮开始生成。如果第1--4轮图片都已完成，则直接进入05。04未完成轮次全部跳过训练集
+IQA，随后自动完成05状态构建、06完整SFT评估、07--10奖励/NFT、11完整RL评估和12对比。
 
 自动执行的顺序如下：
 

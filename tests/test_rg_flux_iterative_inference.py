@@ -199,6 +199,9 @@ class RGFluxIterativeInferenceTests(unittest.TestCase):
         self.assertEqual(args.round_seed_mode, "increment")
         self.assertEqual(args.metrics, ["clipiqa", "niqe"])
         self.assertEqual(args.metric_device, "cpu")
+        self.assertEqual(args.metric_sample_count, -1)
+        self.assertEqual(args.metric_sample_seed, 42)
+        self.assertFalse(args.resume)
 
     def test_generated_round_path_inherits_original_jsonl_condition(self):
         iterative = import_iterative_module()
@@ -363,6 +366,93 @@ class RGFluxIterativeInferenceTests(unittest.TestCase):
             (output_root / "round_01").mkdir(parents=True)
             with self.assertRaises(FileExistsError):
                 iterative._validate_output_root(output_root)
+
+    def test_resume_reuses_generated_round_and_skips_training_metrics(self):
+        iterative = import_iterative_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.png"
+            Image.new("RGB", (8, 8), color=(10, 20, 30)).save(input_path)
+            checkpoint = root / "checkpoint" / "rg_flux_adapters"
+            checkpoint.mkdir(parents=True)
+            refiner = root / "refiner"
+            refiner.mkdir()
+            output_root = root / "iterative_output"
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"dtype": "fp32"},
+                        "data": {"pre_cropped": True},
+                        "condition": {
+                            "lr_cond_mode": "flux2_image_concat",
+                            "use_degradation_vector": False,
+                            "include_caption": False,
+                            "refinement": {"enabled": True},
+                        },
+                        "text_encoding": {"mode": "online", "dtype": "fp32"},
+                        "flow_matching": {
+                            "inference_schedule": "linear",
+                            "inference_init_mode": "pure_noise",
+                            "inference_sigma_start": 1.0,
+                        },
+                        "evaluation": {"metrics": ["niqe"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            base_cli = [
+                "--input", str(input_path), "--checkpoint", str(checkpoint),
+                "--refiner_checkpoint", str(refiner), "--output_dir", str(output_root),
+                "--config", str(config_path), "--iterations", "3", "--upscale", "1",
+                "--dtype", "fp32", "--device", "cpu", "--metrics", "niqe",
+            ]
+            inference_rounds = []
+
+            def fake_inference_dataset(**kwargs):
+                inference_rounds.append(kwargs["refinement_round"] or 1)
+                output_dir = Path(kwargs["output_dir"])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for image_path in iterative.list_images(kwargs["input_path"]):
+                    with Image.open(image_path) as image:
+                        image.convert("RGB").save(output_dir / f"{image_path.stem}.png")
+                return {"valid_image_count": 1, "skipped_image_count": 0}
+
+            def interrupt_during_first_iqa(**_kwargs):
+                raise RuntimeError("simulated interrupted full training IQA")
+
+            first_args = iterative.build_arg_parser().parse_args(base_cli)
+            with (
+                mock.patch.object(iterative, "run_inference_dataset", side_effect=fake_inference_dataset),
+                mock.patch.object(iterative, "evaluate_dataset_dirs", side_effect=interrupt_during_first_iqa),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    iterative.run_iterative_inference(first_args)
+            round_one_bytes = (output_root / "round_01" / "default" / "input.png").read_bytes()
+            self.assertEqual(inference_rounds, [1])
+
+            inference_rounds.clear()
+            resumed_args = iterative.build_arg_parser().parse_args(
+                [*base_cli, "--resume", "--metric_sample_count", "0"]
+            )
+            with (
+                mock.patch.object(iterative, "run_inference_dataset", side_effect=fake_inference_dataset),
+                mock.patch.object(iterative, "evaluate_dataset_dirs") as eval_mock,
+            ):
+                manifest = iterative.run_iterative_inference(resumed_args)
+
+            self.assertEqual(inference_rounds, [2, 3])
+            self.assertEqual(eval_mock.call_count, 0)
+            self.assertEqual(
+                (output_root / "round_01" / "default" / "input.png").read_bytes(),
+                round_one_bytes,
+            )
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["resume"]["first_round_to_generate"], 2)
+            self.assertEqual([row["round"] for row in manifest["rounds"]], [1, 2, 3])
+            self.assertEqual(manifest["rounds"][0]["metric_status"], "skipped_on_resume")
+            self.assertTrue(all(row["metric_status"] == "skipped" for row in manifest["rounds"][1:]))
 
     def test_rejects_claimed_upscale_when_precropped_semantics_would_ignore_it(self):
         iterative = import_iterative_module()

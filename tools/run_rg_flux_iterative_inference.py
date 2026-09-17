@@ -125,6 +125,39 @@ def _write_lineage(path, lineage):
     temporary_path.replace(path)
 
 
+def _read_lineage(path):
+    rows = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _lineage_identity(row):
+    return (
+        str(row.get("dataset") or ""),
+        str(row.get("sample_id") or ""),
+        str(Path(row.get("source_path") or "").expanduser().resolve()),
+    )
+
+
+def _completed_generated_rounds(lineage, iterations):
+    """Return consecutive rounds whose images exist for every lineage row."""
+    completed = []
+    for round_number in range(1, iterations + 1):
+        complete = True
+        for row in lineage:
+            matches = [item for item in row.get("rounds", []) if int(item.get("round", -1)) == round_number]
+            if len(matches) != 1 or not matches[0].get("exists") or not Path(matches[0].get("path", "")).is_file():
+                complete = False
+                break
+        if not complete:
+            break
+        completed.append(round_number)
+    return completed
+
+
 def _record_round_outputs(lineage, round_number, output_dirs):
     for row in lineage:
         output_path = output_dirs[row["dataset"]] / f"{row['sample_id']}.png"
@@ -292,11 +325,17 @@ def run_iterative_inference(args):
         raise ValueError("--iterations must be greater than zero.")
     if args.upscale <= 0:
         raise ValueError("--upscale must be greater than zero.")
+    if args.metric_sample_count < -1:
+        raise ValueError("--metric_sample_count must be -1 (all), 0 (skip), or a positive count.")
 
     resolved_run = _resolve_iterative_run(args)
     output_root = Path(resolved_run["output_dir"])
-    _validate_output_root(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    if args.resume:
+        if not output_root.is_dir():
+            raise FileNotFoundError(f"Cannot resume missing iterative output directory: {output_root}")
+    else:
+        _validate_output_root(output_root)
+        output_root.mkdir(parents=True, exist_ok=True)
 
     config = _prepare_runtime_config(
         args,
@@ -319,9 +358,49 @@ def run_iterative_inference(args):
     dtype, dtype_name = resolve_inference_dtype(config, args.dtype)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     source_datasets = _resolve_source_datasets(args)
-    lineage = _build_lineage(source_datasets)
+    requested_lineage = _build_lineage(source_datasets)
+    lineage = requested_lineage
+    existing_manifest = None
+    start_round = 1
+    if args.resume:
+        existing_manifest = json.loads(
+            (output_root / "iterative_manifest.json").read_text(encoding="utf-8")
+        )
+        lineage = _read_lineage(output_root / "sample_lineage.jsonl")
+        if {_lineage_identity(row) for row in lineage} != {
+            _lineage_identity(row) for row in requested_lineage
+        }:
+            raise ValueError("Resume input set does not match the existing iterative lineage.")
+        if int(existing_manifest.get("iterations", -1)) != int(args.iterations):
+            raise ValueError(
+                f"Resume iterations mismatch: existing={existing_manifest.get('iterations')}, requested={args.iterations}"
+            )
+        if int(existing_manifest.get("base_seed", -1)) != int(args.seed):
+            raise ValueError(
+                f"Resume seed mismatch: existing={existing_manifest.get('base_seed')}, requested={args.seed}"
+            )
+        completed_generated = _completed_generated_rounds(lineage, args.iterations)
+        start_round = len(completed_generated) + 1
+        for row in lineage:
+            unexpected = [
+                int(item.get("round", -1))
+                for item in row.get("rounds", [])
+                if int(item.get("round", -1)) >= start_round
+            ]
+            if unexpected:
+                raise ValueError(
+                    "Resume found a non-consecutive or incomplete round in sample_lineage.jsonl; "
+                    f"first pending round is {start_round}, unexpected entries={unexpected[:3]}."
+                )
+        for round_number in range(start_round, args.iterations + 1):
+            pending_dir = output_root / f"round_{round_number:02d}"
+            if pending_dir.exists() and any(pending_dir.iterdir()):
+                raise FileExistsError(
+                    "Resume refuses to overwrite a partially generated round directory that is not "
+                    f"complete in lineage: {pending_dir}. Preserve it for inspection and use a clean recovery copy."
+                )
     f0_cache = None
-    if args.reuse_f0_dir:
+    if args.reuse_f0_dir and not args.resume:
         from tools.reuse_sr_f0_outputs import validate_f0_cache
 
         if args.refiner_checkpoint and args.refiner_start_round <= 1:
@@ -351,7 +430,7 @@ def run_iterative_inference(args):
 
     manifest_path = output_root / "iterative_manifest.json"
     trend_path = output_root / "metric_trends.csv"
-    manifest = {
+    manifest = existing_manifest or {
         "status": "running",
         "run_dir": str(resolved_run["run_dir"]) if resolved_run["run_dir"] else None,
         "checkpoint_step": resolved_run["checkpoint_step"],
@@ -371,6 +450,45 @@ def run_iterative_inference(args):
         "metric_trends": str(trend_path),
         "rounds": [],
     }
+    manifest["status"] = "running"
+    manifest.pop("error", None)
+    manifest["metrics"] = metrics
+    manifest["metric_device"] = str(args.metric_device)
+    manifest["metric_sample_count"] = int(args.metric_sample_count)
+    manifest["metric_sample_seed"] = int(args.metric_sample_seed)
+    if args.resume:
+        manifest["resume"] = {
+            "first_round_to_generate": int(start_round),
+            "completed_generated_rounds": list(range(1, start_round)),
+            "skip_existing_images": True,
+        }
+        recorded_rounds = {int(item["round"]) for item in manifest.get("rounds", [])}
+        for round_number in range(1, start_round):
+            if round_number in recorded_rounds:
+                continue
+            round_output_dir = output_root / f"round_{round_number:02d}"
+            summary_path = round_output_dir / "metrics" / "summary_scores.json"
+            manifest.setdefault("rounds", []).append(
+                {
+                    "round": round_number,
+                    "input_upscale": int(args.upscale) if round_number == 1 else 1,
+                    "uses_refinement_adapter": bool(
+                        args.refiner_checkpoint and round_number >= int(args.refiner_start_round)
+                    ),
+                    "seed": _round_seed(args.seed, round_number, args.round_seed_mode),
+                    "input_dirs": {},
+                    "output_dirs": {
+                        name: str(round_output_dir / name) for name, _ in source_datasets
+                    },
+                    "inference_manifest": str(round_output_dir / "inference_manifest.json"),
+                    "metrics_dir": str(round_output_dir / "metrics") if summary_path.is_file() else None,
+                    "metric_summary": str(summary_path) if summary_path.is_file() else None,
+                    "metric_status": "completed_before_resume" if summary_path.is_file() else "skipped_on_resume",
+                    "missing_output_count": 0,
+                    "recovered_from_lineage": True,
+                }
+            )
+        manifest["rounds"] = sorted(manifest.get("rounds", []), key=lambda item: int(item["round"]))
     if f0_cache is not None:
         manifest["f0_reuse"] = f0_cache["provenance"]
         _write_json_atomic(output_root / "f0_reuse_manifest.json", f0_cache["provenance"])
@@ -387,8 +505,17 @@ def run_iterative_inference(args):
         }
     _write_json_atomic(manifest_path, manifest)
 
+    if start_round > args.iterations:
+        manifest["status"] = "completed"
+        manifest["resume"]["all_requested_rounds_already_generated"] = True
+        _write_json_atomic(manifest_path, manifest)
+        return manifest
+
     artist = None
     trend_rows = []
+    if trend_path.is_file():
+        with trend_path.open("r", encoding="utf-8", newline="") as handle:
+            trend_rows = list(csv.DictReader(handle))
     try:
         artist = build_rg_flux_artist(config).to(device=device)
         artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)
@@ -405,6 +532,11 @@ def run_iterative_inference(args):
 
         base_condition_index = load_jsonl_conditions(args.jsonl_path)
         current_inputs = {name: Path(path) for name, path in source_datasets}
+        if start_round > 1:
+            current_inputs = {
+                dataset_name: output_root / f"round_{start_round - 1:02d}" / dataset_name
+                for dataset_name, _ in source_datasets
+            }
         lr_cond_mode = config["condition"]["lr_cond_mode"]
         refiner_loaded = False
 
@@ -419,7 +551,7 @@ def run_iterative_inference(args):
                 )
             return Path(matches[0]["source_path"])
 
-        for round_number in range(1, args.iterations + 1):
+        for round_number in range(start_round, args.iterations + 1):
             round_name = f"round_{round_number:02d}"
             round_output_dir = output_root / round_name
             output_dirs = {
@@ -514,29 +646,40 @@ def run_iterative_inference(args):
             )
 
             metrics_dir = round_output_dir / "metrics"
-            metric_summary = evaluate_dataset_dirs(
-                dataset_dirs=output_dirs,
-                output_dir=metrics_dir,
-                metrics=metrics,
-                device=args.metric_device,
-            )
-            trend_rows.extend(
-                _metric_trend_rows(round_number, metric_summary, round_output_dir)
-            )
-            _write_csv_atomic(
-                trend_path,
-                trend_rows,
-                [
-                    "round",
-                    "dataset",
-                    "metric",
-                    "direction",
-                    "mean",
-                    "std",
-                    "count",
-                    "output_dir",
-                ],
-            )
+            metric_summary_path = None
+            metric_status = "skipped" if args.metric_sample_count == 0 else "completed"
+            if args.metric_sample_count != 0:
+                metric_kwargs = {}
+                if args.metric_sample_count > 0:
+                    metric_kwargs = {
+                        "max_samples_per_dataset": args.metric_sample_count,
+                        "sample_seed": args.metric_sample_seed,
+                    }
+                metric_summary = evaluate_dataset_dirs(
+                    dataset_dirs=output_dirs,
+                    output_dir=metrics_dir,
+                    metrics=metrics,
+                    device=args.metric_device,
+                    **metric_kwargs,
+                )
+                trend_rows.extend(
+                    _metric_trend_rows(round_number, metric_summary, round_output_dir)
+                )
+                _write_csv_atomic(
+                    trend_path,
+                    trend_rows,
+                    [
+                        "round",
+                        "dataset",
+                        "metric",
+                        "direction",
+                        "mean",
+                        "std",
+                        "count",
+                        "output_dir",
+                    ],
+                )
+                metric_summary_path = str(metrics_dir / "summary_scores.json")
 
             manifest["rounds"].append(
                 {
@@ -551,8 +694,10 @@ def run_iterative_inference(args):
                         name: str(path) for name, path in output_dirs.items()
                     },
                     "inference_manifest": str(round_manifest_path),
-                    "metrics_dir": str(metrics_dir),
-                    "metric_summary": str(metrics_dir / "summary_scores.json"),
+                    "metrics_dir": str(metrics_dir) if args.metric_sample_count != 0 else None,
+                    "metric_summary": metric_summary_path,
+                    "metric_status": metric_status,
+                    "metric_sample_count": int(args.metric_sample_count),
                     "missing_output_count": missing_outputs,
                     "reused_f0": reuse_round,
                 }
@@ -609,6 +754,26 @@ def build_arg_parser():
         choices=["fixed", "increment"],
         default="fixed",
         help="Reuse the base seed every round or increment it by round number.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an interrupted iterative directory after validating its input set, iteration count, "
+            "seed and complete generated rounds. Existing images are never regenerated."
+        ),
+    )
+    parser.add_argument(
+        "--metric_sample_count",
+        type=int,
+        default=-1,
+        help="Images evaluated per dataset per round: -1=all (default), 0=skip, positive=fixed subset.",
+    )
+    parser.add_argument(
+        "--metric_sample_seed",
+        type=int,
+        default=42,
+        help="Portable deterministic subset seed used when --metric_sample_count is positive.",
     )
     parser.add_argument(
         "--metrics",

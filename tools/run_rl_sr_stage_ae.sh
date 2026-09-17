@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command A–E RL-SR cycle. Data input, inference, and evaluation are all
 # derived from config.data.jsonl_path; only the server-local F0 checkpoint is
-# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|reward|e|eval]
+# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|reward|e|eval]
 
 set -Eeuo pipefail
 
@@ -63,13 +63,23 @@ SEED="${SEED:-$(config_field seed)}"
 ITER_METRIC_DEVICE="${ITER_METRIC_DEVICE:-$(config_field metric_device)}"
 REWARD_DEVICE="${REWARD_DEVICE:-$(config_field reward_device)}"
 DATASET_ID="${DATASET_ID:-$(config_field dataset_id)}"
+F0_TRAIN_IQA_SAMPLES="${F0_TRAIN_IQA_SAMPLES:--1}"
+MULTIROUND_TRAIN_IQA_SAMPLES="${MULTIROUND_TRAIN_IQA_SAMPLES:--1}"
 read -r -a ITER_METRICS <<< "$(config_field metrics)"
 
+for metric_count_name in F0_TRAIN_IQA_SAMPLES MULTIROUND_TRAIN_IQA_SAMPLES; do
+  metric_count_value="${!metric_count_name}"
+  if [[ ! "${metric_count_value}" =~ ^-?[0-9]+$ ]] || (( metric_count_value < -1 )); then
+    echo "${metric_count_name} must be -1 (all), 0 (skip), or a positive image count." >&2
+    exit 2
+  fi
+done
+
 case "${STAGE}" in
-  all|f0|c|multiround) require_file "${TRAIN_JSONL}" ;;
+  all|f0|c|multiround|from04) require_file "${TRAIN_JSONL}" ;;
 esac
 case "${STAGE}" in
-  all|multiround|eval) require_file "${EVAL_JSONL}" ;;
+  all|multiround|from04|eval) require_file "${EVAL_JSONL}" ;;
 esac
 if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
   RUN_ROOT="${RL_SR_RUN_DIR}"
@@ -96,6 +106,7 @@ EVAL_DATASET_DIRS=()
 echo "RL-SR run directory: ${RUN_ROOT}"
 echo "Training data JSONL (config.data.jsonl_path): ${TRAIN_JSONL}"
 echo "Training sample limit: ${TRAIN_MAX_SAMPLES} (0=all); subset seed: ${TRAIN_SUBSET_SEED}"
+echo "Training IQA: 01=${F0_TRAIN_IQA_SAMPLES}, 04=${MULTIROUND_TRAIN_IQA_SAMPLES} (-1=all, 0=skip, >0=sample count)"
 echo "Evaluation data JSONL: ${EVAL_JSONL}"
 
 run_stage() {
@@ -121,14 +132,14 @@ run_stage() {
 
 prepare_inputs() {
   case "${STAGE}" in
-    all|f0|c|multiround)
+    all|f0|c|multiround|from04)
       run_stage "00_create_train_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
         --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training \
         --max_samples "${TRAIN_MAX_SAMPLES}" --subset_seed "${TRAIN_SUBSET_SEED}" --reuse_existing
       ;;
   esac
   case "${STAGE}" in
-    all|multiround|eval)
+    all|multiround|from04|eval)
       run_stage "00_create_evaluation_input_manifests" "${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
         --config "${CONFIG}" --repo_root "${REPO_ROOT}" --output_dir "${EVAL_MANIFEST_DIR}"
       mapfile -t EVAL_DATASET_DIRS < <("${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
@@ -152,6 +163,7 @@ run_f0() {
       --checkpoint "${F0_ADAPTER}" --config "${CONFIG}" --input "${TRAIN_INPUT}" \
       --jsonl_path "${TRAIN_JSONL}" --output_dir "${RUN_ROOT}/01_f0_round1_train_state" \
       --iterations 1 --upscale 1 --seed "${SEED}" \
+      --metric_sample_count "${F0_TRAIN_IQA_SAMPLES}" --metric_sample_seed "${TRAIN_SUBSET_SEED}" \
       --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
   fi
 
@@ -171,23 +183,9 @@ run_c() {
     --max_steps "${SFT_MAX_STEPS}"
 }
 
-run_multiround() {
+build_states_and_evaluate_sft() {
   local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
   require_file "${g_sft_adapter}"
-  local f0_reuse_args=()
-  # A reused 01 is carried into 04 so the same y_1 is not generated again.
-  # An ordinary run retains the previous inference path.
-  if [[ -f "${RUN_ROOT}/01_f0_round1_train_state/f0_reuse_manifest.json" ]]; then
-    f0_reuse_args+=(--reuse_f0_dir "${RUN_ROOT}/01_f0_round1_train_state")
-  fi
-  run_stage "04_sft_multiround_train_state" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
-    --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
-    --config "${CONFIG}" --input "${TRAIN_INPUT}" --jsonl_path "${TRAIN_JSONL}" \
-    --output_dir "${RUN_ROOT}/04_sft_multiround_train_state" \
-    "${f0_reuse_args[@]}" \
-    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
-    --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
-
   run_stage "05_build_states_for_rl" "${PYTHON_CMD[@]}" tools/build_sr_refinement_states.py \
     --lineage_jsonl "${RUN_ROOT}/04_sft_multiround_train_state/sample_lineage.jsonl" \
     --source_jsonl "${TRAIN_JSONL}" --dataset_id "${DATASET_ID}" \
@@ -202,6 +200,40 @@ run_multiround() {
     --output_dir "${RUN_ROOT}/06_sft_multiround_evaluation" \
     --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+}
+
+run_multiround() {
+  local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
+  require_file "${g_sft_adapter}"
+  local f0_reuse_args=()
+  # A reused 01 is carried into 04 so the same y_1 is not generated again.
+  if [[ -f "${RUN_ROOT}/01_f0_round1_train_state/f0_reuse_manifest.json" ]]; then
+    f0_reuse_args+=(--reuse_f0_dir "${RUN_ROOT}/01_f0_round1_train_state")
+  fi
+  run_stage "04_sft_multiround_train_state" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+    --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
+    --config "${CONFIG}" --input "${TRAIN_INPUT}" --jsonl_path "${TRAIN_JSONL}" \
+    --output_dir "${RUN_ROOT}/04_sft_multiround_train_state" \
+    "${f0_reuse_args[@]}" \
+    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
+    --metric_sample_count "${MULTIROUND_TRAIN_IQA_SAMPLES}" --metric_sample_seed "${TRAIN_SUBSET_SEED}" \
+    --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+  build_states_and_evaluate_sft
+}
+
+resume_from_04() {
+  local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
+  require_file "${g_sft_adapter}"
+  require_file "${RUN_ROOT}/04_sft_multiround_train_state/iterative_manifest.json"
+  require_file "${RUN_ROOT}/04_sft_multiround_train_state/sample_lineage.jsonl"
+  run_stage "04_resume_images_skip_train_iqa" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+    --resume --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
+    --config "${CONFIG}" --input "${TRAIN_INPUT}" --jsonl_path "${TRAIN_JSONL}" \
+    --output_dir "${RUN_ROOT}/04_sft_multiround_train_state" \
+    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
+    --metric_sample_count 0 --metric_sample_seed "${TRAIN_SUBSET_SEED}" \
+    --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+  build_states_and_evaluate_sft
 }
 
 run_reward() {
@@ -258,11 +290,12 @@ case "${STAGE}" in
   f0) run_f0 ;;
   c) run_c ;;
   multiround) run_multiround ;;
+  from04) resume_from_04; run_reward; run_e; run_eval ;;
   reward) run_reward ;;
   e) run_e ;;
   eval) run_eval ;;
   *)
-    echo "Usage: $0 [all|f0|c|multiround|reward|e|eval]" >&2
+    echo "Usage: $0 [all|f0|c|multiround|from04|reward|e|eval]" >&2
     exit 2
     ;;
 esac

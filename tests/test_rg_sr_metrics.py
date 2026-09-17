@@ -28,6 +28,27 @@ class RGSrMetricsTests(unittest.TestCase):
         self.assertEqual(metric_direction("niqe", MetricWithoutDirection()), "lower_better")
         self.assertEqual(metric_direction("musiq", MetricWithoutDirection()), "higher_better")
 
+    def test_metric_sampling_is_deterministic_and_bounded_per_dataset(self):
+        from metrics.rg_sr_metrics import sample_images
+
+        images = {
+            "train": [Path(f"/mount-a/train/image-{index:02d}.png") for index in range(20)],
+            "other": [Path(f"/mount-a/other/image-{index:02d}.png") for index in range(7)],
+        }
+        first = sample_images(images, max_samples_per_dataset=5, sample_seed=123)
+        second = sample_images(images, max_samples_per_dataset=5, sample_seed=123)
+        changed = sample_images(images, max_samples_per_dataset=5, sample_seed=124)
+
+        self.assertEqual(first, second)
+        self.assertEqual({name: len(paths) for name, paths in first.items()}, {"train": 5, "other": 5})
+        self.assertNotEqual(first["train"], changed["train"])
+
+    def test_metric_sampling_rejects_non_positive_limit(self):
+        from metrics.rg_sr_metrics import sample_images
+
+        with self.assertRaisesRegex(ValueError, "positive"):
+            sample_images({"train": [Path("a.png")]}, max_samples_per_dataset=0)
+
     def test_evaluate_metrics_writes_each_metric_for_each_image(self):
         from metrics.rg_sr_metrics import build_rows, evaluate_metrics
 
