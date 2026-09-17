@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command A–E RL-SR cycle. Data input, inference, and evaluation are all
 # derived from config.data.jsonl_path; only the server-local F0 checkpoint is
-# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|reward|e|eval]
+# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|reward|e|eval]
 
 set -Eeuo pipefail
 
@@ -14,6 +14,18 @@ else
   PYTHON_CMD=("${PYTHON_BIN}")
 fi
 CONFIG="${CONFIG:-${REPO_ROOT}/configs/rl_sr_refinement_flux2_klein_moe.yaml}"
+
+# libgomp requires OMP_NUM_THREADS to be a positive integer. Some managed
+# training shells export an empty or otherwise malformed value, which is then
+# inherited by every Python subprocess. Normalize it once at the runner entry
+# so resumed stages behave the same as fresh runs.
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ -n "${OMP_NUM_THREADS:-}" ]]; then
+    echo "Warning: invalid OMP_NUM_THREADS='${OMP_NUM_THREADS}'; using 1." >&2
+  fi
+  OMP_NUM_THREADS=1
+fi
+export OMP_NUM_THREADS
 
 # F0 is intentionally the sole machine-specific required value. Dataset paths
 # come from config.data.jsonl_path, and output names are created automatically.
@@ -76,10 +88,10 @@ for metric_count_name in F0_TRAIN_IQA_SAMPLES MULTIROUND_TRAIN_IQA_SAMPLES; do
 done
 
 case "${STAGE}" in
-  all|f0|c|multiround|from04) require_file "${TRAIN_JSONL}" ;;
+  all|f0|c|multiround|from04|from05) require_file "${TRAIN_JSONL}" ;;
 esac
 case "${STAGE}" in
-  all|multiround|from04|eval) require_file "${EVAL_JSONL}" ;;
+  all|multiround|from04|from05|eval) require_file "${EVAL_JSONL}" ;;
 esac
 if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
   RUN_ROOT="${RL_SR_RUN_DIR}"
@@ -132,14 +144,14 @@ run_stage() {
 
 prepare_inputs() {
   case "${STAGE}" in
-    all|f0|c|multiround|from04)
+    all|f0|c|multiround|from04|from05)
       run_stage "00_create_train_input_manifest" "${PYTHON_CMD[@]}" tools/create_sr_input_manifest.py \
         --data_jsonl_path "${TRAIN_JSONL}" --output "${TRAIN_INPUT}" --label training \
         --max_samples "${TRAIN_MAX_SAMPLES}" --subset_seed "${TRAIN_SUBSET_SEED}" --reuse_existing
       ;;
   esac
   case "${STAGE}" in
-    all|multiround|from04|eval)
+    all|multiround|from04|from05|eval)
       run_stage "00_create_evaluation_input_manifests" "${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
         --config "${CONFIG}" --repo_root "${REPO_ROOT}" --output_dir "${EVAL_MANIFEST_DIR}"
       mapfile -t EVAL_DATASET_DIRS < <("${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
@@ -291,11 +303,12 @@ case "${STAGE}" in
   c) run_c ;;
   multiround) run_multiround ;;
   from04) resume_from_04; run_reward; run_e; run_eval ;;
+  from05) build_states_and_evaluate_sft; run_reward; run_e; run_eval ;;
   reward) run_reward ;;
   e) run_e ;;
   eval) run_eval ;;
   *)
-    echo "Usage: $0 [all|f0|c|multiround|from04|reward|e|eval]" >&2
+    echo "Usage: $0 [all|f0|c|multiround|from04|from05|reward|e|eval]" >&2
     exit 2
     ;;
 esac

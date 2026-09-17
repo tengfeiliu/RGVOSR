@@ -13,6 +13,8 @@
 #   fresh-all       与 reuse-all 相同，但 01 和 04 的第 1 轮都重新用 F0 生成。
 #   resume-from04   当前04已生成部分/全部轮次并卡在训练集IQA时使用：验证并复用现有
 #                   04图片，从下一未生成轮次继续，跳过04后续IQA，然后自动完成05--12。
+#   resume-from05   04已完成、05或其后失败时使用：不再运行04，直接重建05并自动完成
+#                   06--12。已有完整阶段输出可由各工具自身的恢复逻辑复用。
 #   resume-c        只运行 03_shared_refiner_sft；要求 02_states_for_c.jsonl 已存在。
 #   resume-multiround
 #                   运行 04_sft_multiround_train_state、05_build_states_for_rl、
@@ -33,6 +35,12 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIG="${CONFIG:-${REPO_ROOT}/configs/rl_sr_refinement_flux2_klein_moe.yaml}"
 CONDA_ENV="${CONDA_ENV:-sr-flux2}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ -n "${OMP_NUM_THREADS:-}" ]]; then
+    echo "Warning: invalid OMP_NUM_THREADS='${OMP_NUM_THREADS}'; using 1." >&2
+  fi
+  OMP_NUM_THREADS=1
+fi
 TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:-4000}"
 TRAIN_SUBSET_SEED="${TRAIN_SUBSET_SEED:-42}"
 F0_TRAIN_IQA_SAMPLES="${F0_TRAIN_IQA_SAMPLES:-0}"
@@ -51,7 +59,7 @@ Usage:
 
   F0_CHECKPOINT=<checkpoint> RL_SR_RUN_DIR=<existing-run-dir> \
     bash commands/rl_sr_stage_ae_commands.sh \
-    {resume-from04|resume-c|resume-multiround|resume-reward|resume-e|resume-eval}
+    {resume-from04|resume-from05|resume-c|resume-multiround|resume-reward|resume-e|resume-eval}
 
   RL_SR_RUN_DIR=<existing-run-dir> \
     bash commands/rl_sr_stage_ae_commands.sh inspect
@@ -64,6 +72,7 @@ Optional environment variables:
   MULTIROUND_TRAIN_IQA_SAMPLES
                          04每轮训练集IQA：-1=全量，0=跳过，正整数=抽样；默认0
   CUDA_VISIBLE_DEVICES   使用的 GPU，默认 0
+  OMP_NUM_THREADS        CPU OpenMP 线程数，必须为正整数；非法或未设置时使用 1
   CONDA_ENV              Conda 环境，默认 sr-flux2
   RL_SR_OUTPUT_ROOT      实验输出根目录
   COMMAND_LOG_ROOT       后台启动日志目录，默认 launcher_logs
@@ -110,6 +119,7 @@ launch_new() {
     F0_TRAIN_IQA_SAMPLES="${F0_TRAIN_IQA_SAMPLES}" \
     MULTIROUND_TRAIN_IQA_SAMPLES="${MULTIROUND_TRAIN_IQA_SAMPLES}" \
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+    OMP_NUM_THREADS="${OMP_NUM_THREADS}" \
     TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 CONDA_ENV="${CONDA_ENV}" \
     bash "${RUNNER}" all \
     > "${log_path}" 2>&1 < /dev/null &
@@ -129,6 +139,7 @@ launch_resume() {
   nohup env \
     REPO_ROOT="${REPO_ROOT}" CONFIG="${CONFIG}" F0_CHECKPOINT="${F0_CHECKPOINT}" \
     RL_SR_RUN_DIR="${RL_SR_RUN_DIR}" CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+    OMP_NUM_THREADS="${OMP_NUM_THREADS}" \
     TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 CONDA_ENV="${CONDA_ENV}" \
     bash "${RUNNER}" "${runner_stage}" \
     > "${log_path}" 2>&1 < /dev/null &
@@ -210,6 +221,11 @@ case "${ACTION}" in
     require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
     launch_resume "from04" "resume_from04_to_final"
+    ;;
+  resume-from05)
+    require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
+    require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    launch_resume "from05" "resume_from05_to_final"
     ;;
   resume-c)
     require_path "F0_CHECKPOINT" "${F0_CHECKPOINT:-}"
