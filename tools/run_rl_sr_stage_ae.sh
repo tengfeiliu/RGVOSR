@@ -196,6 +196,7 @@ run_c() {
 }
 
 build_states_and_evaluate_sft() {
+  local replace_existing_evaluation="${1:-false}"
   local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
   require_file "${g_sft_adapter}"
   run_stage "05_build_states_for_rl" "${PYTHON_CMD[@]}" tools/build_sr_refinement_states.py \
@@ -206,11 +207,17 @@ build_states_and_evaluate_sft() {
     --sampler_manifest "${RUN_ROOT}/04_sft_multiround_train_state/round_01/inference_manifest.json" \
     --output_jsonl "${RUN_ROOT}/05_states_for_rl.jsonl" --max_round "${ITERATIONS}"
 
+  local evaluation_output="${RUN_ROOT}/06_sft_multiround_evaluation"
+  if [[ "${replace_existing_evaluation}" == "true" && -e "${evaluation_output}" ]]; then
+    local archived_evaluation="${evaluation_output}.failed-$(date '+%y%m%d-%H%M%S')"
+    mv -- "${evaluation_output}" "${archived_evaluation}"
+    echo "Archived previous 06 output for inspection: ${archived_evaluation}"
+  fi
   run_stage "06_sft_multiround_evaluation" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
     --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_sft_adapter}" \
     --config "${CONFIG}" --dataset_dirs "${EVAL_DATASET_DIRS[@]}" --jsonl_path "${EVAL_JSONL}" \
-    --output_dir "${RUN_ROOT}/06_sft_multiround_evaluation" \
-    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
+    --output_dir "${evaluation_output}" \
+    --iterations "${ITERATIONS}" --upscale 1 --full_frame_inference --restore_input_size --seed "${SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
 }
 
@@ -245,7 +252,7 @@ resume_from_04() {
     --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
     --metric_sample_count 0 --metric_sample_seed "${TRAIN_SUBSET_SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
-  build_states_and_evaluate_sft
+  build_states_and_evaluate_sft true
 }
 
 run_reward() {
@@ -287,7 +294,7 @@ run_eval() {
     --checkpoint "${F0_ADAPTER}" --refiner_checkpoint "${g_rl_adapter}" \
     --config "${CONFIG}" --dataset_dirs "${EVAL_DATASET_DIRS[@]}" --jsonl_path "${EVAL_JSONL}" \
     --output_dir "${RUN_ROOT}/11_rl_multiround_evaluation" \
-    --iterations "${ITERATIONS}" --upscale 1 --seed "${SEED}" \
+    --iterations "${ITERATIONS}" --upscale 1 --full_frame_inference --restore_input_size --seed "${SEED}" \
     --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
 
   run_stage "12_summarize_sft_vs_rl" "${PYTHON_CMD[@]}" tools/summarize_rl_sr_evaluation.py \
@@ -303,7 +310,7 @@ case "${STAGE}" in
   c) run_c ;;
   multiround) run_multiround ;;
   from04) resume_from_04; run_reward; run_e; run_eval ;;
-  from05) build_states_and_evaluate_sft; run_reward; run_e; run_eval ;;
+  from05) build_states_and_evaluate_sft true; run_reward; run_e; run_eval ;;
   reward) run_reward ;;
   e) run_e ;;
   eval) run_eval ;;

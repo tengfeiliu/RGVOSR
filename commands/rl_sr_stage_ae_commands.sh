@@ -27,6 +27,8 @@
 # 所有模式最终调用 tools/run_rl_sr_stage_ae.sh。训练与评估 JSONL 均从 CONFIG 读取，
 # 不需要 LQ_ROOT、DATASET_ROOT 或额外拆分 JSONL。每次新实验自动创建带配置与时间的
 # 输出目录；启动器自己的控制台日志写入 launcher_logs/，各步骤详细日志写入实验目录 logs/。
+# 01/04 训练状态沿用配置中的 512x512 pre-cropped 输入；06/11 验证固定使用
+# full-frame 推理并恢复每张输入图的原始尺寸，不对 RealLQ250/RealLR200 做 512 裁剪。
 
 set -Eeuo pipefail
 
