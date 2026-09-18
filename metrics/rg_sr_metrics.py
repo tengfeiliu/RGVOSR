@@ -11,6 +11,10 @@ from PIL import Image
 DEFAULT_OMGSR_METRICS = ["clipiqa", "clipiqa+", "nima", "niqe", "liqe", "musiq", "maniqa-pipal"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 LOWER_BETTER_FALLBACKS = {"niqe", "brisque", "piqe", "ilniqe"}
+# PyIQA NIQE evaluates 96x96 blocks at two scales. A short side below 192
+# becomes an empty block grid at the second scale. Only the metric input is
+# enlarged; saved SR images and inputs to every other metric remain untouched.
+METRIC_MIN_SHORT_SIDE = {"niqe": 192}
 
 
 def parse_name_path(values, flag_name):
@@ -153,6 +157,32 @@ def build_rows(images_by_dataset):
     return rows
 
 
+def metric_resize_size(width, height, metric_name):
+    min_short_side = METRIC_MIN_SHORT_SIDE.get(str(metric_name).lower())
+    width, height = int(width), int(height)
+    if min_short_side is None or min(width, height) >= min_short_side:
+        return None
+    scale = float(min_short_side) / float(min(width, height))
+    return (
+        max(min_short_side, int(math.ceil(width * scale))),
+        max(min_short_side, int(math.ceil(height * scale))),
+    )
+
+
+def metric_input(row, metric_name, torch_module):
+    resized_size = metric_resize_size(row["width"], row["height"], metric_name)
+    if resized_size is None or torch_module is None:
+        return row["path"]
+
+    import numpy as np
+
+    with Image.open(row["path"]) as source:
+        image = source.convert("RGB")
+        image = image.resize(resized_size, Image.Resampling.BICUBIC)
+        array = np.asarray(image, dtype=np.float32).copy()
+    return torch_module.from_numpy(array).permute(2, 0, 1).unsqueeze(0).div_(255.0)
+
+
 def evaluate_metrics(rows, metrics, device):
     import pyiqa
     try:
@@ -172,7 +202,8 @@ def evaluate_metrics(rows, metrics, device):
                 metric.eval()
             directions[metric_name] = metric_direction(metric_name, metric)
             for row in rows:
-                row[metric_name] = score_to_float(metric(row["path"]))
+                target = metric_input(row, metric_name, torch)
+                row[metric_name] = score_to_float(metric(target))
             del metric
             if torch is not None and str(device).startswith("cuda"):
                 torch.cuda.empty_cache()
@@ -256,5 +287,10 @@ def evaluate_dataset_dirs(
             },
             "max_samples_per_dataset": max_samples_per_dataset,
             "sample_seed": int(sample_seed) if max_samples_per_dataset is not None else None,
+            "metric_input_policy": {
+                name: {"min_short_side": size, "resize": "bicubic_keep_aspect"}
+                for name, size in METRIC_MIN_SHORT_SIDE.items()
+                if name in {metric.lower() for metric in metrics}
+            },
         },
     )

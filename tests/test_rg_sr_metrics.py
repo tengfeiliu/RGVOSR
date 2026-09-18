@@ -28,6 +28,13 @@ class RGSrMetricsTests(unittest.TestCase):
         self.assertEqual(metric_direction("niqe", MetricWithoutDirection()), "lower_better")
         self.assertEqual(metric_direction("musiq", MetricWithoutDirection()), "higher_better")
 
+    def test_niqe_metric_input_preserves_aspect_and_reaches_two_scale_minimum(self):
+        from metrics.rg_sr_metrics import metric_resize_size
+
+        self.assertEqual(metric_resize_size(256, 96, "niqe"), (512, 192))
+        self.assertIsNone(metric_resize_size(256, 256, "niqe"))
+        self.assertIsNone(metric_resize_size(256, 96, "musiq-pipal"))
+
     def test_metric_sampling_is_deterministic_and_bounded_per_dataset(self):
         from metrics.rg_sr_metrics import sample_images
 
@@ -79,8 +86,9 @@ class RGSrMetricsTests(unittest.TestCase):
             def eval(self):
                 return self
 
-            def __call__(self, path):
-                calls.append((self.name, Path(path).name))
+            def __call__(self, target):
+                identity = Path(target).name if isinstance(target, (str, Path)) else tuple(target.shape)
+                calls.append((self.name, identity))
                 return FakeScore(float(len(calls)))
 
         fake_pyiqa = types.SimpleNamespace(create_metric=lambda name, device: FakeMetric(name))

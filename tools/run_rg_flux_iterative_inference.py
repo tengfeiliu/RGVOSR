@@ -456,6 +456,10 @@ def run_iterative_inference(args):
     manifest["metric_device"] = str(args.metric_device)
     manifest["metric_sample_count"] = int(args.metric_sample_count)
     manifest["metric_sample_seed"] = int(args.metric_sample_seed)
+    trend_rows = []
+    if trend_path.is_file():
+        with trend_path.open("r", encoding="utf-8", newline="") as handle:
+            trend_rows = list(csv.DictReader(handle))
     if args.resume:
         manifest["resume"] = {
             "first_round_to_generate": int(start_round),
@@ -468,6 +472,33 @@ def run_iterative_inference(args):
                 continue
             round_output_dir = output_root / f"round_{round_number:02d}"
             summary_path = round_output_dir / "metrics" / "summary_scores.json"
+            metric_status = "completed_before_resume" if summary_path.is_file() else "skipped_on_resume"
+            if args.metric_sample_count != 0 and not summary_path.is_file():
+                output_dirs = {
+                    name: round_output_dir / name for name, _ in source_datasets
+                }
+                metric_kwargs = {}
+                if args.metric_sample_count > 0:
+                    metric_kwargs = {
+                        "max_samples_per_dataset": args.metric_sample_count,
+                        "sample_seed": args.metric_sample_seed,
+                    }
+                metric_summary = evaluate_dataset_dirs(
+                    dataset_dirs=output_dirs,
+                    output_dir=round_output_dir / "metrics",
+                    metrics=metrics,
+                    device=args.metric_device,
+                    **metric_kwargs,
+                )
+                trend_rows.extend(
+                    _metric_trend_rows(round_number, metric_summary, round_output_dir)
+                )
+                _write_csv_atomic(
+                    trend_path,
+                    trend_rows,
+                    ["round", "dataset", "metric", "direction", "mean", "std", "count", "output_dir"],
+                )
+                metric_status = "completed_on_resume"
             manifest.setdefault("rounds", []).append(
                 {
                     "round": round_number,
@@ -483,7 +514,7 @@ def run_iterative_inference(args):
                     "inference_manifest": str(round_output_dir / "inference_manifest.json"),
                     "metrics_dir": str(round_output_dir / "metrics") if summary_path.is_file() else None,
                     "metric_summary": str(summary_path) if summary_path.is_file() else None,
-                    "metric_status": "completed_before_resume" if summary_path.is_file() else "skipped_on_resume",
+                    "metric_status": metric_status,
                     "missing_output_count": 0,
                     "recovered_from_lineage": True,
                 }
@@ -512,10 +543,6 @@ def run_iterative_inference(args):
         return manifest
 
     artist = None
-    trend_rows = []
-    if trend_path.is_file():
-        with trend_path.open("r", encoding="utf-8", newline="") as handle:
-            trend_rows = list(csv.DictReader(handle))
     try:
         artist = build_rg_flux_artist(config).to(device=device)
         artist.load_trainable(resolved_run["checkpoint"], is_trainable=False)
