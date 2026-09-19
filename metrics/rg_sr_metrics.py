@@ -14,7 +14,12 @@ LOWER_BETTER_FALLBACKS = {"niqe", "brisque", "piqe", "ilniqe"}
 # PyIQA NIQE evaluates 96x96 blocks at two scales. A short side below 192
 # becomes an empty block grid at the second scale. Only the metric input is
 # enlarged; saved SR images and inputs to every other metric remain untouched.
-METRIC_MIN_SHORT_SIDE = {"niqe": 192}
+METRIC_MIN_SHORT_SIDE = {
+    "niqe": 192,
+    # PyIQA LIQE uses a CLIP visual encoder and explicitly requires both
+    # spatial dimensions to be at least 224.
+    "liqe": 224,
+}
 
 
 def parse_name_path(values, flag_name):

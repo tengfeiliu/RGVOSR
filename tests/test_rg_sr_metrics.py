@@ -32,7 +32,9 @@ class RGSrMetricsTests(unittest.TestCase):
         from metrics.rg_sr_metrics import metric_resize_size
 
         self.assertEqual(metric_resize_size(256, 96, "niqe"), (512, 192))
+        self.assertEqual(metric_resize_size(256, 96, "liqe"), (598, 224))
         self.assertIsNone(metric_resize_size(256, 256, "niqe"))
+        self.assertIsNone(metric_resize_size(256, 256, "liqe"))
         self.assertIsNone(metric_resize_size(256, 96, "musiq-pipal"))
 
     def test_metric_sampling_is_deterministic_and_bounded_per_dataset(self):
