@@ -38,6 +38,16 @@ def _dtype(config):
     return {"fp16": torch.float16, "float16": torch.float16, "bf16": torch.bfloat16}.get(name, torch.float32)
 
 
+def _fork_rng_devices(device):
+    """Resolve an unindexed `cuda` to the current visible CUDA device."""
+    if device.type != "cuda":
+        return []
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"Requested device '{device}', but CUDA is not available")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return [index]
+
+
 def _seed(base_seed, state_id, candidate_index):
     digest = hashlib.sha256(f"{state_id}:{candidate_index}".encode("utf-8")).digest()
     return (int(base_seed) + int.from_bytes(digest[:8], "big")) % (2**63 - 1)
@@ -64,6 +74,7 @@ def main(args):
     if not bool(cfg(config, "condition.refinement.enabled", False)):
         raise ValueError("Stage E requires condition.refinement.enabled: true")
     device = torch.device(args.device)
+    rng_devices = _fork_rng_devices(device)
     dtype = _dtype(config)
     artist = build_rg_flux_artist(config).to(device)
     artist.load_trainable(args.old_adapter, is_trainable=False)
@@ -105,7 +116,7 @@ def main(args):
             )
             for candidate_index in range(args.num_candidates):
                 seed = _seed(args.seed, item["state_id"], candidate_index)
-                with torch.random.fork_rng(devices=[device.index] if device.type == "cuda" else []):
+                with torch.random.fork_rng(devices=rng_devices):
                     torch.manual_seed(seed)
                     if device.type == "cuda":
                         torch.cuda.manual_seed_all(seed)

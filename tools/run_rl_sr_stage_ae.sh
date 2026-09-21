@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command A–E RL-SR cycle. Data input, inference, and evaluation are all
 # derived from config.data.jsonl_path; only the server-local F0 checkpoint is
-# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|from06|reward|e|eval]
+# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|from06|from07|reward|e|eval]
 
 set -Eeuo pipefail
 
@@ -319,11 +319,12 @@ case "${STAGE}" in
   from04) resume_from_04; run_reward; run_e; run_eval ;;
   from05) build_states_and_evaluate_sft; run_reward; run_e; run_eval ;;
   from06) run_sft_evaluation; run_reward; run_e; run_eval ;;
+  from07) run_reward; run_e; run_eval ;;
   reward) run_reward ;;
   e) run_e ;;
   eval) run_eval ;;
   *)
-    echo "Usage: $0 [all|f0|c|multiround|from04|from05|from06|reward|e|eval]" >&2
+    echo "Usage: $0 [all|f0|c|multiround|from04|from05|from06|from07|reward|e|eval]" >&2
     exit 2
     ;;
 esac
