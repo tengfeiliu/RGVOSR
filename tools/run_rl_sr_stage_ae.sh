@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command A–E RL-SR cycle. Data input, inference, and evaluation are all
 # derived from config.data.jsonl_path; only the server-local F0 checkpoint is
-# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|reward|e|eval]
+# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|from06|reward|e|eval]
 
 set -Eeuo pipefail
 
@@ -91,7 +91,7 @@ case "${STAGE}" in
   all|f0|c|multiround|from04|from05) require_file "${TRAIN_JSONL}" ;;
 esac
 case "${STAGE}" in
-  all|multiround|from04|from05|eval) require_file "${EVAL_JSONL}" ;;
+  all|multiround|from04|from05|from06|eval) require_file "${EVAL_JSONL}" ;;
 esac
 if [[ -n "${RL_SR_RUN_DIR:-}" ]]; then
   RUN_ROOT="${RL_SR_RUN_DIR}"
@@ -151,7 +151,7 @@ prepare_inputs() {
       ;;
   esac
   case "${STAGE}" in
-    all|multiround|from04|from05|eval)
+    all|multiround|from04|from05|from06|eval)
       run_stage "00_create_evaluation_input_manifests" "${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
         --config "${CONFIG}" --repo_root "${REPO_ROOT}" --output_dir "${EVAL_MANIFEST_DIR}"
       mapfile -t EVAL_DATASET_DIRS < <("${PYTHON_CMD[@]}" tools/create_sr_evaluation_manifests.py \
@@ -206,6 +206,13 @@ build_states_and_evaluate_sft() {
     --sampler_manifest "${RUN_ROOT}/04_sft_multiround_train_state/round_01/inference_manifest.json" \
     --output_jsonl "${RUN_ROOT}/05_states_for_rl.jsonl" --max_round "${ITERATIONS}"
 
+  run_sft_evaluation
+}
+
+run_sft_evaluation() {
+  local g_sft_adapter="${RUN_ROOT}/03_g_sft/rg_flux_adapters"
+  require_file "${g_sft_adapter}"
+  require_file "${RUN_ROOT}/05_states_for_rl.jsonl"
   local evaluation_output="${RUN_ROOT}/06_sft_multiround_evaluation"
   local evaluation_resume_args=()
   if [[ -f "${evaluation_output}/iterative_manifest.json" ]]; then
@@ -311,11 +318,12 @@ case "${STAGE}" in
   multiround) run_multiround ;;
   from04) resume_from_04; run_reward; run_e; run_eval ;;
   from05) build_states_and_evaluate_sft; run_reward; run_e; run_eval ;;
+  from06) run_sft_evaluation; run_reward; run_e; run_eval ;;
   reward) run_reward ;;
   e) run_e ;;
   eval) run_eval ;;
   *)
-    echo "Usage: $0 [all|f0|c|multiround|from04|from05|reward|e|eval]" >&2
+    echo "Usage: $0 [all|f0|c|multiround|from04|from05|from06|reward|e|eval]" >&2
     exit 2
     ;;
 esac

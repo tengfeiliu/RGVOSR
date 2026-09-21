@@ -137,7 +137,7 @@ rl_sr:
         dataset_filter: RealLR200
         expected_count: 200
     metric_device: cpu
-    metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq-pipal]
+    metrics: [clipiqa, clipiqa+, nima, niqe, liqe, maniqa-pipal]
   state_jsonl: null
   init_adapter: null          # Stage-0/F0 adapter used to initialize stage C
   sft_output_dir: exp_rg_flux_refiner_sft

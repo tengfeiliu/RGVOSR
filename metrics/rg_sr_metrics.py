@@ -198,6 +198,17 @@ def evaluate_metrics(rows, metrics, device):
     if str(device).startswith("cuda") and (torch is None or not torch.cuda.is_available()):
         raise RuntimeError(f"Requested device '{device}', but CUDA is not available")
 
+    list_models = getattr(pyiqa, "list_models", None)
+    if callable(list_models):
+        available_metrics = set(list_models())
+        unsupported = [name for name in metrics if name not in available_metrics]
+        if unsupported:
+            raise ValueError(
+                "Unsupported PyIQA metric(s): "
+                f"{unsupported}. Check metric names before evaluation; "
+                "use 'maniqa-pipal', not 'musiq-pipal'."
+            )
+
     directions = {}
     no_grad = torch.no_grad if torch is not None else contextlib.nullcontext
     with no_grad():

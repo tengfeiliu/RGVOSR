@@ -15,6 +15,8 @@
 #                   04图片，从下一未生成轮次继续，跳过04后续IQA，然后自动完成05--12。
 #   resume-from05   04已完成、05或其后失败时使用：不再运行04，直接重建05并自动完成
 #                   06--12。已有完整阶段输出可由各工具自身的恢复逻辑复用。
+#   resume-from06   05已完成、06推理或指标失败时使用：复用06现有轮次图片，补算缺失
+#                   指标并自动完成07--12。
 #   resume-c        只运行 03_shared_refiner_sft；要求 02_states_for_c.jsonl 已存在。
 #   resume-multiround
 #                   运行 04_sft_multiround_train_state、05_build_states_for_rl、
@@ -61,7 +63,7 @@ Usage:
 
   RL_SR_RUN_DIR=<existing-run-dir> [F0_CHECKPOINT=<checkpoint>] \
     bash commands/rl_sr_stage_ae_commands.sh \
-    {resume-from04|resume-from05|resume-c|resume-multiround|resume-reward|resume-e|resume-eval}
+    {resume-from04|resume-from05|resume-from06|resume-c|resume-multiround|resume-reward|resume-e|resume-eval}
 
   RL_SR_RUN_DIR=<existing-run-dir> \
     bash commands/rl_sr_stage_ae_commands.sh inspect
@@ -260,6 +262,11 @@ case "${ACTION}" in
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
     resolve_resume_f0_checkpoint
     launch_resume "from05" "resume_from05_to_final"
+    ;;
+  resume-from06)
+    require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"
+    resolve_resume_f0_checkpoint
+    launch_resume "from06" "resume_from06_to_final"
     ;;
   resume-c)
     require_path "RL_SR_RUN_DIR" "${RL_SR_RUN_DIR:-}"

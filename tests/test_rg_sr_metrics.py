@@ -125,6 +125,26 @@ class RGSrMetricsTests(unittest.TestCase):
         self.assertEqual(rows[0]["clipiqa"], 1.0)
         self.assertEqual(rows[1]["niqe"], 4.0)
 
+    def test_evaluate_metrics_rejects_unknown_metric_before_loading_models(self):
+        from metrics.rg_sr_metrics import evaluate_metrics
+
+        create_calls = []
+        fake_pyiqa = types.SimpleNamespace(
+            list_models=lambda: ["maniqa-pipal", "musiq"],
+            create_metric=lambda name, device: create_calls.append(name),
+        )
+        old_pyiqa = sys.modules.get("pyiqa")
+        sys.modules["pyiqa"] = fake_pyiqa
+        try:
+            with self.assertRaisesRegex(ValueError, "maniqa-pipal"):
+                evaluate_metrics([], ["musiq-pipal"], "cpu")
+        finally:
+            if old_pyiqa is None:
+                sys.modules.pop("pyiqa", None)
+            else:
+                sys.modules["pyiqa"] = old_pyiqa
+        self.assertEqual(create_calls, [])
+
     def test_write_outputs_creates_per_image_csv_and_summary_json(self):
         from metrics.rg_sr_metrics import build_summary, write_outputs
 
