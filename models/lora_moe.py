@@ -16,7 +16,9 @@ def route_logits(logits, mode="soft", top_k=2, temperature=1.0):
     top_k = max(1, min(int(top_k), logits.shape[-1]))
     values, indexes = torch.topk(scaled, k=top_k, dim=-1)
     top_alpha = torch.softmax(values, dim=-1)
-    alpha = torch.zeros_like(logits)
+    # CUDA autocast promotes softmax to FP32 while logits can remain BF16.
+    # Scatter must use the actual softmax dtype; non-AMP inference is unchanged.
+    alpha = torch.zeros_like(logits, dtype=top_alpha.dtype)
     alpha.scatter_(-1, indexes, top_alpha)
     return alpha
 

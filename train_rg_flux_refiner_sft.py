@@ -8,6 +8,8 @@ FLUX.2 backbone before constructing the optimizer.
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import asdict
 import json
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from diffusers.optimization import get_scheduler
 from dataloaders.sr_refinement_state_dataset import (
     SRRefinementStateDataset,
     sr_refinement_state_collate_fn,
+    build_refinement_dataloader,
+    set_refinement_loader_epoch,
 )
 from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
@@ -27,7 +31,15 @@ from rg_flux_fm import build_flow_matching_inputs, sample_sigma
 from rl_sr.artifact_store import write_json_atomic
 from rl_sr.conditioning import state_router_condition_tensors
 from rl_sr.schema import content_tree_sha256
-from rl_sr.snapshots import assert_rl_frozen_backbone, configure_rl_trainables
+from rl_sr.snapshots import assert_rl_frozen_backbone
+from rl_sr.stable_training import (
+    SFT_LOSS_FIELDS,
+    build_sft_parameter_groups,
+    finite_sft_metrics,
+    resolve_sft_controls,
+    save_sft_checkpoint,
+)
+from rl_sr.training import refinement_image_losses
 from train_rg_flux_sr import cfg, load_config
 
 
@@ -46,11 +58,15 @@ def _require_refinement_config(config):
         raise ValueError("RL-SR permanently freezes FLUX.2: training.freeze_flux_transformer must be true")
     if not bool(cfg(config, "condition.refinement.enabled", False)):
         raise ValueError("Set condition.refinement.enabled: true for stages C/E")
+    if not cfg(config, "rl_sr.init_adapter", None):
+        raise ValueError("Stage C requires rl_sr.init_adapter or --init_adapter; refusing random F0 initialization")
 
 
 def train(config, state_jsonl=None, output_dir=None, max_steps=None):
     _require_refinement_config(config)
     rl_config = config.get("rl_sr") or {}
+    # Reject malformed stability controls before loading data or a large model.
+    resolve_sft_controls(config)
     state_jsonl = state_jsonl or rl_config.get("state_jsonl")
     if not state_jsonl:
         raise ValueError("Provide --state_jsonl or rl_sr.state_jsonl")
@@ -70,37 +86,26 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
         require_hr=True,
         vae_align=int(cfg(config, "data.vae_align", 16)),
     )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=per_device_batch,
-        shuffle=True,
-        num_workers=int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))),
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))) > 0,
-        collate_fn=sr_refinement_state_collate_fn,
-    )
+    dataloader = build_refinement_dataloader(dataset, per_device_batch,
+        int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))),
+        sr_refinement_state_collate_fn, config)
     if not len(dataloader):
         raise ValueError("State dataset is smaller than one batch; lower rl_sr.batch_size")
     artist = build_rg_flux_artist(config)
     init_adapter = rl_config.get("init_adapter")
     if init_adapter:
         artist.load_trainable(init_adapter, is_trainable=True)
-    trainable = configure_rl_trainables(artist, train_router=False)
+    trainable, param_groups, sft_controls = build_sft_parameter_groups(artist, config)
     assert_rl_frozen_backbone(artist, train_router=False)
-    param_groups = [
-        {
-            "params": [param for _, param in trainable],
-            "lr": float(rl_config.get("sft_lr", cfg(config, "training.lr_adapter", 1.0e-4))),
-            "weight_decay": float(rl_config.get("weight_decay", cfg(config, "training.weight_decay", 0.01))),
-        }
-    ]
     optimizer = torch.optim.AdamW(
         param_groups,
         betas=(float(rl_config.get("adam_beta1", 0.9)), float(rl_config.get("adam_beta2", 0.95))),
         eps=float(rl_config.get("adam_epsilon", 1.0e-8)),
     )
-    requested_steps = int(max_steps or rl_config.get("sft_max_steps", cfg(config, "training.max_steps", 1000)))
+    requested_steps = int(max_steps if max_steps is not None else rl_config.get(
+        "sft_max_steps", cfg(config, "training.max_steps", 1000)))
+    if requested_steps <= 0:
+        raise ValueError("SFT max_steps must be a positive number of optimizer updates")
     scheduler = get_scheduler(
         str(rl_config.get("lr_scheduler", "constant_with_warmup")),
         optimizer,
@@ -117,8 +122,23 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
     fm_weight = float(rl_config.get("sft_fm_weight", 1.0))
     latent_weight = float(rl_config.get("sft_latent_weight", 0.10))
     global_step = 0
+    micro_steps = 0
+    optimizer_steps_skipped = 0
+    accumulated_micro_steps = 0
+    accumulated_losses = {name: 0.0 for name in SFT_LOSS_FIELDS}
+    checkpoint_records = []
+    last_metrics = None
+    csv_fields = ["optimizer_update", "micro_steps", "accumulated_micro_steps", *SFT_LOSS_FIELDS,
+                  "grad_norm", "lora_lr", "refinement_lr"]
+    loss_csv = output_dir / "loss_history.csv"
+    if accelerator.is_main_process:
+        with loss_csv.open("w", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=csv_fields).writeheader()
+    epoch = 0
     artist.train()
     while global_step < requested_steps:
+        set_refinement_loader_epoch(dataloader, epoch)
+        epoch += 1
         for batch in dataloader:
             if global_step >= requested_steps:
                 break
@@ -169,33 +189,94 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
                     )
                     loss_fm = F.mse_loss(v_pred.float(), v_target.float())
                     sigma_view = sigma.reshape(-1, 1, 1, 1).to(dtype=z_t.dtype)
-                    z0_pred = z_t - sigma_view * v_pred
+                    z0_pred = z_t.float() - sigma_view.float() * v_pred.float()
                     loss_latent = F.smooth_l1_loss(z0_pred.float(), z_hr.float())
-                    loss = fm_weight * loss_fm + latent_weight * loss_latent
+                    image_losses = refinement_image_losses(unwrapped, config, global_step, z0_pred, hq)
+                    loss = fm_weight * loss_fm + latent_weight * loss_latent + image_losses["loss_image"]
+                metrics = finite_sft_metrics({"loss": loss, "loss_fm": loss_fm,
+                    "loss_latent": loss_latent, "loss_charb": image_losses["loss_charb"],
+                    "loss_lpips": image_losses["loss_lpips"]}, accelerator)
+                micro_steps += 1
+                accumulated_micro_steps += 1
+                for name, value in metrics.items():
+                    accumulated_losses[name] += value
                 accelerator.backward(loss)
+                synchronized = accelerator.sync_gradients
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(artist.parameters(), float(rl_config.get("max_grad_norm", 1.0)))
+                    grad_norm = accelerator.clip_grad_norm_(artist.parameters(), float(rl_config.get("max_grad_norm", 1.0)))
+                    finite_sft_metrics({"grad_norm": grad_norm}, accelerator)
+                # Record the rates used for this update, before scheduler.step().
+                update_lrs = {group["name"]: float(group["lr"]) for group in optimizer.param_groups}
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+            if not synchronized:
+                continue
+            if accelerator.optimizer_step_was_skipped:
+                optimizer_steps_skipped += 1
+                accumulated_micro_steps = 0
+                accumulated_losses = {name: 0.0 for name in SFT_LOSS_FIELDS}
+                continue
             global_step += 1
-            if accelerator.is_main_process and global_step % int(rl_config.get("log_every", 20)) == 0:
+            # The loss row is the mean of all microbatches in this update,
+            # averaged across ranks, not just the final microbatch's loss.
+            means = torch.tensor([accumulated_losses[name] / accumulated_micro_steps for name in SFT_LOSS_FIELDS],
+                                 device=accelerator.device, dtype=torch.float64)
+            means = accelerator.reduce(means, reduction="mean").tolist()
+            last_metrics = finite_sft_metrics({**dict(zip(SFT_LOSS_FIELDS, means)), "grad_norm": grad_norm}, accelerator)
+            if accelerator.is_main_process:
+                row = {"optimizer_update": global_step, "micro_steps": micro_steps,
+                       "accumulated_micro_steps": accumulated_micro_steps, **last_metrics,
+                       "lora_lr": update_lrs.get("lora", 0.0), "refinement_lr": update_lrs.get("refinement", 0.0)}
+                with loss_csv.open("a", newline="", encoding="utf-8") as handle:
+                    csv.DictWriter(handle, fieldnames=csv_fields).writerow(row)
+            accumulated_micro_steps = 0
+            accumulated_losses = {name: 0.0 for name in SFT_LOSS_FIELDS}
+            if sft_controls.checkpoint_every and global_step % sft_controls.checkpoint_every == 0:
+                checkpoint = save_sft_checkpoint(unwrapped, output_dir / f"checkpoint-{global_step:08d}",
+                    {"optimizer_updates": global_step, "micro_steps": micro_steps,
+                     "optimizer_steps_skipped": optimizer_steps_skipped}, last_metrics, accelerator)
+                if checkpoint is not None:
+                    checkpoint_records.append({"optimizer_updates": global_step,
+                        "path": f"checkpoint-{global_step:08d}", "adapter_sha256": checkpoint["adapter_sha256"],
+                        "weights_sha256": checkpoint["weights_sha256"]})
+            if accelerator.is_main_process and global_step % max(1, int(rl_config.get("log_every", 20))) == 0:
                 print(
-                    f"[refiner-sft] step={global_step} loss={loss.detach().float().item():.6f} "
-                    f"fm={loss_fm.detach().float().item():.6f} latent={loss_latent.detach().float().item():.6f}",
+                    f"[refiner-sft] update={global_step} micro_steps={micro_steps} loss={last_metrics['loss']:.6f} "
+                    f"fm={last_metrics['loss_fm']:.6f} latent={last_metrics['loss_latent']:.6f} "
+                    f"charb={last_metrics['loss_charb']:.6f} lpips={last_metrics['loss_lpips']:.6f}",
                     flush=True,
                 )
     accelerator.wait_for_everyone()
     unwrapped = accelerator.unwrap_model(artist)
+    final_checkpoint = save_sft_checkpoint(unwrapped, output_dir,
+        {"optimizer_updates": global_step, "micro_steps": micro_steps,
+         "optimizer_steps_skipped": optimizer_steps_skipped}, last_metrics, accelerator)
     if accelerator.is_main_process:
         adapter_dir = output_dir / "rg_flux_adapters"
-        unwrapped.save_trainable(adapter_dir, save_files=True)
         summary = {
             "stage": "C_shared_refinement_sft",
             "global_step": global_step,
+            "optimizer_updates": global_step,
+            "requested_optimizer_updates": requested_steps,
+            "micro_steps": micro_steps,
+            "optimizer_steps_skipped": optimizer_steps_skipped,
+            "grad_accum_steps": accumulation,
             "state_jsonl": str(state_jsonl),
             "adapter_sha256": content_tree_sha256(adapter_dir),
+            "weights_sha256": final_checkpoint["weights_sha256"],
+            "sft_controls": asdict(sft_controls),
+            "optimizer_parameter_groups": [{"name": group["name"],
+                "initial_lr": group["initial_lr"], "final_lr": float(group["lr"]),
+                "parameter_count": sum(parameter.numel() for parameter in group["params"])}
+                for group in optimizer.param_groups],
+            "loss_history_csv": str(loss_csv),
+            "last_update_metrics": last_metrics,
+            "checkpoints": checkpoint_records,
             "backbone_frozen": True,
+            "routing": unwrapped.set_moe_inference_schedule(),
+            "image_loss": rl_config.get("image_loss", {}),
+            "round_balanced_batches": bool(rl_config.get("round_balanced_batches", False)),
             "trainable_parameter_names": [name for name, _ in trainable],
         }
         write_json_atomic(output_dir / "summary.json", summary)

@@ -3,14 +3,96 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
+import random
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler, DataLoader
 from torchvision import transforms
 
 from rl_sr.artifact_store import read_jsonl
 from rl_sr.schema import StateRecord
+
+
+class RoundBalancedBatchSampler(Sampler):
+    """Mix distinct target rounds per batch; oversample scarce round buckets.
+
+    A sampling epoch has floor(N / B) batches. It is not a once-only traversal:
+    buckets wrap with a new shuffle to avoid majority rounds dominating.
+    """
+
+    def __init__(self, round_indices, batch_size, seed=42, min_rounds=2, drop_last=True):
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.drop_last = bool(drop_last)
+        self.buckets = {}
+        for index, round_index in enumerate(round_indices):
+            self.buckets.setdefault(int(round_index), []).append(index)
+        self.rounds = sorted(self.buckets)
+        if int(min_rounds) < 2:
+            raise ValueError("Balanced batches require min_rounds >= 2")
+        if len(self.rounds) < int(min_rounds) or self.batch_size < int(min_rounds):
+            raise ValueError("Round-balanced batches need >=2 rounds and batch_size >= min_rounds; "
+                             "rebuild single-round bootstrap states or disable round_balanced_batches")
+        self.count = len(round_indices)
+        if self.count < self.batch_size:
+            raise ValueError("Dataset is smaller than one balanced batch")
+
+    def __len__(self):
+        return self.count // self.batch_size if self.drop_last else math.ceil(self.count / self.batch_size)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        buckets = {key: list(indices) for key, indices in self.buckets.items()}
+        for indices in buckets.values():
+            rng.shuffle(indices)
+        cursors = {key: 0 for key in buckets}
+        round_offset = self.epoch * len(self) * self.batch_size
+        for batch_index in range(len(self)):
+            batch = []
+            for slot in range(self.batch_size):
+                key = self.rounds[(round_offset + batch_index * self.batch_size + slot) % len(self.rounds)]
+                if cursors[key] == len(buckets[key]):
+                    rng.shuffle(buckets[key])
+                    cursors[key] = 0
+                batch.append(buckets[key][cursors[key]])
+                cursors[key] += 1
+            rng.shuffle(batch)
+            yield batch
+
+
+def refinement_round_indices(dataset):
+    if hasattr(dataset, "states"):
+        return [dataset.states[record.state_id].round_index for record in dataset.records]
+    return [record.round_index for record in dataset.records]
+
+
+def build_refinement_dataloader(dataset, batch_size, num_workers, collate_fn, config):
+    settings = config.get("rl_sr") or {}
+    kwargs = dict(num_workers=num_workers, pin_memory=True, collate_fn=collate_fn,
+                  persistent_workers=num_workers > 0)
+    if settings.get("round_balanced_batches", False):
+        sampler = RoundBalancedBatchSampler(refinement_round_indices(dataset), batch_size,
+                    seed=int(settings.get("seed", config.get("training", {}).get("seed", 42))),
+                    min_rounds=int(settings.get("min_rounds_per_batch", 2)))
+        return DataLoader(dataset, batch_sampler=sampler, **kwargs)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True, **kwargs)
+
+
+def set_refinement_loader_epoch(loader, epoch):
+    # Accelerator can wrap batch_sampler. Walk wrappers without discarding
+    # the original per-batch mixing contract.
+    sampler = loader.batch_sampler
+    while sampler is not None:
+        if isinstance(sampler, RoundBalancedBatchSampler):
+            sampler.set_epoch(epoch)
+            return
+        sampler = getattr(sampler, "batch_sampler", None)
 
 
 class SRRefinementStateDataset(Dataset):

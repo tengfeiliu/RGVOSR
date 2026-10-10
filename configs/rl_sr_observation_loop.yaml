@@ -1,0 +1,53 @@
+version: observation_loop_v5
+source_jsonl: /media/xd/data/code/RGVOSR/datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl
+baseline_run: /media/xd/data/code/RGVOSR/exp_rg_flux_rl/rlsr_f0-036000_flux2-klein_flux2-image-concat_iqa-suggestion_ccondition8_s512_n3000-ss42_r4_k4_sft1000_nft250_eval-reallq250-reallr200_261005-235953
+prior_runs:
+  - /media/xd/data/code/RGVOSR-self-refine-v2/exp_rg_flux_self_refine/self_refine_v2_20261007
+  - /media/xd/data/code/RGVOSR-self-refine-v3/exp_rg_flux_self_refine/stable_f0_v3_20261007
+  - /media/xd/data/code/RGVOSR-self-refine-v4/exp_rg_flux_self_refine/round_state_v4_20261008
+generic_cache_run: /media/xd/data/code/RGVOSR-self-refine-v4/exp_rg_flux_self_refine/round_state_v4_20261008
+base_config: /media/xd/data/code/RGVOSR-self-refine-v3/exp_rg_flux_self_refine/stable_f0_v3_20261007/generators/A_cycle0/runtime_config.yaml
+model_path: /media/xd/data/models/FLUX.2-klein-base-4B
+f0_adapter: /media/xd/data/code/RGVOSR/exp_rg_flux_sr/rg_flux2_klein_sr_ms_stage0B_flux2_image_concat_size512_s3_condition8_prompt_iqa_suggestion_26080421_r02/checkpoints/checkpoint-00036000/rg_flux_adapters
+f0_sha256: bf8539cfd27dc5f43d9a202b6f68ab87cc2ae8c603ca37df2e0b19f909452fe0
+seed: 20261010
+train_sources: 1024
+validation_sources: 128
+test_sources: 256
+inference_batch: 8
+flux_batch: 20
+flux_micro_batch: 20
+flux_updates: 200
+flux_lr: 0.0001
+flux_attention_width: 256
+flux_spatial_grid: 32
+flux_eval_sources: 32
+flux_ablation_sources: 64
+flux_checkpoint_every: 100
+loop_width: 96
+loop_depth: 2
+loop_heads: 4
+loop_batch: 256
+loop_micro_batch: 256
+loop_updates: 1200
+loop_lr: 0.0002
+loop_crop: 512
+loop_checkpoint_every: 200
+loop_validation_sources: 64
+loop_eval_batch: 16
+identity_fraction: 0.1
+gradient_weight: 0.05
+low_frequency_weight: 0.1
+refresh_every: 400
+refresh_fraction: 0.5
+minimum_free_gib:
+  cache_text: 34
+  f0: 22
+  flux_weak: 68
+  flux_spatial: 68
+  flux_generic: 22
+  correctors: 56
+  smoke: 24
+poll_seconds: 30
+max_attempts: 3
+stages: [prepare, cache_text, f0, smoke, correctors, flux_generic, flux_weak, flux_spatial, report]

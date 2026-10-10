@@ -813,16 +813,16 @@ def run_inference_dataset(
                         "Refinement inference requires an original-LR anchor for every image; "
                         f"missing anchor for {image_path}"
                     )
-                anchor_up_pil, _, anchor_up = prepare_lq_up(
-                    anchor_path,
-                    upscale=1 if pre_cropped else args.upscale,
-                    align=int(cfg(config, "data.vae_align", 16)),
-                    min_size=args.min_size,
-                )
-                del anchor_up_pil
+                # Match training: resize the original LR anchor to the current
+                # SR geometry after its minimum-size and VAE alignment steps.
+                with Image.open(anchor_path) as anchor_image:
+                    anchor_up_pil = anchor_image.convert("RGB").resize(
+                        lq_up_pil.size, Image.Resampling.BICUBIC
+                    )
+                anchor_up = to_tensor(anchor_up_pil).unsqueeze(0).mul(2.0).sub(1.0)
                 z_anchor_lr = artist.encode_images(
                     anchor_up.to(device=device, dtype=dtype),
-                    sample=lr_cond_mode != "flux2_image_concat",
+                    sample=False,
                 ).to(device=device, dtype=dtype)
             cache_image_key = str(image_path)
             if isinstance(condition, dict):

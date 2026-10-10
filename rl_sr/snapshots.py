@@ -44,6 +44,10 @@ def configure_rl_trainables(artist, train_router: bool = False) -> list[tuple[st
             trainable.append((name, parameter))
     if not trainable:
         raise RuntimeError("RL-SR found no trainable LoRA or condition-adapter parameters")
+    if not train_router and hasattr(artist, "set_moe_inference_schedule"):
+        # Freezing parameters does not freeze routing mode/temperature. All
+        # C/E policies must use the schedule that generated their rollouts.
+        artist.set_moe_inference_schedule()
     assert_rl_frozen_backbone(artist, train_router=train_router)
     return trainable
 

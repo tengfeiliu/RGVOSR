@@ -326,6 +326,8 @@ class Flux2KleinSRArtist(nn.Module):
                 anchor_tokens=int(_cfg(self.config, "condition.refinement.anchor_tokens", 8)),
                 dropout=float(_cfg(self.config, "condition.refinement.dropout", condition_dropout)),
                 max_round=int(_cfg(self.config, "condition.refinement.max_round", 16)),
+                anchor_mode=str(_cfg(self.config, "condition.refinement.anchor_mode", "legacy")),
+                attention_dim=int(_cfg(self.config, "condition.refinement.attention_dim", 128)),
             )
 
     def _resolve_lora_targets(self):
@@ -1095,6 +1097,8 @@ class Flux2KleinSRArtist(nn.Module):
             "flux_backend": self.backend_name,
             "lora_backend": self.lora_backend,
         }
+        if self.refinement_condition_adapter is not None:
+            metadata["refinement_condition"] = self.refinement_condition_adapter.checkpoint_metadata()
         if self.is_lora_moe_enabled():
             moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
             metadata["lora_moe"] = {
@@ -1169,11 +1173,19 @@ class Flux2KleinSRArtist(nn.Module):
         if not checkpoint_dir.is_dir():
             raise NotADirectoryError(f"Adapter checkpoint path is not a directory: {checkpoint_dir}")
         meta_path = checkpoint_dir / "rg_flux_checkpoint_meta.json"
+        metadata = {}
         if meta_path.exists():
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
             backend = str(metadata.get("flux_backend", "")).lower()
             if backend and backend != self.backend_name:
                 raise RuntimeError(f"Checkpoint backend '{backend}' is incompatible with '{self.backend_name}'.")
+            refinement_metadata = metadata.get("refinement_condition")
+            if refinement_metadata is not None:
+                if self.refinement_condition_adapter is None:
+                    raise RuntimeError("Checkpoint contains refinement weights; enable condition.refinement.enabled")
+                self.refinement_condition_adapter.validate_checkpoint_metadata(refinement_metadata, True)
+                if not (checkpoint_dir / "condition_adapters.pt").is_file():
+                    raise FileNotFoundError("Refinement checkpoint is missing condition_adapters.pt")
             checkpoint_moe = metadata.get("lora_moe")
             if self.is_lora_moe_enabled() and isinstance(checkpoint_moe, dict):
                 moe_cfg = _cfg(self.config, "model.lora_moe", {}) or {}
@@ -1237,4 +1249,15 @@ class Flux2KleinSRArtist(nn.Module):
         adapter_state = checkpoint_dir / "condition_adapters.pt"
         if adapter_state.exists():
             state = torch.load(adapter_state, map_location="cpu")
+            refinement_metadata = metadata.get("refinement_condition")
+            has_refinement = any(name.startswith("refinement_condition_adapter.") for name in state)
+            if self.refinement_condition_adapter is not None:
+                self.refinement_condition_adapter.validate_checkpoint_metadata(refinement_metadata, has_refinement)
+                if refinement_metadata is not None:
+                    expected = {name for name in self.state_dict() if name.startswith("refinement_condition_adapter.")}
+                    missing = expected - set(state)
+                    if missing:
+                        raise RuntimeError(f"Refinement checkpoint is missing parameters: {sorted(missing)[:4]}")
+            elif refinement_metadata is not None or has_refinement:
+                raise RuntimeError("Checkpoint contains refinement weights; enable condition.refinement.enabled")
             _load_state_dict_with_shape_check(self, state, adapter_state, "condition adapter")
