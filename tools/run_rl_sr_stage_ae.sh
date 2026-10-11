@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command A–E RL-SR cycle. Data input, inference, and evaluation are all
-# derived from config.data.jsonl_path; only the server-local F0 checkpoint is
-# required. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|from06|from07|reward|e|eval]
+# derived from config.data.jsonl_path. F0 defaults to rl_sr.init_adapter and
+# can be overridden with F0_CHECKPOINT. Usage: bash tools/run_rl_sr_stage_ae.sh [all|f0|c|multiround|from04|from05|from06|from07|reward|e|eval]
 
 set -Eeuo pipefail
 
@@ -27,9 +27,22 @@ if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 export OMP_NUM_THREADS
 
-# F0 is intentionally the sole machine-specific required value. Dataset paths
-# come from config.data.jsonl_path, and output names are created automatically.
-: "${F0_CHECKPOINT:?Set F0_CHECKPOINT to checkpoint-00036000 or its rg_flux_adapters directory}"
+# Read the same F0 used by direct C training; never silently initialize from a
+# random or different adapter when the environment override is absent.
+if [[ -z "${F0_CHECKPOINT:-}" ]]; then
+  F0_CHECKPOINT="$("${PYTHON_CMD[@]}" - "${CONFIG}" "${REPO_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+config = yaml.safe_load(Path(sys.argv[1]).read_text())
+value = (config.get('rl_sr') or {}).get('init_adapter')
+if not value:
+    raise SystemExit('Set rl_sr.init_adapter or F0_CHECKPOINT to the F0 adapter')
+path = Path(value).expanduser()
+print(path if path.is_absolute() else (Path(sys.argv[2]) / path).resolve())
+PY
+)"
+fi
 F0_ADAPTER="${F0_ADAPTER:-${F0_CHECKPOINT}/rg_flux_adapters}"
 if [[ -f "${F0_CHECKPOINT}/flux2_klein_lora_moe_state.pt" ]]; then
   F0_ADAPTER="${F0_CHECKPOINT}"
@@ -68,6 +81,15 @@ EVAL_JSONL="$(config_field evaluation_jsonl_path)"
 TRAIN_MAX_SAMPLES="$(config_field train_max_samples)"
 TRAIN_SUBSET_SEED="$(config_field train_subset_seed)"
 ITERATIONS="${ITERATIONS:-$(config_field iterations)}"
+if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || (( ITERATIONS < 1 )); then
+  echo "ITERATIONS must be a positive integer." >&2
+  exit 2
+fi
+SFT_BOOTSTRAP_ROUNDS="${SFT_BOOTSTRAP_ROUNDS:-$(config_field sft_bootstrap_rounds)}"
+if [[ ! "${SFT_BOOTSTRAP_ROUNDS}" =~ ^[0-9]+$ ]] || (( SFT_BOOTSTRAP_ROUNDS < 2 )); then
+  echo "SFT_BOOTSTRAP_ROUNDS must be >=2 to build multi-round C training states." >&2
+  exit 2
+fi
 NUM_CANDIDATES="${NUM_CANDIDATES:-$(config_field num_candidates)}"
 SFT_MAX_STEPS="${SFT_MAX_STEPS:-$(config_field sft_max_steps)}"
 RL_MAX_STEPS="${RL_MAX_STEPS:-$(config_field rl_max_steps)}"
@@ -179,12 +201,21 @@ run_f0() {
       --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
   fi
 
+  # Collect actual y1..y(K-1) from frozen F0. Reuse y1, without inventing
+  # missing rounds or using post-C data to bootstrap C.
+  run_stage "02_f0_bootstrap_trajectory" "${PYTHON_CMD[@]}" tools/run_rg_flux_iterative_inference.py \
+    --checkpoint "${F0_ADAPTER}" --config "${CONFIG}" --input "${TRAIN_INPUT}" \
+    --jsonl_path "${TRAIN_JSONL}" --output_dir "${RUN_ROOT}/02_f0_bootstrap_trajectory" \
+    --reuse_f0_dir "${RUN_ROOT}/01_f0_round1_train_state" \
+    --iterations "${SFT_BOOTSTRAP_ROUNDS}" --upscale 1 --seed "${SEED}" \
+    --metric_sample_count 0 --metric_device "${ITER_METRIC_DEVICE}" --metrics "${ITER_METRICS[@]}"
+
   run_stage "02_build_states_for_c" "${PYTHON_CMD[@]}" tools/build_sr_refinement_states.py \
-    --lineage_jsonl "${RUN_ROOT}/01_f0_round1_train_state/sample_lineage.jsonl" \
+    --lineage_jsonl "${RUN_ROOT}/02_f0_bootstrap_trajectory/sample_lineage.jsonl" \
     --source_jsonl "${TRAIN_JSONL}" --dataset_id "${DATASET_ID}" \
-    --artifact_root "${RUN_ROOT}/01_f0_round1_train_state" --producer_adapter "${F0_ADAPTER}" \
-    --sampler_manifest "${RUN_ROOT}/01_f0_round1_train_state/round_01/inference_manifest.json" \
-    --output_jsonl "${RUN_ROOT}/02_states_for_c.jsonl" --max_round 2
+    --artifact_root "${RUN_ROOT}/02_f0_bootstrap_trajectory" --producer_adapter "${F0_ADAPTER}" \
+    --sampler_manifest "${RUN_ROOT}/02_f0_bootstrap_trajectory/round_01/inference_manifest.json" \
+    --output_jsonl "${RUN_ROOT}/02_states_for_c.jsonl" --max_round "$((SFT_BOOTSTRAP_ROUNDS + 1))"
 }
 
 run_c() {

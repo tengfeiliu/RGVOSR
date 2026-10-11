@@ -20,6 +20,8 @@ from diffusers.optimization import get_scheduler
 from dataloaders.sr_refinement_state_dataset import (
     SRRefinementStateDataset,
     sr_refinement_state_collate_fn,
+    build_refinement_dataloader,
+    set_refinement_loader_epoch,
 )
 from models.rg_flux_artist_factory import build_rg_flux_artist
 from models.text_embedding_cache import get_text_embedding_cache, resolve_prompt_embeddings
@@ -28,6 +30,7 @@ from rl_sr.artifact_store import write_json_atomic
 from rl_sr.conditioning import state_router_condition_tensors
 from rl_sr.schema import content_tree_sha256
 from rl_sr.snapshots import assert_rl_frozen_backbone, configure_rl_trainables
+from rl_sr.training import refinement_image_losses
 from train_rg_flux_sr import cfg, load_config
 
 
@@ -46,6 +49,8 @@ def _require_refinement_config(config):
         raise ValueError("RL-SR permanently freezes FLUX.2: training.freeze_flux_transformer must be true")
     if not bool(cfg(config, "condition.refinement.enabled", False)):
         raise ValueError("Set condition.refinement.enabled: true for stages C/E")
+    if not cfg(config, "rl_sr.init_adapter", None):
+        raise ValueError("Stage C requires rl_sr.init_adapter or --init_adapter; refusing random F0 initialization")
 
 
 def train(config, state_jsonl=None, output_dir=None, max_steps=None):
@@ -70,16 +75,9 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
         require_hr=True,
         vae_align=int(cfg(config, "data.vae_align", 16)),
     )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=per_device_batch,
-        shuffle=True,
-        num_workers=int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))),
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))) > 0,
-        collate_fn=sr_refinement_state_collate_fn,
-    )
+    dataloader = build_refinement_dataloader(dataset, per_device_batch,
+        int(rl_config.get("num_workers", cfg(config, "data.num_workers", 2))),
+        sr_refinement_state_collate_fn, config)
     if not len(dataloader):
         raise ValueError("State dataset is smaller than one batch; lower rl_sr.batch_size")
     artist = build_rg_flux_artist(config)
@@ -117,8 +115,11 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
     fm_weight = float(rl_config.get("sft_fm_weight", 1.0))
     latent_weight = float(rl_config.get("sft_latent_weight", 0.10))
     global_step = 0
+    epoch = 0
     artist.train()
     while global_step < requested_steps:
+        set_refinement_loader_epoch(dataloader, epoch)
+        epoch += 1
         for batch in dataloader:
             if global_step >= requested_steps:
                 break
@@ -169,9 +170,10 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
                     )
                     loss_fm = F.mse_loss(v_pred.float(), v_target.float())
                     sigma_view = sigma.reshape(-1, 1, 1, 1).to(dtype=z_t.dtype)
-                    z0_pred = z_t - sigma_view * v_pred
+                    z0_pred = z_t.float() - sigma_view.float() * v_pred.float()
                     loss_latent = F.smooth_l1_loss(z0_pred.float(), z_hr.float())
-                    loss = fm_weight * loss_fm + latent_weight * loss_latent
+                    image_losses = refinement_image_losses(unwrapped, config, global_step, z0_pred, hq)
+                    loss = fm_weight * loss_fm + latent_weight * loss_latent + image_losses["loss_image"]
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(artist.parameters(), float(rl_config.get("max_grad_norm", 1.0)))
@@ -182,7 +184,9 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
             if accelerator.is_main_process and global_step % int(rl_config.get("log_every", 20)) == 0:
                 print(
                     f"[refiner-sft] step={global_step} loss={loss.detach().float().item():.6f} "
-                    f"fm={loss_fm.detach().float().item():.6f} latent={loss_latent.detach().float().item():.6f}",
+                    f"fm={loss_fm.detach().float().item():.6f} latent={loss_latent.detach().float().item():.6f} "
+                    f"charb={image_losses['loss_charb'].detach().item():.6f} "
+                    f"lpips={image_losses['loss_lpips'].detach().item():.6f}",
                     flush=True,
                 )
     accelerator.wait_for_everyone()
@@ -196,6 +200,9 @@ def train(config, state_jsonl=None, output_dir=None, max_steps=None):
             "state_jsonl": str(state_jsonl),
             "adapter_sha256": content_tree_sha256(adapter_dir),
             "backbone_frozen": True,
+            "routing": unwrapped.set_moe_inference_schedule(),
+            "image_loss": rl_config.get("image_loss", {}),
+            "round_balanced_batches": bool(rl_config.get("round_balanced_batches", False)),
             "trainable_parameter_names": [name for name, _ in trainable],
         }
         write_json_atomic(output_dir / "summary.json", summary)

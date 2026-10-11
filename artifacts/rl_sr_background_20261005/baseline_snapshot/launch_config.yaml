@@ -1,0 +1,162 @@
+model:
+  flux_backend: flux2_klein
+  flux_model_path: /media/xd/data/models/FLUX.2-klein-base-4B/
+  dtype: bf16
+  text_encoder_device: cuda
+  text_encoder_dtype: fp32
+  vae_device: cuda
+  vae_dtype: fp32
+  max_prompt_sequence_length: 512
+  use_lora: true
+  lora_backend: moe
+  lora_rank: 32
+  lora_alpha: 32
+  gradient_checkpointing: false
+  guidance_scale: 1.0
+  latent_channels: 128
+  context_dim: 7680
+  lora_moe:
+    num_routed_experts: 4
+    top_k: 2
+    router_input_mode: condition8
+    router_condition_version: text8_v1
+    router_condition_dim: 8
+    router_timestep_dim: 32
+    latent_branch: stat_conv
+    router_hidden_dim: 1024
+    prototype_scale: 1.0
+    router_ema_decay: 0.99
+    router_noise_std: 0.1
+    router_noise_end_ratio: 0.3
+    warmup_ratio: 0.3
+    init_temperature: 2.0
+    final_temperature: 0.7
+    inference_routing_mode: topk
+    inference_temperature: 0.7
+    inference_top_k: 2
+    teacher_routing_enabled: false
+    semantic_prototype_init: false
+    teacher_start_ratio: 0.15
+    teacher_end_ratio: 0.35
+    teacher_target_temperature: 0.7
+    shared_always_active: true
+    freeze_shared_during_warmup: true
+    init_from_single_lora: null
+text_encoding:
+  mode: online
+  strict: true
+  dtype: bf16
+  validate_prompt_hash: true
+data:
+  jsonl_path: datasets/LSDIR_precrop512/train.iqa_caption_suggestion.jsonl
+  crop_size: 512
+  pre_cropped: true
+  scale: 4
+  batch_size: 1
+  num_workers: 2
+  vae_align: 16
+condition:
+  use_prompt: true
+  use_suggestions: true
+  prompt_variant: iqa_suggestion
+  include_caption: true
+  prompt_schedule:
+    enabled: true
+    switch_step: 0
+    before_variant: fixed
+    before_include_caption: false
+    after_variant: iqa_suggestion
+    after_include_caption: true
+  use_degradation_vector: false
+  use_visual_semantic_tokens: false
+  deg_vector_dim: 8
+  deg_token_count: 0
+  deg_hidden_dim: 512
+  lr_cond_mode: flux2_image_concat
+  lr_token_count: 1024
+  condition_dropout: 0.0
+  visual_feature_dim: 768
+  visual_token_count: 64
+  refinement:
+    enabled: true
+    anchor_mode: spatial
+    anchor_tokens: 64
+    attention_dim: 128
+    dropout: 0.0
+    max_round: 16
+training:
+  freeze_flux_transformer: true
+  seed: 42
+  lr_adapter: 0.0001
+  weight_decay: 0.01
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+flow_matching:
+  sigma_sampling: uniform
+  timestep_conversion: sigma
+  num_inference_steps: 25
+  inference_schedule: linear
+  inference_init_mode: pure_noise
+  inference_sigma_start: 1.0
+rl_sr:
+  output_root: exp_rg_flux_rl
+  run_prefix: rlsr
+  dataset_id: lsdir_precrop512_v1
+  train_max_samples: 3000
+  train_subset_seed: 42
+  iterations: 4
+  sft_bootstrap_rounds: 3
+  num_candidates: 4
+  reward_device: cuda
+  evaluation:
+    jsonl_path: datasets/inference.iqa_caption_suggestion.jsonl
+    datasets:
+    - name: RealLQ250
+      dataset_filter: RealLQ250
+      expected_count: 250
+    - name: RealLR200
+      dataset_filter: RealLR200
+      expected_count: 200
+    metric_device: cpu
+    metrics:
+    - clipiqa
+    - clipiqa+
+    - nima
+    - niqe
+    - liqe
+    - musiq
+    - maniqa-pipal
+  state_jsonl: null
+  init_adapter: exp_rg_flux_sr/rg_flux2_klein_sr_ms_stage0B_flux2_image_concat_size512_s3_condition8_prompt_iqa_suggestion_26080421_r02/checkpoints/checkpoint-00036000/rg_flux_adapters
+  sft_output_dir: exp_rg_flux_refiner_sft
+  rl_output_dir: exp_rg_flux_output_rl
+  batch_size: 4
+  rl_batch_size: 4
+  sft_replay_batch_size: 4
+  round_balanced_batches: true
+  min_rounds_per_batch: 2
+  num_workers: 2
+  grad_accum_steps: 1
+  sft_max_steps: 1000
+  sft_lr: 0.0001
+  sft_fm_weight: 1.0
+  sft_latent_weight: 0.1
+  rl_max_steps: 250
+  rl_lr: 2.0e-05
+  nft_beta: 1.0
+  nft_weight: 1.0
+  reference_weight: 0.1
+  sft_replay_weight: 0.25
+  sft_replay_latent_weight: 0.05
+  sft_replay_image_weight: 0.25
+  image_loss:
+    charb_weight: 0.1
+    lpips_weight: 0.05
+    crop_size: 256
+    lpips_resize: 256
+    every: 1
+    lpips_warmup_start: 0
+    lpips_warmup_end: 0
+  min_reward_confidence: 0.15
+  max_grad_norm: 1.0
+  log_every: 10

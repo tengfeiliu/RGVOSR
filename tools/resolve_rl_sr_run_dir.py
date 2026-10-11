@@ -142,6 +142,7 @@ def load_context(
         "output_root": str(output_root),
         "run_name": run_name,
         "iterations": iterations,
+        "sft_bootstrap_rounds": int(_get(config, "rl_sr", "sft_bootstrap_rounds", default=max(iterations - 1, 2))),
         "num_candidates": candidates,
         "train_max_samples": train_max_samples,
         "train_subset_seed": train_subset_seed,

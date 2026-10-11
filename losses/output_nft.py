@@ -30,7 +30,10 @@ def nft_velocity_loss(
         raise ValueError("NFT velocities must have identical shapes")
     if float(beta) <= 0:
         raise ValueError("beta must be positive")
-    probability = optimality_probability.to(device=velocity_current.device, dtype=velocity_current.dtype).reshape(-1)
+    velocity_current = velocity_current.float()
+    velocity_old = velocity_old.detach().float()
+    velocity_target = velocity_target.float()
+    probability = optimality_probability.to(device=velocity_current.device, dtype=torch.float32).reshape(-1)
     if probability.shape[0] != velocity_current.shape[0]:
         raise ValueError("optimality_probability batch size must match velocities")
     probability = probability.clamp(0.0, 1.0)
@@ -53,7 +56,7 @@ def nft_velocity_loss(
 def reference_velocity_loss(velocity_current: torch.Tensor, velocity_reference: torch.Tensor) -> torch.Tensor:
     if velocity_current.shape != velocity_reference.shape:
         raise ValueError("Reference velocities must have identical shapes")
-    return (velocity_current - velocity_reference.detach()).square().mean()
+    return (velocity_current.float() - velocity_reference.detach().float()).square().mean()
 
 
 def group_optimality_probabilities(

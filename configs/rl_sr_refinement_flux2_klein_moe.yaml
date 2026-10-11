@@ -2,7 +2,7 @@
 # IDs use content hashes plus relative keys and never include these paths.
 model:
   flux_backend: flux2_klein
-  flux_model_path: /root/autodl-tmp/models/FLUX.2-klein-base-4B/
+  flux_model_path: /media/xd/data/models/FLUX.2-klein-base-4B/
   dtype: bf16
   text_encoder_device: cuda
   text_encoder_dtype: fp32
@@ -16,7 +16,7 @@ model:
   gradient_checkpointing: false
   guidance_scale: 1.0
   latent_channels: 128
-  context_dim: 15360
+  context_dim: 7680
   lora_moe:
     num_routed_experts: 4
     top_k: 2
@@ -87,7 +87,9 @@ condition:
   visual_token_count: 64
   refinement:
     enabled: true
-    anchor_tokens: 8
+    anchor_mode: spatial       # legacy keeps the old 1D pooled anchor for ablations
+    anchor_tokens: 64          # 8x8 spatial grid; 256 gives a 16x16 grid
+    attention_dim: 128
     dropout: 0.0
     max_round: 16
 
@@ -122,6 +124,7 @@ rl_sr:
   train_max_samples: 0
   train_subset_seed: 42
   iterations: 4
+  sft_bootstrap_rounds: 3       # Independent of evaluation/inference iterations
   num_candidates: 4
   reward_device: cuda
   evaluation:
@@ -139,12 +142,14 @@ rl_sr:
     metric_device: cpu
     metrics: [clipiqa, clipiqa+, nima, niqe, liqe, musiq, maniqa-pipal]
   state_jsonl: null
-  init_adapter: null          # Stage-0/F0 adapter used to initialize stage C
+  init_adapter: exp_rg_flux_sr/rg_flux2_klein_sr_ms_stage0B_flux2_image_concat_size512_s3_condition8_prompt_iqa_suggestion_26080421_r02/checkpoints/checkpoint-00036000/rg_flux_adapters
   sft_output_dir: exp_rg_flux_refiner_sft
   rl_output_dir: exp_rg_flux_output_rl
-  batch_size: 1
-  rl_batch_size: 1
-  sft_replay_batch_size: 1
+  batch_size: 4
+  rl_batch_size: 4
+  sft_replay_batch_size: 4
+  round_balanced_batches: true
+  min_rounds_per_batch: 2
   num_workers: 2
   grad_accum_steps: 1
   sft_max_steps: 1000
@@ -158,6 +163,15 @@ rl_sr:
   reference_weight: 0.10
   sft_replay_weight: 0.25
   sft_replay_latent_weight: 0.05
+  sft_replay_image_weight: 0.25
+  image_loss:
+    charb_weight: 0.10
+    lpips_weight: 0.05
+    crop_size: 256
+    lpips_resize: 256
+    every: 1
+    lpips_warmup_start: 0
+    lpips_warmup_end: 0
   min_reward_confidence: 0.15
   max_grad_norm: 1.0
   log_every: 10

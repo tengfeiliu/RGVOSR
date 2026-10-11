@@ -1,0 +1,5 @@
+*
+!.gitignore
+!*.md
+!*.csv
+!check_iqa.py

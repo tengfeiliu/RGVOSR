@@ -23,6 +23,8 @@ from torch.utils.data import Dataset
 from dataloaders.sr_refinement_state_dataset import (
     SRRefinementStateDataset,
     sr_refinement_state_collate_fn,
+    build_refinement_dataloader,
+    set_refinement_loader_epoch,
 )
 from losses.output_nft import nft_velocity_loss, reference_velocity_loss, renoise_rectified_flow
 from models.rg_flux_artist_factory import build_rg_flux_artist
@@ -31,6 +33,7 @@ from rl_sr.artifact_store import read_jsonl, write_json_atomic
 from rl_sr.conditioning import state_router_condition_tensors
 from rl_sr.schema import RolloutRecord, StateRecord, adapter_content_sha256, content_sha256, content_tree_sha256
 from rl_sr.snapshots import AdapterSnapshot, assert_rl_frozen_backbone, configure_rl_trainables, is_rl_trainable_name
+from rl_sr.training import refinement_image_losses, backward_policy_then_replay
 from train_rg_flux_sr import cfg, load_config
 
 
@@ -211,14 +214,10 @@ def train(config, args):
                                                 vae_align=int(cfg(config, "data.vae_align", 16)))
     batch_size = int(rl_config.get("rl_batch_size", 1))
     replay_batch_size = int(rl_config.get("sft_replay_batch_size", batch_size))
-    update_loader = torch.utils.data.DataLoader(
-        update_dataset, batch_size=batch_size, shuffle=True, drop_last=True,
-        num_workers=int(rl_config.get("num_workers", 2)), pin_memory=True, collate_fn=rollout_collate_fn,
-    )
-    replay_loader = torch.utils.data.DataLoader(
-        replay_dataset, batch_size=replay_batch_size, shuffle=True, drop_last=True,
-        num_workers=int(rl_config.get("num_workers", 2)), pin_memory=True, collate_fn=sr_refinement_state_collate_fn,
-    )
+    update_loader = build_refinement_dataloader(update_dataset, batch_size,
+        int(rl_config.get("num_workers", 2)), rollout_collate_fn, config)
+    replay_loader = build_refinement_dataloader(replay_dataset, replay_batch_size,
+        int(rl_config.get("num_workers", 2)), sr_refinement_state_collate_fn, config)
     if not len(update_loader):
         raise ValueError("RL rollout buffer is smaller than rl_sr.rl_batch_size")
     if not len(replay_loader):
@@ -261,16 +260,23 @@ def train(config, args):
     reference_weight = float(rl_config.get("reference_weight", 0.10))
     sft_weight = float(rl_config.get("sft_replay_weight", 0.25))
     sft_latent_weight = float(rl_config.get("sft_replay_latent_weight", 0.05))
+    replay_image_weight = float(rl_config.get("sft_replay_image_weight", 0.25))
     replay_iterator = iter(replay_loader)
     global_step = 0
+    epoch = 0
+    replay_epoch = 0
     artist.train()
     while global_step < max_steps:
+        set_refinement_loader_epoch(update_loader, epoch)
+        epoch += 1
         for rollout_batch in update_loader:
             if global_step >= max_steps:
                 break
             try:
                 replay_batch = next(replay_iterator)
             except StopIteration:
+                replay_epoch += 1
+                set_refinement_loader_epoch(replay_loader, replay_epoch)
                 replay_iterator = iter(replay_loader)
                 replay_batch = next(replay_iterator)
             with torch.no_grad():
@@ -327,28 +333,35 @@ def train(config, args):
                     v_phi = _velocity(artist, z_t, tau, prompt_embeds, pooled, text_ids,
                                       z_current, z_anchor, rounds, lr_cond_mode,
                                       router_condition, router_condition_mask, router_condition_confidence)
-                    probability = rollout_batch["optimality_probability"].to(accelerator.device, dtype=dtype)
-                    confidence = rollout_batch["confidence"].to(accelerator.device, dtype=dtype)
+                    probability = rollout_batch["optimality_probability"].to(accelerator.device, dtype=torch.float32)
+                    confidence = rollout_batch["confidence"].to(accelerator.device, dtype=torch.float32)
                     hard = rollout_batch["hard_violation"].to(accelerator.device)
                     sample_weight = torch.where(hard, torch.ones_like(confidence), confidence)
                     loss_nft = nft_velocity_loss(v_phi, v_old, velocity_target, probability,
                                                  beta=beta, sample_weight=sample_weight)
                     loss_reference = reference_velocity_loss(v_phi, v_reference)
-                    r_v_phi = _velocity(
-                        artist, r_z_t, r_tau, r_prompt, r_pooled, r_text_ids, rz_current, rz_anchor,
-                        replay_batch["round_index"].to(accelerator.device), lr_cond_mode,
-                        r_router_condition, r_router_condition_mask, r_router_condition_confidence,
-                    )
-                    loss_sft_fm = F.mse_loss(r_v_phi.float(), r_target.float())
-                    r_z0_pred = r_z_t - r_tau_view * r_v_phi
-                    loss_sft_latent = F.smooth_l1_loss(r_z0_pred.float(), z_hr.float())
-                    loss = (
-                        nft_weight * loss_nft
-                        + reference_weight * loss_reference
-                        + sft_weight * loss_sft_fm
-                        + sft_latent_weight * loss_sft_latent
-                    )
-                accelerator.backward(loss)
+                    policy_loss = nft_weight * loss_nft + reference_weight * loss_reference
+
+                def replay_forward():
+                    with accelerator.autocast():
+                        r_v_phi = _velocity(
+                            artist, r_z_t, r_tau, r_prompt, r_pooled, r_text_ids, rz_current, rz_anchor,
+                            replay_batch["round_index"].to(accelerator.device), lr_cond_mode,
+                            r_router_condition, r_router_condition_mask, r_router_condition_confidence,
+                        )
+                        loss_fm = F.mse_loss(r_v_phi.float(), r_target.float())
+                        r_z0_pred = r_z_t.float() - r_tau_view.float() * r_v_phi.float()
+                        loss_latent = F.smooth_l1_loss(r_z0_pred, z_hr.float())
+                        image = refinement_image_losses(unwrapped, config, global_step, r_z0_pred, replay_hq)
+                        return {
+                            "loss": sft_weight * loss_fm + sft_latent_weight * loss_latent
+                                    + replay_image_weight * image["loss_image"],
+                            "fm": loss_fm, "image": image,
+                        }
+
+                loss, replay_losses = backward_policy_then_replay(policy_loss, replay_forward, accelerator.backward)
+                loss_sft_fm = replay_losses["fm"]
+                replay_image = replay_losses["image"]
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(artist.parameters(), float(rl_config.get("max_grad_norm", 1.0)))
                 optimizer.step()
@@ -359,7 +372,9 @@ def train(config, args):
                 print(
                     f"[output-nft] step={global_step} total={loss.detach().float().item():.6f} "
                     f"nft={loss_nft.detach().float().item():.6f} ref={loss_reference.detach().float().item():.6f} "
-                    f"sft={loss_sft_fm.detach().float().item():.6f}", flush=True
+                    f"sft={loss_sft_fm.detach().float().item():.6f} "
+                    f"replay_charb={replay_image['loss_charb'].detach().item():.6f} "
+                    f"replay_lpips={replay_image['loss_lpips'].detach().item():.6f}", flush=True
                 )
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -374,6 +389,10 @@ def train(config, args):
             "rollout_buffer_policy_sha256": update_dataset.policy_adapter_sha256,
             "backbone_frozen": True,
             "router_frozen": True,
+            "routing": unwrapped.set_moe_inference_schedule(),
+            "image_loss": rl_config.get("image_loss", {}),
+            "round_balanced_batches": bool(rl_config.get("round_balanced_batches", False)),
+            "backward_schedule": "policy_then_replay_single_optimizer_step",
             "action": "saved_final_rectified_flow_latent_z0",
             "trainable_parameter_names": [name for name, _ in trainable],
         }
